@@ -4,6 +4,7 @@ import { RGBELoader } from "three/addons/loaders/RGBELoader.js";
 
 const fileInput = document.querySelector("#fileInput");
 const fileHint = document.querySelector("#fileHint");
+const pickerModeButton = document.querySelector("#pickerModeButton");
 const viewport = document.querySelector("#viewport");
 const windowLayer = document.querySelector("#windowLayer");
 const dropPrompt = document.querySelector("#dropPrompt");
@@ -23,20 +24,51 @@ const pixelPosition = document.querySelector("#pixelPosition");
 const linearValue = document.querySelector("#linearValue");
 const srgbValue = document.querySelector("#srgbValue");
 const viewState = document.querySelector("#viewState");
+const pickerValueMode = document.querySelector("#pickerValueMode");
+const pickerRows = document.querySelector("#pickerRows");
+const pickerCopyText = document.querySelector("#pickerCopyText");
+const copyPickersButton = document.querySelector("#copyPickersButton");
 
 const images = [];
 const minWindowWidth = 220;
 const minWindowHeight = 160;
+const maxPickers = 20;
+const pickerColors = [
+  "#ff365e", "#35d0ff", "#ffe156", "#69f28d", "#c77dff",
+  "#ff9f1c", "#2ec4b6", "#f15bb5", "#b8f35a", "#4d96ff",
+  "#ff6b6b", "#9bf6ff", "#fdffb6", "#caffbf", "#bdb2ff",
+  "#ffc6ff", "#00f5d4", "#f7b801", "#a1ff0a", "#ff70a6"
+];
 
 let selectedId = null;
 let nextId = 1;
+let nextPickerId = 1;
 let topZ = 10;
 let activeDrag = null;
 let rafPending = false;
+let pickerMode = false;
 
 fileInput.addEventListener("change", () => {
   void openFiles(fileInput.files);
   fileInput.value = "";
+});
+
+pickerModeButton.addEventListener("click", () => {
+  pickerMode = !pickerMode;
+  pickerModeButton.classList.toggle("active", pickerMode);
+  updatePickerCursor();
+});
+
+pickerValueMode.addEventListener("change", () => updatePickerPanel());
+
+copyPickersButton.addEventListener("click", async () => {
+  pickerCopyText.select();
+  const text = pickerCopyText.value;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    document.execCommand("copy");
+  }
 });
 
 viewport.addEventListener("dragenter", (event) => {
@@ -178,6 +210,7 @@ document.addEventListener("pointerup", () => {
   activeDrag = null;
 });
 
+updatePickerPanel();
 requestRender();
 
 async function openFiles(fileList, dropPoint = null) {
@@ -196,6 +229,7 @@ async function openFiles(fileList, dropPoint = null) {
       createImageWindow(image, dropPoint, index);
       selectImage(image);
       fitImageToWindow(image, false);
+      updatePickerPanel();
       requestRender();
     } catch (error) {
       console.error(error);
@@ -205,6 +239,7 @@ async function openFiles(fileList, dropPoint = null) {
 
   dropPrompt.classList.toggle("hidden", images.length > 0);
   fileHint.textContent = `${images.length} image${images.length === 1 ? "" : "s"} opened`;
+  updatePickerCursor();
 }
 
 async function loadImageFile(file) {
@@ -307,6 +342,7 @@ function createImageRecord(file, width, height, type, pixels) {
       offsetY: 0,
       fit: true
     },
+    pickers: [],
     window: {
       x: 24,
       y: 24,
@@ -340,9 +376,10 @@ function createImageWindow(image, dropPoint, placementIndex) {
 
   const titlebar = document.createElement("div");
   titlebar.className = "window-titlebar";
-  titlebar.innerHTML = `<div class="window-title"></div><div class="window-size"></div>`;
+  titlebar.innerHTML = `<div class="window-title"></div><div class="window-size"></div><button class="window-close" type="button" aria-label="Close image window">×</button>`;
   titlebar.querySelector(".window-title").textContent = image.name;
   titlebar.querySelector(".window-size").textContent = `${image.width}x${image.height}`;
+  const closeButton = titlebar.querySelector(".window-close");
 
   const body = document.createElement("div");
   body.className = "window-body";
@@ -363,12 +400,16 @@ function createImageWindow(image, dropPoint, placementIndex) {
     body,
     canvas,
     ctx: canvas.getContext("2d", { alpha: false }),
-    resizeHandle
+    resizeHandle,
+    closeButton
   };
 
   frame.addEventListener("pointerdown", () => selectImage(image));
 
   titlebar.addEventListener("pointerdown", (event) => {
+    if (event.target.closest(".window-close")) {
+      return;
+    }
     if (event.button !== 0) {
       return;
     }
@@ -383,6 +424,14 @@ function createImageWindow(image, dropPoint, placementIndex) {
       y: image.window.y
     };
     titlebar.setPointerCapture(event.pointerId);
+  });
+
+  closeButton.addEventListener("pointerdown", (event) => event.stopPropagation());
+  closeButton.addEventListener("click", (event) => {
+    event.stopPropagation();
+    if (confirm(`Close "${image.name}"?`)) {
+      closeImage(image);
+    }
   });
 
   resizeHandle.addEventListener("pointerdown", (event) => {
@@ -407,6 +456,11 @@ function createImageWindow(image, dropPoint, placementIndex) {
 
   canvas.addEventListener("pointerdown", (event) => {
     selectImage(image);
+    if (pickerMode && event.button === 0) {
+      event.preventDefault();
+      togglePickerAtEvent(image, event);
+      return;
+    }
     if (event.button !== 2 && event.button !== 1) {
       return;
     }
@@ -472,6 +526,229 @@ function applyWindowGeometry(image) {
   frame.style.width = `${image.window.width}px`;
   frame.style.height = `${image.window.height}px`;
   frame.style.zIndex = String(image.window.z);
+}
+
+function closeImage(image) {
+  const index = images.findIndex((item) => item.id === image.id);
+  if (index === -1) {
+    return;
+  }
+  image.elements?.frame.remove();
+  images.splice(index, 1);
+  if (selectedId === image.id) {
+    selectedId = images.length ? images[images.length - 1].id : null;
+    const nextImage = currentImage();
+    if (nextImage) {
+      selectImage(nextImage);
+    } else {
+      updateSettingsPanel();
+      updateViewState();
+    }
+  }
+  dropPrompt.classList.toggle("hidden", images.length > 0);
+  fileHint.textContent = images.length ? `${images.length} image${images.length === 1 ? "" : "s"} opened` : "Drop images on the black view";
+  updatePickerCursor();
+  updatePickerPanel();
+  requestRender();
+}
+
+function togglePickerAtEvent(image, event) {
+  const pixel = pixelFromEvent(image, event);
+  if (!pixel) {
+    return;
+  }
+
+  const existingIndex = image.pickers.findIndex((picker) => picker.x === pixel.x && picker.y === pixel.y);
+  if (existingIndex !== -1) {
+    image.pickers.splice(existingIndex, 1);
+    updatePickerPanel();
+    requestRender();
+    return;
+  }
+
+  if (allPickers().length >= maxPickers) {
+    fileHint.textContent = `Picker limit is ${maxPickers}.`;
+    return;
+  }
+
+  image.pickers.push({
+    id: nextPickerId,
+    x: pixel.x,
+    y: pixel.y,
+    color: nextPickerColor()
+  });
+  nextPickerId += 1;
+  updatePickerPanel();
+  requestRender();
+}
+
+function removePicker(pickerId) {
+  for (const image of images) {
+    const index = image.pickers.findIndex((picker) => picker.id === pickerId);
+    if (index !== -1) {
+      image.pickers.splice(index, 1);
+      updatePickerPanel();
+      requestRender();
+      return;
+    }
+  }
+}
+
+function drawPickers(image, ctx) {
+  const { width, height } = canvasCssSize(image);
+  for (const picker of image.pickers) {
+    const x = image.view.offsetX + (picker.x + 0.5) * image.view.scale;
+    const y = image.view.offsetY + (picker.y + 0.5) * image.view.scale;
+    if (x < -24 || y < -24 || x > width + 24 || y > height + 24) {
+      continue;
+    }
+
+    const arm = 9;
+    ctx.save();
+    ctx.lineCap = "square";
+    ctx.strokeStyle = "#000";
+    ctx.lineWidth = 4;
+    drawCross(ctx, x, y, arm);
+    ctx.strokeStyle = picker.color;
+    ctx.lineWidth = 2;
+    drawCross(ctx, x, y, arm);
+    ctx.fillStyle = picker.color;
+    ctx.font = "11px Consolas, monospace";
+    ctx.fillText(String(picker.id), x + 7, y - 7);
+    ctx.restore();
+  }
+}
+
+function drawCross(ctx, x, y, arm) {
+  ctx.beginPath();
+  ctx.moveTo(x - arm, y);
+  ctx.lineTo(x + arm, y);
+  ctx.moveTo(x, y - arm);
+  ctx.lineTo(x, y + arm);
+  ctx.stroke();
+}
+
+function updatePickerPanel() {
+  const rows = allPickers();
+  pickerRows.replaceChildren();
+
+  if (rows.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "picker-empty";
+    empty.textContent = "No pickers.";
+    pickerRows.append(empty);
+  } else {
+    for (const { image, picker } of rows) {
+      const values = pickerValues(image, picker);
+      const row = document.createElement("div");
+      row.className = "picker-row";
+
+      const markerChip = document.createElement("span");
+      markerChip.className = "picker-marker-chip";
+      markerChip.style.backgroundColor = picker.color;
+
+      const sampleChip = document.createElement("span");
+      sampleChip.className = "sample-chip";
+      sampleChip.style.backgroundColor = sampleCssColor(values.linear);
+
+      const label = document.createElement("span");
+      label.textContent = `P${picker.id} ${picker.x},${picker.y}`;
+      label.title = image.name;
+
+      const value = document.createElement("span");
+      value.textContent = formatPickerValue(values);
+
+      const remove = document.createElement("button");
+      remove.className = "picker-remove";
+      remove.type = "button";
+      remove.textContent = "×";
+      remove.title = "Remove picker";
+      remove.addEventListener("click", () => removePicker(picker.id));
+
+      row.append(markerChip, sampleChip, label, value, remove);
+      pickerRows.append(row);
+    }
+  }
+
+  pickerCopyText.value = pickerCopyTextValue(rows);
+}
+
+function pickerCopyTextValue(rows) {
+  const mode = pickerValueMode.value;
+  const lines = ["id\timage\tx\ty\tmode\tr\tg\tb\ta"];
+  for (const { image, picker } of rows) {
+    const values = pickerValues(image, picker);
+    const tuple = valueTupleForMode(values, mode);
+    lines.push([
+      `P${picker.id}`,
+      image.name,
+      picker.x,
+      picker.y,
+      mode,
+      ...tuple
+    ].join("\t"));
+  }
+  return lines.join("\n");
+}
+
+function pickerValues(image, picker) {
+  const index = (picker.y * image.width + picker.x) * 4;
+  const linear = [
+    image.pixels[index],
+    image.pixels[index + 1],
+    image.pixels[index + 2],
+    image.pixels[index + 3]
+  ];
+  const srgb = [
+    linearToSrgb(linear[0]),
+    linearToSrgb(linear[1]),
+    linearToSrgb(linear[2]),
+    linear[3]
+  ];
+  const srgb255 = [
+    Math.round(clamp01(srgb[0]) * 255),
+    Math.round(clamp01(srgb[1]) * 255),
+    Math.round(clamp01(srgb[2]) * 255),
+    Math.round(clamp01(srgb[3]) * 255)
+  ];
+  return { linear, srgb, srgb255 };
+}
+
+function formatPickerValue(values) {
+  const tuple = valueTupleForMode(values, pickerValueMode.value);
+  return tuple.join(", ");
+}
+
+function valueTupleForMode(values, mode) {
+  if (mode === "srgb255") {
+    return values.srgb255;
+  }
+  if (mode === "srgb") {
+    return values.srgb.map(formatNumber);
+  }
+  return values.linear.map(formatNumber);
+}
+
+function sampleCssColor(linear) {
+  const r = Math.round(clamp01(linearToSrgb(linear[0])) * 255);
+  const g = Math.round(clamp01(linearToSrgb(linear[1])) * 255);
+  const b = Math.round(clamp01(linearToSrgb(linear[2])) * 255);
+  return `rgb(${r} ${g} ${b})`;
+}
+
+function allPickers() {
+  return images.flatMap((image) => image.pickers.map((picker) => ({ image, picker })));
+}
+
+function nextPickerColor() {
+  const used = new Set(allPickers().map(({ picker }) => picker.color));
+  return pickerColors.find((color) => !used.has(color)) || pickerColors[0];
+}
+
+function updatePickerCursor() {
+  for (const image of images) {
+    image.elements?.canvas.classList.toggle("picker-mode", pickerMode);
+  }
 }
 
 function computeRange(pixels) {
@@ -580,6 +857,7 @@ function renderImage(image) {
     image.width * image.view.scale,
     image.height * image.view.scale
   );
+  drawPickers(image, ctx);
 }
 
 function ensureDisplayCanvas(image) {
@@ -699,18 +977,13 @@ function endImagePan(image, event) {
 }
 
 function updatePixelReadout(image, event) {
-  const rect = image.elements.canvas.getBoundingClientRect();
-  const viewX = event.clientX - rect.left;
-  const viewY = event.clientY - rect.top;
-  const x = Math.floor((viewX - image.view.offsetX) / image.view.scale);
-  const y = Math.floor((viewY - image.view.offsetY) / image.view.scale);
-
-  if (x < 0 || y < 0 || x >= image.width || y >= image.height) {
+  const pixel = pixelFromEvent(image, event);
+  if (!pixel) {
     clearPixelReadout();
     return;
   }
 
-  const index = (y * image.width + x) * 4;
+  const index = (pixel.y * image.width + pixel.x) * 4;
   const linear = [
     image.pixels[index],
     image.pixels[index + 1],
@@ -724,9 +997,22 @@ function updatePixelReadout(image, event) {
     linear[3]
   ];
 
-  pixelPosition.textContent = `x: ${x}, y: ${y}`;
+  pixelPosition.textContent = `x: ${pixel.x}, y: ${pixel.y}`;
   linearValue.textContent = `Linear: ${formatTuple(linear)}`;
   srgbValue.textContent = `sRGB: ${formatTuple(srgb)}`;
+}
+
+function pixelFromEvent(image, event) {
+  const rect = image.elements.canvas.getBoundingClientRect();
+  const viewX = event.clientX - rect.left;
+  const viewY = event.clientY - rect.top;
+  const x = Math.floor((viewX - image.view.offsetX) / image.view.scale);
+  const y = Math.floor((viewY - image.view.offsetY) / image.view.scale);
+
+  if (x < 0 || y < 0 || x >= image.width || y >= image.height) {
+    return null;
+  }
+  return { x, y };
 }
 
 function clearPixelReadout() {

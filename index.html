@@ -22,6 +22,7 @@
         <input id="fileInput" type="file" multiple accept="image/*,.hdr,.pic,.exr">
         Open
       </label>
+      <button id="pickerModeButton" class="tool-button" type="button">Picker</button>
       <div id="fileHint" class="file-hint">Drop images on the black view</div>
     </header>
 
@@ -94,6 +95,20 @@
               <div><span>Range</span><strong id="metaRange"></strong></div>
             </div>
           </div>
+        </aside>
+
+        <aside id="pickerPanel" class="picker-panel" aria-label="Color picker values">
+          <div class="panel-title picker-title">
+            <span>Pickers</span>
+            <select id="pickerValueMode" aria-label="Picker value mode">
+              <option value="linear">Linear</option>
+              <option value="srgb">sRGB</option>
+              <option value="srgb255">sRGB 255</option>
+            </select>
+          </div>
+          <div id="pickerRows" class="picker-rows"></div>
+          <textarea id="pickerCopyText" class="picker-copy-text" readonly spellcheck="false"></textarea>
+          <button id="copyPickersButton" class="copy-button" type="button">Copy</button>
         </aside>
       </section>
     </main>
