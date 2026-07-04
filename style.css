@@ -14,6 +14,7 @@
 
 * {
   box-sizing: border-box;
+  user-select: none;
 }
 
 html,
@@ -30,6 +31,11 @@ button,
 input,
 select {
   font: inherit;
+}
+
+input,
+textarea {
+  user-select: text;
 }
 
 .app {
@@ -127,6 +133,105 @@ select {
 .window-layer {
   position: absolute;
   inset: 0;
+  z-index: 10;
+  pointer-events: none;
+}
+
+.selection-graph-panel {
+  position: absolute;
+  left: 12px;
+  top: 12px;
+  z-index: 100000;
+  display: grid;
+  grid-template-rows: 24px minmax(0, 1fr);
+  width: 300px;
+  height: 220px;
+  min-width: 180px;
+  min-height: 140px;
+  overflow: hidden;
+  border: 1px solid #27313b;
+  border-radius: 7px;
+  background: rgba(10, 12, 15, 0.92);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.3);
+}
+
+.selection-graph-panel.hidden {
+  display: none;
+}
+
+.graph-titlebar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+  padding: 0 8px;
+  border-bottom: 1px solid #202832;
+  background: #11151b;
+  color: #c8d1dc;
+  font-size: 11px;
+  font-weight: 650;
+  cursor: move;
+}
+
+.graph-titlebar span,
+.graph-titlebar strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.graph-titlebar strong {
+  color: var(--muted);
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 10px;
+  font-weight: 500;
+}
+
+.selection-graph-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: grab;
+}
+
+.selection-graph-canvas:active {
+  cursor: grabbing;
+}
+
+.graph-resize-handle {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 18px;
+  height: 18px;
+  cursor: nwse-resize;
+}
+
+.graph-resize-handle::after {
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  width: 8px;
+  height: 8px;
+  border-right: 2px solid #7b8794;
+  border-bottom: 2px solid #7b8794;
+  content: "";
+}
+
+.inspector.collapsed,
+.picker-panel.collapsed,
+.selection-graph-panel.collapsed {
+  height: auto !important;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.inspector.collapsed > :not(.panel-title),
+.picker-panel.collapsed > :not(.panel-title),
+.selection-graph-panel.collapsed > :not(.graph-titlebar) {
+  display: none;
 }
 
 .image-window {
@@ -140,6 +245,7 @@ select {
   overflow: hidden;
   background: #050505;
   box-shadow: 0 16px 36px rgba(0, 0, 0, 0.42);
+  pointer-events: auto;
 }
 
 .image-window.active {
@@ -290,10 +396,10 @@ select {
   left: 12px;
   bottom: 12px;
   z-index: 100000;
-  width: min(560px, calc(100% - 24px));
+  width: min(640px, calc(100% - 24px));
   max-height: min(360px, calc(100% - 24px));
   display: grid;
-  grid-template-rows: 38px minmax(0, 1fr) 76px 34px;
+  grid-template-rows: 38px minmax(0, 1fr);
   overflow: hidden;
   border: 1px solid var(--line);
   border-radius: 7px;
@@ -305,8 +411,45 @@ select {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 112px;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
   height: 38px;
+}
+
+.panel-tabs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0;
+  height: 28px;
+  overflow: hidden;
+  border: 1px solid #33404d;
+  border-radius: 6px;
+  background: #080a0d;
+}
+
+.tab-button {
+  height: 26px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.tab-button + .tab-button {
+  border-left: 1px solid #33404d;
+}
+
+.tab-button.active {
+  background: #12304a;
+  color: var(--accent-strong);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.picker-title .tool-button {
+  height: 26px;
+  padding: 0 8px;
+  font-size: 12px;
 }
 
 .picker-title select {
@@ -318,6 +461,16 @@ select {
   min-height: 0;
   overflow: auto;
   padding: 8px;
+}
+
+.panel-tab-content {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) 76px 36px;
+  min-height: 0;
+}
+
+.panel-tab-content.hidden {
+  display: none;
 }
 
 .picker-empty {
@@ -378,9 +531,39 @@ select {
 
 .copy-button {
   height: 28px;
-  margin: 3px 8px 8px auto;
+  margin: 0;
   padding: 0 12px;
   font-size: 12px;
+}
+
+.panel-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 3px 8px 8px;
+}
+
+.panel-actions select {
+  width: 118px;
+  height: 28px;
+  font-size: 12px;
+}
+
+.panel-actions .tool-button {
+  height: 28px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+.selection-summary {
+  min-height: 0;
+  overflow: auto;
+  padding: 8px;
+  color: #dce7f3;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 11px;
+  white-space: pre;
 }
 
 .panel-title {
@@ -392,6 +575,7 @@ select {
   font-weight: 700;
   letter-spacing: 0;
   text-transform: uppercase;
+  cursor: move;
 }
 
 .settings-form,

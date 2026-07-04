@@ -22,12 +22,19 @@
         <input id="fileInput" type="file" multiple accept="image/*,.hdr,.pic,.exr">
         Open
       </label>
-      <button id="pickerModeButton" class="tool-button" type="button">Picker</button>
       <div id="fileHint" class="file-hint">Drop images on the black view</div>
     </header>
 
     <main class="workspace">
       <section id="viewport" class="viewport" aria-label="Image viewport">
+        <aside id="selectionGraphPanel" class="selection-graph-panel hidden" aria-label="Selection value graph">
+          <div class="graph-titlebar">
+            <span>Selection Graph</span>
+            <strong id="selectionGraphLabel">-</strong>
+          </div>
+          <canvas id="selectionGraphCanvas" class="selection-graph-canvas"></canvas>
+          <div id="selectionGraphResize" class="graph-resize-handle"></div>
+        </aside>
         <div id="windowLayer" class="window-layer"></div>
         <div id="dropPrompt" class="drop-prompt">
           <div>Drop images here</div>
@@ -88,6 +95,20 @@
               </div>
             </div>
 
+            <div class="field">
+              <span>Save</span>
+              <div class="inline-input">
+                <select id="saveFormatSelect">
+                  <option value="png">PNG</option>
+                  <option value="jpeg">JPEG</option>
+                  <option value="webp">WebP</option>
+                  <option value="hdr" data-hdri-only>HDR RGBE</option>
+                  <option value="exr" data-hdri-only>EXR Float</option>
+                </select>
+                <button id="saveImageButton" type="button">Save</button>
+              </div>
+            </div>
+
             <div class="meta">
               <div><span>Name</span><strong id="metaName"></strong></div>
               <div><span>Size</span><strong id="metaSize"></strong></div>
@@ -99,16 +120,37 @@
 
         <aside id="pickerPanel" class="picker-panel" aria-label="Color picker values">
           <div class="panel-title picker-title">
-            <span>Pickers</span>
+            <div class="panel-tabs">
+              <button id="pickersTabButton" class="tab-button active" type="button">Pickers</button>
+              <button id="selectionTabButton" class="tab-button" type="button">Selection</button>
+            </div>
             <select id="pickerValueMode" aria-label="Picker value mode">
               <option value="linear">Linear</option>
               <option value="srgb">sRGB</option>
               <option value="srgb255">sRGB 255</option>
             </select>
           </div>
-          <div id="pickerRows" class="picker-rows"></div>
-          <textarea id="pickerCopyText" class="picker-copy-text" readonly spellcheck="false"></textarea>
-          <button id="copyPickersButton" class="copy-button" type="button">Copy</button>
+          <div id="pickersTabContent" class="panel-tab-content">
+            <div id="pickerRows" class="picker-rows"></div>
+            <textarea id="pickerCopyText" class="picker-copy-text" readonly spellcheck="false"></textarea>
+            <div class="panel-actions">
+              <button id="pickerModeButton" class="tool-button" type="button">Picker</button>
+              <button id="clearPickersButton" class="tool-button" type="button">Clear</button>
+              <select id="pickerCopyMode" aria-label="Picker copy mode">
+                <option value="full">Full CSV</option>
+                <option value="values">Values only</option>
+              </select>
+              <button id="copyPickersButton" class="copy-button" type="button">Copy</button>
+            </div>
+          </div>
+          <div id="selectionTabContent" class="panel-tab-content hidden">
+            <div id="selectionSummary" class="selection-summary">No selection.</div>
+            <textarea id="selectionMatrixText" class="picker-copy-text" readonly spellcheck="false"></textarea>
+            <div class="panel-actions">
+              <button id="copySelectionMatrixButton" class="copy-button" type="button">Copy Matrix</button>
+              <button id="downloadSelectionCsvButton" class="copy-button" type="button">CSV</button>
+            </div>
+          </div>
         </aside>
       </section>
     </main>
