@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HDRI Value Viewer</title>
+  <link rel="stylesheet" href="./style.css">
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">HDRI Value Viewer</div>
+      <label class="file-button">
+        <input id="fileInput" type="file" multiple accept="image/*,.hdr,.pic,.exr">
+        Open
+      </label>
+      <div id="fileHint" class="file-hint">Drop images on the black view</div>
+    </header>
+
+    <main class="workspace">
+      <section id="viewport" class="viewport" aria-label="Image viewport">
+        <div id="windowLayer" class="window-layer"></div>
+        <div id="dropPrompt" class="drop-prompt">
+          <div>Drop images here</div>
+          <span>PNG / JPEG / WebP / AVIF / GIF / BMP / HDR / EXR</span>
+        </div>
+
+        <aside id="inspector" class="inspector" aria-label="View settings">
+          <div class="panel-title">View Settings</div>
+
+          <div id="emptySettings" class="empty-settings">Select an image window.</div>
+
+          <div id="settingsForm" class="settings-form hidden">
+            <label class="field">
+              <span>Zoom</span>
+              <select id="zoomSelect">
+                <option value="fit">Fit</option>
+                <option value="custom" hidden>Custom</option>
+                <option value="1">100%</option>
+                <option value="2">200%</option>
+                <option value="4">400%</option>
+                <option value="8">800%</option>
+                <option value="16">1600%</option>
+                <option value="32">3200%</option>
+              </select>
+            </label>
+
+            <label class="field">
+              <span>Filtering</span>
+              <select id="filterSelect">
+                <option value="auto">Auto</option>
+                <option value="nearest">Nearest</option>
+                <option value="linear">Linear</option>
+              </select>
+            </label>
+
+            <label class="check-field">
+              <input id="autoLevelInput" type="checkbox">
+              <span>Auto level</span>
+            </label>
+
+            <div class="field">
+              <span>Brightness</span>
+              <div class="inline-input">
+                <input id="brightnessInput" type="number" value="1" min="0" step="0.01" inputmode="decimal">
+                <button id="brightnessReset" type="button">Reset</button>
+              </div>
+            </div>
+
+            <div class="field">
+              <span>Channel</span>
+              <div id="channelButtons" class="segmented">
+                <button type="button" data-channel="rgba">RGBA</button>
+                <button type="button" data-channel="rgb">RGB</button>
+                <button type="button" data-channel="r">R</button>
+                <button type="button" data-channel="g">G</button>
+                <button type="button" data-channel="b">B</button>
+                <button type="button" data-channel="a">A</button>
+              </div>
+            </div>
+
+            <div class="meta">
+              <div><span>Name</span><strong id="metaName"></strong></div>
+              <div><span>Size</span><strong id="metaSize"></strong></div>
+              <div><span>Type</span><strong id="metaType"></strong></div>
+              <div><span>Range</span><strong id="metaRange"></strong></div>
+            </div>
+          </div>
+        </aside>
+      </section>
+    </main>
+
+    <footer class="statusbar">
+      <div id="pixelPosition">x: -, y: -</div>
+      <div id="linearValue">Linear: -</div>
+      <div id="srgbValue">sRGB: -</div>
+      <div id="viewState">100%</div>
+    </footer>
+  </div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
