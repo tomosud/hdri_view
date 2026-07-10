@@ -53,6 +53,10 @@ const minWindowHeight = 160;
 const minGraphWidth = 180;
 const minGraphHeight = 140;
 const maxPickers = 20;
+const sessionDbName = "hdri-value-viewer";
+const sessionDbVersion = 1;
+const sessionStoreName = "session";
+const sessionKey = "current";
 const pickerColors = [
   "#ff365e", "#35d0ff", "#ffe156", "#69f28d", "#c77dff",
   "#ff9f1c", "#2ec4b6", "#f15bb5", "#b8f35a", "#4d96ff",
@@ -70,11 +74,21 @@ let pickerMode = false;
 let internalClipboard = null;
 let topUiZ = 100000;
 let activePanelTab = "pickers";
+let saveSessionTimer = null;
+let restoringSession = false;
 const graphView = {
   yaw: -0.72,
   pitch: 0.92
 };
 const graphCtx = selectionGraphCanvas.getContext("2d");
+
+fileInput.addEventListener("click", (event) => {
+  if (!window.showOpenFilePicker) {
+    return;
+  }
+  event.preventDefault();
+  void openFilesWithPicker();
+});
 
 fileInput.addEventListener("change", () => {
   void openFiles(fileInput.files);
@@ -88,9 +102,13 @@ pickerModeButton.addEventListener("click", () => {
 pickerValueMode.addEventListener("change", () => {
   updatePickerPanel();
   updateSelectionPanel();
+  scheduleSessionSave();
 });
 
-pickerCopyMode.addEventListener("change", () => updatePickerPanel());
+pickerCopyMode.addEventListener("change", () => {
+  updatePickerPanel();
+  scheduleSessionSave();
+});
 
 pickersTabButton.addEventListener("click", () => setPanelTab("pickers"));
 selectionTabButton.addEventListener("click", () => setPanelTab("selection"));
@@ -140,6 +158,7 @@ clearPickersButton.addEventListener("click", () => {
     }
     updatePickerPanel();
     requestRender();
+    scheduleSessionSave();
   }
 });
 
@@ -205,7 +224,7 @@ viewport.addEventListener("drop", (event) => {
   event.preventDefault();
   viewport.classList.remove("drag-over");
   const rect = viewport.getBoundingClientRect();
-  void openFiles(event.dataTransfer.files, {
+  void openDroppedFiles(event, {
     x: event.clientX - rect.left,
     y: event.clientY - rect.top
   });
@@ -218,18 +237,13 @@ viewport.addEventListener("pointerdown", (event) => {
 });
 
 document.addEventListener("paste", (event) => {
-  if (selectedId !== null) {
+  if (shouldKeepNativeClipboardEvent(event)) {
     return;
   }
-  if (internalClipboard?.internalOnly) {
-    event.preventDefault();
-    pasteInternalClipboard();
-    return;
-  }
-  const files = Array.from(event.clipboardData?.files || []).filter((file) => file.type.startsWith("image/"));
+  const files = Array.from(event.clipboardData?.files || []).filter(isSupportedClipboardFile);
   if (files.length > 0) {
     event.preventDefault();
-    void openFiles(files);
+    void openFiles(files, null, { embedded: true });
     return;
   }
   if (internalClipboard) {
@@ -239,6 +253,9 @@ document.addEventListener("paste", (event) => {
 });
 
 document.addEventListener("copy", (event) => {
+  if (shouldKeepNativeClipboardEvent(event) || hasNativeTextSelection()) {
+    return;
+  }
   const image = currentImage();
   if (!image?.selection) {
     return;
@@ -246,6 +263,27 @@ document.addEventListener("copy", (event) => {
   event.preventDefault();
   void copySelection(image, image.selection);
 });
+
+function shouldKeepNativeClipboardEvent(event) {
+  const target = event.target;
+  if (!(target instanceof Element)) {
+    return false;
+  }
+  return Boolean(target.closest("input, textarea, [contenteditable='true']"));
+}
+
+function hasNativeTextSelection() {
+  const selection = window.getSelection?.();
+  return Boolean(selection && !selection.isCollapsed && selection.toString());
+}
+
+function isSupportedClipboardFile(file) {
+  if (file.type.startsWith("image/")) {
+    return true;
+  }
+  const extension = file.name.split(".").pop()?.toLowerCase();
+  return extension === "hdr" || extension === "pic" || extension === "exr";
+}
 
 zoomSelect.addEventListener("change", () => {
   const image = currentImage();
@@ -268,6 +306,7 @@ filterSelect.addEventListener("change", () => {
   }
   image.settings.filter = filterSelect.value;
   requestRender();
+  scheduleSessionSave();
 });
 
 autoLevelInput.addEventListener("change", () => {
@@ -278,6 +317,7 @@ autoLevelInput.addEventListener("change", () => {
   image.settings.autoLevel = autoLevelInput.checked;
   image.displayDirty = true;
   requestRender();
+  scheduleSessionSave();
 });
 
 brightnessInput.addEventListener("change", () => {
@@ -290,6 +330,7 @@ brightnessInput.addEventListener("change", () => {
   brightnessInput.value = String(image.settings.brightness);
   image.displayDirty = true;
   requestRender();
+  scheduleSessionSave();
 });
 
 brightnessInput.addEventListener("input", () => {
@@ -302,6 +343,7 @@ brightnessInput.addEventListener("input", () => {
     image.settings.brightness = value;
     image.displayDirty = true;
     requestRender();
+    scheduleSessionSave();
   }
 });
 
@@ -314,6 +356,7 @@ brightnessReset.addEventListener("click", () => {
   brightnessInput.value = "1";
   image.displayDirty = true;
   requestRender();
+  scheduleSessionSave();
 });
 
 channelButtons.addEventListener("click", (event) => {
@@ -329,6 +372,7 @@ channelButtons.addEventListener("click", (event) => {
   updateSelectionPanel();
   drawSelectionGraph();
   requestRender();
+  scheduleSessionSave();
 });
 
 new ResizeObserver(() => {
@@ -384,6 +428,7 @@ document.addEventListener("pointermove", (event) => {
 });
 
 document.addEventListener("pointerup", (event) => {
+  const completedDragKind = activeDrag?.kind;
   if (activeDrag?.kind === "selectRect") {
     const image = activeDrag.image;
     const rect = image.selection;
@@ -393,7 +438,7 @@ document.addEventListener("pointerup", (event) => {
       // Pointer capture may already be released by the browser.
     }
     if (activeDrag.moved && rect && rect.width > 0 && rect.height > 0) {
-      void copySelection(image, rect);
+      fileHint.textContent = `Selected ${rect.width} x ${rect.height}`;
     } else {
       image.selection = null;
       updateSelectionPanel();
@@ -402,6 +447,9 @@ document.addEventListener("pointerup", (event) => {
     }
   }
   activeDrag = null;
+  if (completedDragKind) {
+    scheduleSessionSave();
+  }
 });
 
 makeFloatingPanelDraggable(inspector);
@@ -410,34 +458,136 @@ makeFloatingPanelDraggable(selectionGraphPanel);
 updatePickerPanel();
 requestRender();
 drawSelectionGraph();
+void restoreSavedSession();
 
-async function openFiles(fileList, dropPoint = null) {
-  const files = Array.from(fileList || []).filter((file) => file.size > 0);
+async function openFilesWithPicker() {
+  try {
+    const handles = await window.showOpenFilePicker({
+      multiple: true,
+      types: [{
+        description: "Images",
+        accept: {
+          "image/*": [".png", ".jpg", ".jpeg", ".webp", ".avif", ".gif", ".bmp", ".hdr", ".pic", ".exr"]
+        }
+      }]
+    });
+    await openFileHandles(handles);
+  } catch (error) {
+    if (error?.name !== "AbortError") {
+      console.error(error);
+      fileHint.textContent = "Open failed.";
+    }
+  } finally {
+    fileInput.value = "";
+  }
+}
+
+async function openDroppedFiles(event, dropPoint = null) {
+  const handleItems = Array.from(event.dataTransfer?.items || [])
+    .filter((item) => item.kind === "file" && typeof item.getAsFileSystemHandle === "function");
+  if (handleItems.length > 0) {
+    const handles = [];
+    for (const item of handleItems) {
+      const handle = await item.getAsFileSystemHandle().catch(() => null);
+      if (handle?.kind === "file") {
+        handles.push(handle);
+      }
+    }
+    if (handles.length > 0) {
+      await openFileHandles(handles, dropPoint);
+      return;
+    }
+  }
+  await openFiles(event.dataTransfer.files, dropPoint);
+}
+
+async function openFileHandles(handles, dropPoint = null) {
+  const entries = [];
+  for (const handle of handles) {
+    try {
+      const file = await handle.getFile();
+      entries.push({ file, handle });
+    } catch (error) {
+      console.warn(error);
+    }
+  }
+  await openFileEntries(entries, dropPoint);
+}
+
+async function openFiles(fileList, dropPoint = null, options = {}) {
+  const entries = Array.from(fileList || [])
+    .filter((file) => file.size > 0)
+    .map((file) => ({ file, embedded: Boolean(options.embedded) }));
+  await openFileEntries(entries, dropPoint);
+}
+
+async function openFileEntries(entries, dropPoint = null) {
+  const files = entries.filter((entry) => entry.file?.size > 0);
   if (files.length === 0) {
     return;
   }
 
   fileHint.textContent = `Loading ${files.length} file${files.length === 1 ? "" : "s"}...`;
 
+  let openedCount = 0;
+  const failed = [];
   for (let index = 0; index < files.length; index += 1) {
-    const file = files[index];
+    const entry = files[index];
+    const file = entry.file;
     try {
       const image = await loadImageFile(file);
+      image.source = imageSourceForEntry(file, entry);
       images.push(image);
       createImageWindow(image, dropPoint, index);
       selectImage(image);
       fitImageToWindow(image, false);
       updatePickerPanel();
       requestRender();
+      openedCount += 1;
     } catch (error) {
       console.error(error);
-      fileHint.textContent = `Failed: ${file.name}`;
+      failed.push(formatFileError(file, error));
+      fileHint.textContent = failed[failed.length - 1];
     }
   }
 
   dropPrompt.classList.toggle("hidden", images.length > 0);
-  fileHint.textContent = `${images.length} image${images.length === 1 ? "" : "s"} opened`;
+  if (failed.length > 0) {
+    fileHint.textContent = openedCount > 0
+      ? `Opened ${openedCount}; ${failed.join("; ")}`
+      : failed.join("; ");
+  } else {
+    fileHint.textContent = `${images.length} image${images.length === 1 ? "" : "s"} opened`;
+  }
   updatePickerCursor();
+  scheduleSessionSave();
+}
+
+function imageSourceForEntry(file, entry) {
+  if (entry.embedded) {
+    return { kind: "embedded" };
+  }
+  if (entry.handle) {
+    return {
+      kind: "file-handle",
+      handle: entry.handle,
+      name: file.name,
+      size: file.size,
+      lastModified: file.lastModified
+    };
+  }
+  return {
+    kind: "external",
+    name: file.name,
+    size: file.size,
+    lastModified: file.lastModified
+  };
+}
+
+function formatFileError(file, error) {
+  const rawMessage = error instanceof Error ? error.message : String(error || "");
+  const message = rawMessage.replace(/^THREE\.EXRLoader:\s*/, "").trim();
+  return message ? `Failed: ${file.name} (${message})` : `Failed: ${file.name}`;
 }
 
 async function loadImageFile(file) {
@@ -490,13 +640,16 @@ async function loadDataTexture(file, kind) {
   const itemSize = Math.max(1, Math.round(data.length / (width * height)));
   const pixels = new Float32Array(width * height * 4);
 
-  for (let pixel = 0; pixel < width * height; pixel += 1) {
-    const sourceIndex = pixel * itemSize;
-    const targetIndex = pixel * 4;
-    pixels[targetIndex] = readTextureValue(data, sourceIndex);
-    pixels[targetIndex + 1] = readTextureValue(data, sourceIndex + Math.min(1, itemSize - 1));
-    pixels[targetIndex + 2] = readTextureValue(data, sourceIndex + Math.min(2, itemSize - 1));
-    pixels[targetIndex + 3] = itemSize >= 4 ? readTextureValue(data, sourceIndex + 3) : 1;
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const sourcePixel = kind === "exr" ? (height - 1 - y) * width + x : y * width + x;
+      const sourceIndex = sourcePixel * itemSize;
+      const targetIndex = (y * width + x) * 4;
+      pixels[targetIndex] = readTextureValue(data, sourceIndex);
+      pixels[targetIndex + 1] = readTextureValue(data, sourceIndex + Math.min(1, itemSize - 1));
+      pixels[targetIndex + 2] = readTextureValue(data, sourceIndex + Math.min(2, itemSize - 1));
+      pixels[targetIndex + 3] = itemSize >= 4 ? readTextureValue(data, sourceIndex + 3) : 1;
+    }
   }
 
   parsed.dispose?.();
@@ -530,7 +683,7 @@ function parseUncompressedExr(buffer) {
   }
 
   const version = view.getUint32(4, true);
-  if ((version & 0x200) || (version & 0x1000)) {
+  if ((version & 0x200) || (version & 0x800) || (version & 0x1000)) {
     return null;
   }
 
@@ -561,14 +714,12 @@ function parseUncompressedExr(buffer) {
   const compressionAttr = attributes.get("compression");
   const dataWindowAttr = attributes.get("dataWindow");
   const channelsAttr = attributes.get("channels");
-  const lineOrderAttr = attributes.get("lineOrder");
   if (!compressionAttr || !dataWindowAttr || !channelsAttr) {
     return null;
   }
   if (view.getUint8(compressionAttr.offset) !== 0) {
     return null;
   }
-  const lineOrder = lineOrderAttr ? view.getUint8(lineOrderAttr.offset) : 0;
 
   const dataWindow = readBox2i(view, dataWindowAttr.offset);
   const width = dataWindow.maxX - dataWindow.minX + 1;
@@ -578,7 +729,7 @@ function parseUncompressedExr(buffer) {
   }
 
   const channels = readExrChannels(view, channelsAttr.offset, channelsAttr.size);
-  if (channels.length === 0) {
+  if (channels.length === 0 || channels.some((channel) => !channel.supported)) {
     return null;
   }
 
@@ -604,7 +755,7 @@ function parseUncompressedExr(buffer) {
     const packedSize = view.getUint32(chunkOffset + 4, true);
     let dataOffset = chunkOffset + 8;
     const yOffset = yCoord - dataWindow.minY;
-    const rowIndex = lineOrder === 1 ? height - 1 - yOffset : yOffset;
+    const rowIndex = yOffset;
     if (rowIndex < 0 || rowIndex >= height || dataOffset + packedSize > view.byteLength) {
       return null;
     }
@@ -680,9 +831,11 @@ function readExrChannels(view, offset, size) {
     const xSampling = view.getInt32(offset, true);
     const ySampling = view.getInt32(offset + 4, true);
     offset += 8;
-    if (xSampling === 1 && ySampling === 1 && exrSampleByteSize(pixelType) > 0) {
-      channels.push({ name, pixelType });
-    }
+    channels.push({
+      name,
+      pixelType,
+      supported: xSampling === 1 && ySampling === 1 && exrSampleByteSize(pixelType) > 0
+    });
   }
   return channels;
 }
@@ -727,6 +880,7 @@ function createImageRecord(file, width, height, type, pixels, sourceFormat = "ra
     height,
     type,
     sourceFormat,
+    source: { kind: "external", name: file.name },
     pixels,
     range,
     settings: {
@@ -948,6 +1102,7 @@ function selectImage(image) {
   updateSelectionPanel();
   drawSelectionGraph();
   updateViewState();
+  scheduleSessionSave();
 }
 
 function clearActiveSelection() {
@@ -959,6 +1114,7 @@ function clearActiveSelection() {
   updateSelectionPanel();
   drawSelectionGraph();
   updateViewState();
+  scheduleSessionSave();
 }
 
 function applyWindowGeometry(image) {
@@ -989,6 +1145,7 @@ function makeFloatingPanelDraggable(panel) {
     }
     panel.classList.toggle("collapsed");
     drawSelectionGraph();
+    scheduleSessionSave();
   });
 
   title.addEventListener("pointerdown", (event) => {
@@ -1048,6 +1205,7 @@ function closeImage(image) {
   updateSelectionPanel();
   drawSelectionGraph();
   requestRender();
+  scheduleSessionSave();
 }
 
 function togglePickerAtEvent(image, event) {
@@ -1064,6 +1222,7 @@ function togglePickerAtEvent(image, event) {
     image.pickers.splice(existingIndex, 1);
     updatePickerPanel();
     requestRender();
+    scheduleSessionSave();
     return;
   }
 
@@ -1081,6 +1240,7 @@ function togglePickerAtEvent(image, event) {
   nextPickerId += 1;
   updatePickerPanel();
   requestRender();
+  scheduleSessionSave();
 }
 
 function removePicker(pickerId) {
@@ -1093,6 +1253,7 @@ function removePicker(pickerId) {
       image.pickers.splice(index, 1);
       updatePickerPanel();
       requestRender();
+      scheduleSessionSave();
       return;
     }
   }
@@ -1269,6 +1430,7 @@ function pasteInternalClipboard() {
     new Float32Array(copied.pixels),
     copied.sourceFormat
   );
+  image.source = { kind: "embedded" };
   images.push(image);
   createImageWindow(image, null, 0);
   selectImage(image);
@@ -1276,6 +1438,7 @@ function pasteInternalClipboard() {
   dropPrompt.classList.add("hidden");
   fileHint.textContent = `${images.length} image${images.length === 1 ? "" : "s"} opened`;
   requestRender();
+  scheduleSessionSave();
 }
 
 function saveImage(image, format) {
@@ -1387,7 +1550,7 @@ function encodeExr(image) {
     writer.i32(image.width - 1);
     writer.i32(image.height - 1);
   });
-  writeExrAttribute(header, "lineOrder", "lineOrder", (writer) => writer.u8(1));
+  writeExrAttribute(header, "lineOrder", "lineOrder", (writer) => writer.u8(0));
   writeExrAttribute(header, "pixelAspectRatio", "float", (writer) => writer.f32(1));
   writeExrAttribute(header, "screenWindowCenter", "v2f", (writer) => {
     writer.f32(0);
@@ -1411,7 +1574,7 @@ function encodeExr(image) {
   }
 
   for (let y = 0; y < image.height; y += 1) {
-    out.i32(image.height - 1 - y);
+    out.i32(y);
     out.u32(chunkDataSize);
     for (const channelIndex of [3, 2, 1, 0]) {
       for (let x = 0; x < image.width; x += 1) {
@@ -1522,6 +1685,307 @@ class ByteWriter {
   }
 }
 
+function scheduleSessionSave() {
+  if (restoringSession || !window.indexedDB) {
+    return;
+  }
+  clearTimeout(saveSessionTimer);
+  saveSessionTimer = setTimeout(() => {
+    saveSessionTimer = null;
+    void saveCurrentSession();
+  }, 450);
+}
+
+async function saveCurrentSession() {
+  try {
+    const db = await openSessionDb();
+    await idbPut(db, sessionStoreName, buildSessionRecord(), sessionKey);
+    db.close();
+  } catch (error) {
+    console.warn("Session save skipped.", error);
+  }
+}
+
+async function restoreSavedSession() {
+  if (!window.indexedDB) {
+    return;
+  }
+
+  restoringSession = true;
+  try {
+    const db = await openSessionDb();
+    const session = await idbGet(db, sessionStoreName, sessionKey);
+    db.close();
+    if (!session || session.version !== 1) {
+      return;
+    }
+
+    applyAppSessionState(session);
+
+    let restoredCount = 0;
+    let skippedCount = 0;
+    for (const savedImage of session.images || []) {
+      try {
+        const image = await restoreImageFromSession(savedImage);
+        if (!image) {
+          skippedCount += 1;
+          continue;
+        }
+        images.push(image);
+        createImageWindow(image, null, restoredCount);
+        applySavedImageState(image, savedImage);
+        applyWindowGeometry(image);
+        restoredCount += 1;
+      } catch (error) {
+        skippedCount += 1;
+        console.warn("Saved image restore skipped.", error);
+      }
+    }
+
+    nextId = Math.max(nextId, ...images.map((image) => image.id + 1), session.nextId || 1);
+    nextPickerId = Math.max(nextPickerId, ...allPickers().map(({ picker }) => picker.id + 1), session.nextPickerId || 1);
+    topZ = Math.max(topZ, ...images.map((image) => image.window.z), session.topZ || topZ);
+    topUiZ = Math.max(topUiZ, session.topUiZ || topUiZ);
+    selectedId = images.some((image) => image.id === session.selectedId) ? session.selectedId : images.at(-1)?.id ?? null;
+
+    dropPrompt.classList.toggle("hidden", images.length > 0);
+    if (selectedId !== null) {
+      const image = currentImage();
+      if (image) {
+        selectImage(image);
+      }
+    } else {
+      updateSettingsPanel();
+      updateSelectionPanel();
+      drawSelectionGraph();
+      updateViewState();
+    }
+    updatePickerPanel();
+    updatePickerCursor();
+    requestRender();
+
+    if (restoredCount > 0 || skippedCount > 0) {
+      fileHint.textContent = skippedCount > 0
+        ? `Restored ${restoredCount}; skipped ${skippedCount} unavailable`
+        : `Restored ${restoredCount} image${restoredCount === 1 ? "" : "s"}`;
+    }
+  } catch (error) {
+    console.warn("Session restore skipped.", error);
+  } finally {
+    restoringSession = false;
+  }
+}
+
+function buildSessionRecord() {
+  return {
+    version: 1,
+    savedAt: Date.now(),
+    selectedId,
+    nextId,
+    nextPickerId,
+    topZ,
+    topUiZ,
+    activePanelTab,
+    pickerMode,
+    pickerValueMode: pickerValueMode.value,
+    pickerCopyMode: pickerCopyMode.value,
+    graphView: { ...graphView },
+    panels: {
+      inspector: panelSessionState(inspector),
+      picker: panelSessionState(pickerPanel),
+      graph: panelSessionState(selectionGraphPanel)
+    },
+    images: images.map(imageSessionState)
+  };
+}
+
+function imageSessionState(image) {
+  return {
+    id: image.id,
+    name: image.name,
+    width: image.width,
+    height: image.height,
+    type: image.type,
+    sourceFormat: image.sourceFormat,
+    source: imageSourceSessionState(image),
+    settings: { ...image.settings },
+    view: { ...image.view },
+    pickers: image.pickers.map((picker) => ({ ...picker })),
+    selection: image.selection ? { ...image.selection } : null,
+    window: { ...image.window }
+  };
+}
+
+function imageSourceSessionState(image) {
+  const source = image.source || { kind: "external" };
+  if (source.kind === "embedded") {
+    return {
+      kind: "embedded",
+      pixels: image.pixels.buffer.slice(image.pixels.byteOffset, image.pixels.byteOffset + image.pixels.byteLength)
+    };
+  }
+  if (source.kind === "file-handle" && source.handle) {
+    return {
+      kind: "file-handle",
+      handle: source.handle,
+      name: source.name || image.name,
+      size: source.size || 0,
+      lastModified: source.lastModified || 0
+    };
+  }
+  return {
+    kind: "external",
+    name: source.name || image.name,
+    size: source.size || 0,
+    lastModified: source.lastModified || 0
+  };
+}
+
+function panelSessionState(panel) {
+  return {
+    collapsed: panel.classList.contains("collapsed"),
+    left: panel.style.left,
+    top: panel.style.top,
+    right: panel.style.right,
+    bottom: panel.style.bottom,
+    width: panel.style.width,
+    height: panel.style.height,
+    zIndex: panel.style.zIndex
+  };
+}
+
+function applyAppSessionState(session) {
+  if (typeof session.pickerValueMode === "string") {
+    pickerValueMode.value = session.pickerValueMode;
+  }
+  if (typeof session.pickerCopyMode === "string") {
+    pickerCopyMode.value = session.pickerCopyMode;
+  }
+  if (session.graphView) {
+    graphView.yaw = finiteOrDefault(session.graphView.yaw, graphView.yaw);
+    graphView.pitch = finiteOrDefault(session.graphView.pitch, graphView.pitch);
+  }
+  applyPanelSessionState(inspector, session.panels?.inspector);
+  applyPanelSessionState(pickerPanel, session.panels?.picker);
+  applyPanelSessionState(selectionGraphPanel, session.panels?.graph);
+  setPanelTab(session.activePanelTab === "selection" ? "selection" : "pickers");
+  setPickerMode(Boolean(session.pickerMode));
+}
+
+function applyPanelSessionState(panel, state) {
+  if (!state) {
+    return;
+  }
+  panel.classList.toggle("collapsed", Boolean(state.collapsed));
+  for (const key of ["left", "top", "right", "bottom", "width", "height", "zIndex"]) {
+    if (typeof state[key] === "string") {
+      panel.style[key] = state[key];
+    }
+  }
+}
+
+async function restoreImageFromSession(savedImage) {
+  const source = savedImage.source || {};
+  if (source.kind === "embedded" && source.pixels instanceof ArrayBuffer) {
+    const pixels = new Float32Array(source.pixels);
+    if (pixels.length !== savedImage.width * savedImage.height * 4) {
+      return null;
+    }
+    const image = createImageRecord(
+      { name: savedImage.name || "pasted image" },
+      savedImage.width,
+      savedImage.height,
+      savedImage.type || "raster/srgb",
+      pixels,
+      savedImage.sourceFormat || "raster"
+    );
+    image.source = { kind: "embedded" };
+    return image;
+  }
+
+  if (source.kind === "file-handle" && source.handle && typeof source.handle.getFile === "function") {
+    const file = await source.handle.getFile();
+    const image = await loadImageFile(file);
+    image.source = {
+      kind: "file-handle",
+      handle: source.handle,
+      name: file.name,
+      size: file.size,
+      lastModified: file.lastModified
+    };
+    return image;
+  }
+
+  return null;
+}
+
+function applySavedImageState(image, savedImage) {
+  image.id = Number.isInteger(savedImage.id) ? savedImage.id : image.id;
+  image.name = savedImage.name || image.name;
+  image.settings = {
+    ...image.settings,
+    ...(savedImage.settings || {})
+  };
+  image.view = {
+    ...image.view,
+    ...(savedImage.view || {})
+  };
+  image.pickers = Array.isArray(savedImage.pickers)
+    ? savedImage.pickers.filter((picker) => Number.isInteger(picker.x) && Number.isInteger(picker.y)).map((picker) => ({ ...picker }))
+    : [];
+  image.selection = savedImage.selection ? clampSavedRect(savedImage.selection, image.width, image.height) : null;
+  image.window = {
+    ...image.window,
+    ...(savedImage.window || {})
+  };
+  if (image.elements) {
+    image.elements.frame.dataset.id = String(image.id);
+    image.elements.frame.querySelector(".window-title").textContent = image.name;
+    image.elements.frame.querySelector(".window-size").textContent = `${image.width}x${image.height}`;
+  }
+  image.displayDirty = true;
+}
+
+function clampSavedRect(rect, width, height) {
+  const x = clamp(Math.floor(rect.x || 0), 0, Math.max(0, width - 1));
+  const y = clamp(Math.floor(rect.y || 0), 0, Math.max(0, height - 1));
+  const rectWidth = clamp(Math.floor(rect.width || 1), 1, width - x);
+  const rectHeight = clamp(Math.floor(rect.height || 1), 1, height - y);
+  return { x, y, width: rectWidth, height: rectHeight };
+}
+
+function finiteOrDefault(value, fallback) {
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function openSessionDb() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(sessionDbName, sessionDbVersion);
+    request.onupgradeneeded = () => {
+      request.result.createObjectStore(sessionStoreName);
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+function idbGet(db, storeName, key) {
+  return new Promise((resolve, reject) => {
+    const request = db.transaction(storeName, "readonly").objectStore(storeName).get(key);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+function idbPut(db, storeName, value, key) {
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(storeName, "readwrite");
+    transaction.objectStore(storeName).put(value, key);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+  });
+}
+
 function stripExtension(name) {
   return name.replace(/\.[^.]+$/, "");
 }
@@ -1541,12 +2005,14 @@ function setPanelTab(tab) {
   } else {
     updateSelectionPanel();
   }
+  scheduleSessionSave();
 }
 
 function setPickerMode(enabled) {
   pickerMode = enabled && activePanelTab === "pickers";
   pickerModeButton.classList.toggle("active", pickerMode);
   updatePickerCursor();
+  scheduleSessionSave();
 }
 
 function updatePickerPanel() {
@@ -1712,7 +2178,7 @@ function drawSelectionGraph() {
   }
 
   selectionGraphPanel.classList.remove("hidden");
-  selectionGraphLabel.textContent = `${rect.width} x ${rect.height} ${graphModeLabel(image)}`;
+  selectionGraphLabel.textContent = `${rect.width} x ${rect.height} px ${graphModeLabel(image)}`;
   if (selectionGraphPanel.classList.contains("collapsed")) {
     return;
   }
@@ -1747,45 +2213,10 @@ function drawSelectionGraph() {
   graphCtx.save();
   drawGraphBase(samples, projector);
 
-  const quads = [];
-  for (let row = 0; row < samples.rows - 1; row += 1) {
-    for (let col = 0; col < samples.cols - 1; col += 1) {
-      const v00 = samples.values[row][col];
-      const v10 = samples.values[row][col + 1];
-      const v11 = samples.values[row + 1][col + 1];
-      const v01 = samples.values[row + 1][col];
-      const avg = (v00 + v10 + v11 + v01) / 4;
-      const depth =
-        projector.depth(col, row) +
-        projector.depth(col + 1, row) +
-        projector.depth(col + 1, row + 1) +
-        projector.depth(col, row + 1);
-      quads.push({
-        depth,
-        color: graphColor((avg - min) / range),
-        points: [
-          projector.surface(col, row, v00),
-          projector.surface(col + 1, row, v10),
-          projector.surface(col + 1, row + 1, v11),
-          projector.surface(col, row + 1, v01)
-        ]
-      });
-    }
-  }
-
-  quads.sort((a, b) => a.depth - b.depth);
-  for (const quad of quads) {
-    graphCtx.beginPath();
-    graphCtx.moveTo(quad.points[0].x, quad.points[0].y);
-    graphCtx.lineTo(quad.points[1].x, quad.points[1].y);
-    graphCtx.lineTo(quad.points[2].x, quad.points[2].y);
-    graphCtx.lineTo(quad.points[3].x, quad.points[3].y);
-    graphCtx.closePath();
-    graphCtx.fillStyle = quad.color;
-    graphCtx.fill();
-    graphCtx.strokeStyle = "rgba(8, 12, 18, 0.36)";
-    graphCtx.lineWidth = 0.6;
-    graphCtx.stroke();
+  if (samples.stepped) {
+    drawSteppedGraph(samples, projector, min, range);
+  } else {
+    drawInterpolatedGraph(samples, projector, min, range);
   }
 
   drawGraphLegend(width, height, min, max);
@@ -1793,17 +2224,22 @@ function drawSelectionGraph() {
 }
 
 function selectionGraphSamples(image, rect) {
-  const cols = Math.max(2, Math.min(36, rect.width));
-  const rows = Math.max(2, Math.min(36, rect.height));
+  const stepped = rect.width <= 18 && rect.height <= 18;
+  const cols = stepped ? rect.width : Math.max(2, Math.min(36, rect.width));
+  const rows = stepped ? rect.height : Math.max(2, Math.min(36, rect.height));
   const values = [];
   let min = Infinity;
   let max = -Infinity;
 
   for (let row = 0; row < rows; row += 1) {
-    const y = rect.y + Math.round((rect.height - 1) * (rows === 1 ? 0 : row / (rows - 1)));
+    const y = stepped
+      ? rect.y + row
+      : rect.y + Math.round((rect.height - 1) * (rows === 1 ? 0 : row / (rows - 1)));
     const line = [];
     for (let col = 0; col < cols; col += 1) {
-      const x = rect.x + Math.round((rect.width - 1) * (cols === 1 ? 0 : col / (cols - 1)));
+      const x = stepped
+        ? rect.x + col
+        : rect.x + Math.round((rect.width - 1) * (cols === 1 ? 0 : col / (cols - 1)));
       const value = graphPixelValue(image, x, y);
       line.push(value);
       if (Number.isFinite(value)) {
@@ -1818,7 +2254,7 @@ function selectionGraphSamples(image, rect) {
     min = 0;
     max = 0;
   }
-  return { cols, rows, values, min, max };
+  return { cols, rows, values, min, max, stepped };
 }
 
 function graphPixelValue(image, x, y) {
@@ -1851,6 +2287,124 @@ function graphModeLabel(image) {
   return "Luminance";
 }
 
+function drawInterpolatedGraph(samples, projector, min, range) {
+  const quads = [];
+  for (let row = 0; row < samples.rows - 1; row += 1) {
+    for (let col = 0; col < samples.cols - 1; col += 1) {
+      const v00 = samples.values[row][col];
+      const v10 = samples.values[row][col + 1];
+      const v11 = samples.values[row + 1][col + 1];
+      const v01 = samples.values[row + 1][col];
+      const avg = (v00 + v10 + v11 + v01) / 4;
+      quads.push({
+        depth: graphFaceDepth(projector, col, row, col + 1, row + 1),
+        color: graphColor((avg - min) / range),
+        alpha: 1,
+        stroke: "rgba(8, 12, 18, 0.36)",
+        points: [
+          projector.surface(col, row, v00),
+          projector.surface(col + 1, row, v10),
+          projector.surface(col + 1, row + 1, v11),
+          projector.surface(col, row + 1, v01)
+        ]
+      });
+    }
+  }
+
+  drawGraphFaces(quads, 0.6);
+}
+
+function drawSteppedGraph(samples, projector, min, range) {
+  const faces = [];
+  const valueAt = (col, row) => samples.values[row][col];
+  const normalized = (value) => (value - min) / range;
+
+  for (let row = 0; row < samples.rows; row += 1) {
+    for (let col = 0; col < samples.cols; col += 1) {
+      const value = valueAt(col, row);
+      addSteppedTopFace(faces, projector, col, row, value, normalized(value));
+
+      if (col === 0) {
+        addSteppedSideFace(faces, projector, col, row, col, row + 1, value, min, normalized(value));
+      }
+      if (row === 0) {
+        addSteppedSideFace(faces, projector, col, row, col + 1, row, value, min, normalized(value));
+      }
+      if (col === samples.cols - 1) {
+        addSteppedSideFace(faces, projector, col + 1, row, col + 1, row + 1, value, min, normalized(value));
+      } else {
+        const next = valueAt(col + 1, row);
+        if (Math.abs(next - value) > 1e-12) {
+          addSteppedSideFace(faces, projector, col + 1, row, col + 1, row + 1, value, next, normalized((value + next) / 2));
+        }
+      }
+      if (row === samples.rows - 1) {
+        addSteppedSideFace(faces, projector, col, row + 1, col + 1, row + 1, value, min, normalized(value));
+      } else {
+        const next = valueAt(col, row + 1);
+        if (Math.abs(next - value) > 1e-12) {
+          addSteppedSideFace(faces, projector, col, row + 1, col + 1, row + 1, value, next, normalized((value + next) / 2));
+        }
+      }
+    }
+  }
+
+  drawGraphFaces(faces, 0.9);
+}
+
+function addSteppedTopFace(faces, projector, col, row, value, colorValue) {
+  faces.push({
+    depth: graphFaceDepth(projector, col, row, col + 1, row + 1),
+    color: graphColor(colorValue),
+    alpha: 1,
+    stroke: "rgba(5, 8, 12, 0.62)",
+    points: [
+      projector.surface(col, row, value),
+      projector.surface(col + 1, row, value),
+      projector.surface(col + 1, row + 1, value),
+      projector.surface(col, row + 1, value)
+    ]
+  });
+}
+
+function addSteppedSideFace(faces, projector, x0, y0, x1, y1, valueA, valueB, colorValue) {
+  faces.push({
+    depth: graphFaceDepth(projector, x0, y0, x1, y1),
+    color: graphColor(colorValue),
+    alpha: 0.72,
+    stroke: "rgba(5, 8, 12, 0.46)",
+    points: [
+      projector.surface(x0, y0, valueA),
+      projector.surface(x1, y1, valueA),
+      projector.surface(x1, y1, valueB),
+      projector.surface(x0, y0, valueB)
+    ]
+  });
+}
+
+function graphFaceDepth(projector, x0, y0, x1, y1) {
+  return projector.depth(x0, y0) + projector.depth(x1, y0) + projector.depth(x1, y1) + projector.depth(x0, y1);
+}
+
+function drawGraphFaces(faces, lineWidth) {
+  faces.sort((a, b) => a.depth - b.depth);
+  for (const face of faces) {
+    graphCtx.beginPath();
+    graphCtx.moveTo(face.points[0].x, face.points[0].y);
+    for (const point of face.points.slice(1)) {
+      graphCtx.lineTo(point.x, point.y);
+    }
+    graphCtx.closePath();
+    graphCtx.globalAlpha = face.alpha;
+    graphCtx.fillStyle = face.color;
+    graphCtx.fill();
+    graphCtx.globalAlpha = 1;
+    graphCtx.strokeStyle = face.stroke;
+    graphCtx.lineWidth = lineWidth;
+    graphCtx.stroke();
+  }
+}
+
 function makeGraphProjector(samples, rect, width, height, min, range) {
   const plot = {
     left: 12,
@@ -1861,33 +2415,65 @@ function makeGraphProjector(samples, rect, width, height, min, range) {
   const aspect = rect.width / rect.height;
   const worldWidth = aspect >= 1 ? 1.7 : clamp(1.7 * aspect, 0.42, 1.7);
   const worldDepth = aspect >= 1 ? clamp(1.7 / aspect, 0.42, 1.7) : 1.7;
-  const worldHeight = 0.78;
-  const rawPoints = [];
-
-  for (let row = 0; row < samples.rows; row += 1) {
-    for (let col = 0; col < samples.cols; col += 1) {
-      rawPoints.push(projectGraphPoint(col, row, 0, samples, worldWidth, worldDepth, worldHeight));
-      rawPoints.push(projectGraphPoint(col, row, 1, samples, worldWidth, worldDepth, worldHeight));
-    }
-  }
-
-  const extent = rawPoints.reduce((result, point) => ({
-    minX: Math.min(result.minX, point.x),
-    maxX: Math.max(result.maxX, point.x),
-    minY: Math.min(result.minY, point.y),
-    maxY: Math.max(result.maxY, point.y)
-  }), {
-    minX: Infinity,
-    maxX: -Infinity,
-    minY: Infinity,
-    maxY: -Infinity
-  });
-
+  const baseWorldHeight = 0.78;
+  const pointCols = samples.stepped ? samples.cols + 1 : samples.cols;
+  const pointRows = samples.stepped ? samples.rows + 1 : samples.rows;
   const availableWidth = Math.max(20, plot.right - plot.left);
   const availableHeight = Math.max(20, plot.bottom - plot.top);
+
+  const graphExtent = (worldHeight) => {
+    const rawPoints = [];
+    for (let row = 0; row < pointRows; row += 1) {
+      for (let col = 0; col < pointCols; col += 1) {
+        rawPoints.push(projectGraphPoint(col, row, 0, samples, worldWidth, worldDepth, worldHeight));
+        rawPoints.push(projectGraphPoint(col, row, 1, samples, worldWidth, worldDepth, worldHeight));
+      }
+    }
+    return rawPoints.reduce((result, point) => ({
+      minX: Math.min(result.minX, point.x),
+      maxX: Math.max(result.maxX, point.x),
+      minY: Math.min(result.minY, point.y),
+      maxY: Math.max(result.maxY, point.y)
+    }), {
+      minX: Infinity,
+      maxX: -Infinity,
+      minY: Infinity,
+      maxY: -Infinity
+    });
+  };
+
+  let worldHeight = baseWorldHeight;
+  let extent = graphExtent(worldHeight);
+  const baseExtentWidth = Math.max(0.001, extent.maxX - extent.minX);
+  const baseExtentHeight = Math.max(0.001, extent.maxY - extent.minY);
+  const scaleFromWidth = availableWidth / baseExtentWidth * 0.92;
+  const projectedValueAxis = Math.sin(graphView.pitch);
+
+  if (projectedValueAxis > 0.18 && baseExtentHeight * scaleFromWidth < availableHeight * 0.82) {
+    const targetExtentHeight = availableHeight * 0.92 / scaleFromWidth;
+    let low = baseWorldHeight;
+    let high = baseWorldHeight;
+    while (graphExtent(high).maxY - graphExtent(high).minY < targetExtentHeight && high < 12) {
+      high *= 1.5;
+    }
+    for (let i = 0; i < 16; i += 1) {
+      const middle = (low + high) / 2;
+      const middleExtent = graphExtent(middle);
+      if (middleExtent.maxY - middleExtent.minY < targetExtentHeight) {
+        low = middle;
+      } else {
+        high = middle;
+      }
+    }
+    worldHeight = high;
+    extent = graphExtent(worldHeight);
+  }
+
+  const extentWidth = Math.max(0.001, extent.maxX - extent.minX);
+  const extentHeight = Math.max(0.001, extent.maxY - extent.minY);
   const scale = Math.min(
-    availableWidth / Math.max(0.001, extent.maxX - extent.minX),
-    availableHeight / Math.max(0.001, extent.maxY - extent.minY)
+    availableWidth / extentWidth,
+    availableHeight / extentHeight
   ) * 0.92;
   const offsetX = plot.left + availableWidth / 2 - ((extent.minX + extent.maxX) / 2) * scale;
   const offsetY = plot.top + availableHeight / 2 - ((extent.minY + extent.maxY) / 2) * scale;
@@ -1914,8 +2500,10 @@ function projectGraphPoint(col, row, zRatio, samples, worldWidth, worldDepth, wo
 }
 
 function graphWorldPoint(col, row, samples, worldWidth, worldDepth) {
-  const xRatio = samples.cols <= 1 ? 0 : col / (samples.cols - 1);
-  const yRatio = samples.rows <= 1 ? 0 : row / (samples.rows - 1);
+  const xDivisor = samples.stepped ? samples.cols : samples.cols - 1;
+  const yDivisor = samples.stepped ? samples.rows : samples.rows - 1;
+  const xRatio = xDivisor <= 0 ? 0 : col / xDivisor;
+  const yRatio = yDivisor <= 0 ? 0 : row / yDivisor;
   const x = (xRatio - 0.5) * worldWidth;
   const y = (yRatio - 0.5) * worldDepth;
   const cos = Math.cos(graphView.yaw);
@@ -1930,19 +2518,21 @@ function graphWorldPoint(col, row, samples, worldWidth, worldDepth) {
 function drawGraphBase(samples, projector) {
   graphCtx.strokeStyle = "rgba(255, 255, 255, 0.18)";
   graphCtx.lineWidth = 1;
-  const rowStep = Math.max(1, Math.floor((samples.rows - 1) / 6));
-  for (let row = 0; row < samples.rows; row += rowStep) {
+  const maxRow = samples.stepped ? samples.rows : samples.rows - 1;
+  const maxCol = samples.stepped ? samples.cols : samples.cols - 1;
+  const rowStep = samples.stepped ? 1 : Math.max(1, Math.floor(maxRow / 6));
+  for (let row = 0; row <= maxRow; row += rowStep) {
     const start = projector.base(0, row);
-    const end = projector.base(samples.cols - 1, row);
+    const end = projector.base(maxCol, row);
     graphCtx.beginPath();
     graphCtx.moveTo(start.x, start.y);
     graphCtx.lineTo(end.x, end.y);
     graphCtx.stroke();
   }
-  const colStep = Math.max(1, Math.floor((samples.cols - 1) / 6));
-  for (let col = 0; col < samples.cols; col += colStep) {
+  const colStep = samples.stepped ? 1 : Math.max(1, Math.floor(maxCol / 6));
+  for (let col = 0; col <= maxCol; col += colStep) {
     const start = projector.base(col, 0);
-    const end = projector.base(col, samples.rows - 1);
+    const end = projector.base(col, maxRow);
     graphCtx.beginPath();
     graphCtx.moveTo(start.x, start.y);
     graphCtx.lineTo(end.x, end.y);
@@ -1951,9 +2541,9 @@ function drawGraphBase(samples, projector) {
   graphCtx.strokeStyle = "rgba(255, 255, 255, 0.28)";
   const corners = [
     projector.base(0, 0),
-    projector.base(samples.cols - 1, 0),
-    projector.base(samples.cols - 1, samples.rows - 1),
-    projector.base(0, samples.rows - 1)
+    projector.base(maxCol, 0),
+    projector.base(maxCol, maxRow),
+    projector.base(0, maxRow)
   ];
   graphCtx.beginPath();
   graphCtx.moveTo(corners[0].x, corners[0].y);
@@ -2381,6 +2971,7 @@ function zoomAt(image, x, y, nextScale) {
   image.view.fit = false;
   updateSettingsPanel();
   requestRender();
+  scheduleSessionSave();
 }
 
 function fitImageToWindow(image, renderAfter = true) {
@@ -2393,6 +2984,7 @@ function fitImageToWindow(image, renderAfter = true) {
   updateSettingsPanel();
   if (renderAfter) {
     requestRender();
+    scheduleSessionSave();
   }
 }
 
@@ -2405,6 +2997,7 @@ function endImagePan(image, event) {
   }
   image.pan = null;
   image.elements.canvas.classList.remove("panning");
+  scheduleSessionSave();
 }
 
 function updatePixelReadout(image, event) {
