@@ -564,6 +564,9 @@ textarea {
   font-family: Consolas, "Courier New", monospace;
   font-size: 11px;
   white-space: pre;
+  cursor: text;
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 .panel-title {
@@ -661,6 +664,18 @@ button:hover {
 .inline-input button {
   height: 32px;
   font-size: 12px;
+}
+
+.ev-buttons {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.ev-buttons button {
+  height: 28px;
+  padding: 0 6px;
+  font-size: 11px;
 }
 
 .segmented {

@@ -20,6 +20,8 @@ const filterSelect = document.querySelector("#filterSelect");
 const autoLevelInput = document.querySelector("#autoLevelInput");
 const brightnessInput = document.querySelector("#brightnessInput");
 const brightnessReset = document.querySelector("#brightnessReset");
+const brightnessHalf = document.querySelector("#brightnessHalf");
+const brightnessDouble = document.querySelector("#brightnessDouble");
 const channelButtons = document.querySelector("#channelButtons");
 const saveFormatSelect = document.querySelector("#saveFormatSelect");
 const saveImageButton = document.querySelector("#saveImageButton");
@@ -53,10 +55,13 @@ const minWindowHeight = 160;
 const minGraphWidth = 180;
 const minGraphHeight = 140;
 const maxPickers = 20;
+const selectionMatrixPreviewRows = 8;
+const selectionMatrixPreviewColumns = 12;
 const sessionDbName = "hdri-value-viewer";
 const sessionDbVersion = 1;
 const sessionStoreName = "session";
 const sessionKey = "current";
+const internalClipboardMime = "application/x-hdri-value-viewer";
 const pickerColors = [
   "#ff365e", "#35d0ff", "#ffe156", "#69f28d", "#c77dff",
   "#ff9f1c", "#2ec4b6", "#f15bb5", "#b8f35a", "#4d96ff",
@@ -70,6 +75,7 @@ let nextPickerId = 1;
 let topZ = 10;
 let activeDrag = null;
 let rafPending = false;
+let graphRafPending = false;
 let pickerMode = false;
 let internalClipboard = null;
 let topUiZ = 100000;
@@ -81,6 +87,16 @@ const graphView = {
   pitch: 0.92
 };
 const graphCtx = selectionGraphCanvas.getContext("2d");
+const selectionDetailsCache = new WeakMap();
+let selectionDetailsTimer = null;
+let selectionCopyFrame = null;
+let selectionWorker = null;
+let selectionJobId = 0;
+let selectionDetailsInFlight = null;
+let selectionMatrixCopyFrame = null;
+let selectionMatrixCopyWorker = null;
+let selectionMatrixCopyJobId = 0;
+let selectionMatrixCopyInFlight = null;
 
 fileInput.addEventListener("click", (event) => {
   if (!window.showOpenFilePicker) {
@@ -123,18 +139,12 @@ copyPickersButton.addEventListener("click", async () => {
   }
 });
 
-copySelectionMatrixButton.addEventListener("click", async () => {
-  const text = selectionMatrixText.value;
-  if (!text) {
-    return;
-  }
-  selectionMatrixText.select();
-  try {
-    await navigator.clipboard.writeText(text);
-  } catch {
-    document.execCommand("copy");
-  }
+copySelectionMatrixButton.addEventListener("click", () => {
+  void copyFullSelectionMatrix();
 });
+
+selectionSummary.addEventListener("pointerdown", (event) => event.stopPropagation());
+selectionSummary.addEventListener("copy", (event) => event.stopPropagation());
 
 downloadSelectionCsvButton.addEventListener("click", () => {
   const image = currentImage();
@@ -240,13 +250,20 @@ document.addEventListener("paste", (event) => {
   if (shouldKeepNativeClipboardEvent(event)) {
     return;
   }
-  const files = Array.from(event.clipboardData?.files || []).filter(isSupportedClipboardFile);
+  const clipboardData = event.clipboardData;
+  if (internalClipboard && clipboardHasType(clipboardData, internalClipboardMime)) {
+    event.preventDefault();
+    pasteInternalClipboard();
+    return;
+  }
+
+  const files = clipboardImageFiles(clipboardData);
   if (files.length > 0) {
     event.preventDefault();
     void openFiles(files, null, { embedded: true });
     return;
   }
-  if (internalClipboard) {
+  if (internalClipboard && (!clipboardData || clipboardData.types.length === 0)) {
     event.preventDefault();
     pasteInternalClipboard();
   }
@@ -261,7 +278,7 @@ document.addEventListener("copy", (event) => {
     return;
   }
   event.preventDefault();
-  void copySelection(image, image.selection);
+  void copySelection(image, image.selection, event.clipboardData);
 });
 
 function shouldKeepNativeClipboardEvent(event) {
@@ -283,6 +300,26 @@ function isSupportedClipboardFile(file) {
   }
   const extension = file.name.split(".").pop()?.toLowerCase();
   return extension === "hdr" || extension === "pic" || extension === "exr";
+}
+
+function clipboardImageFiles(clipboardData) {
+  const files = Array.from(clipboardData?.files || []);
+  if (files.length === 0) {
+    for (const item of Array.from(clipboardData?.items || [])) {
+      if (item.kind !== "file") {
+        continue;
+      }
+      const file = item.getAsFile();
+      if (file) {
+        files.push(file);
+      }
+    }
+  }
+  return files.filter(isSupportedClipboardFile);
+}
+
+function clipboardHasType(clipboardData, type) {
+  return Array.from(clipboardData?.types || []).some((value) => value.toLowerCase() === type);
 }
 
 zoomSelect.addEventListener("change", () => {
@@ -359,6 +396,25 @@ brightnessReset.addEventListener("click", () => {
   scheduleSessionSave();
 });
 
+brightnessHalf.addEventListener("click", () => scaleBrightness(0.5));
+brightnessDouble.addEventListener("click", () => scaleBrightness(2));
+
+function scaleBrightness(factor) {
+  const image = currentImage();
+  if (!image) {
+    return;
+  }
+  const next = image.settings.brightness * factor;
+  if (!Number.isFinite(next) || next < 0) {
+    return;
+  }
+  image.settings.brightness = next;
+  brightnessInput.value = String(next);
+  image.displayDirty = true;
+  requestRender();
+  scheduleSessionSave();
+}
+
 channelButtons.addEventListener("click", (event) => {
   const button = event.target.closest("button[data-channel]");
   const image = currentImage();
@@ -406,24 +462,24 @@ document.addEventListener("pointermove", (event) => {
     activeDrag.panel.style.left = `${next.x}px`;
     activeDrag.panel.style.top = `${next.y}px`;
   } else if (activeDrag.kind === "selectRect") {
-    const pixel = pixelFromEvent(activeDrag.image, event);
+    const pixel = pixelFromEvent(activeDrag.image, event, true);
     if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
       activeDrag.moved = true;
     }
     if (pixel) {
       activeDrag.image.selection = normalizePixelRect(activeDrag.startPixel, pixel);
       updateSelectionPanel();
-      drawSelectionGraph();
+      requestSelectionGraphDraw();
       requestRender();
     }
   } else if (activeDrag.kind === "graphResize") {
     selectionGraphPanel.style.width = `${Math.max(minGraphWidth, activeDrag.width + dx)}px`;
     selectionGraphPanel.style.height = `${Math.max(minGraphHeight, activeDrag.height + dy)}px`;
-    drawSelectionGraph();
+    requestSelectionGraphDraw();
   } else if (activeDrag.kind === "graphRotate") {
     graphView.yaw = activeDrag.yaw + dx * 0.01;
     graphView.pitch = clamp(activeDrag.pitch - dy * 0.006, 0.28, 1.22);
-    drawSelectionGraph();
+    requestSelectionGraphDraw();
   }
 });
 
@@ -447,6 +503,12 @@ document.addEventListener("pointerup", (event) => {
     }
   }
   activeDrag = null;
+  if (completedDragKind === "selectRect") {
+    updateSelectionPanel();
+  }
+  if (["selectRect", "graphResize", "graphRotate"].includes(completedDragKind)) {
+    drawSelectionGraph();
+  }
   if (completedDragKind) {
     scheduleSessionSave();
   }
@@ -624,13 +686,6 @@ async function loadRasterImage(file) {
 
 async function loadDataTexture(file, kind) {
   const buffer = await file.arrayBuffer();
-  if (kind === "exr") {
-    const exr = parseUncompressedExr(buffer);
-    if (exr) {
-      return createImageRecord(file, exr.width, exr.height, "openexr/linear", exr.pixels, "exr");
-    }
-  }
-
   const loader = kind === "exr" ? new EXRLoader() : new RGBELoader();
   if (typeof loader.setDataType === "function") {
     loader.setDataType(THREE.FloatType);
@@ -638,22 +693,41 @@ async function loadDataTexture(file, kind) {
   const parsed = loader.parse(buffer);
   const { data, width, height } = extractTextureData(parsed);
   const itemSize = Math.max(1, Math.round(data.length / (width * height)));
-  const pixels = new Float32Array(width * height * 4);
+  const canReusePixels = data instanceof Float32Array && itemSize === 4;
+  const pixels = canReusePixels ? data : new Float32Array(width * height * 4);
 
-  for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
-      const sourcePixel = kind === "exr" ? (height - 1 - y) * width + x : y * width + x;
-      const sourceIndex = sourcePixel * itemSize;
-      const targetIndex = (y * width + x) * 4;
-      pixels[targetIndex] = readTextureValue(data, sourceIndex);
-      pixels[targetIndex + 1] = readTextureValue(data, sourceIndex + Math.min(1, itemSize - 1));
-      pixels[targetIndex + 2] = readTextureValue(data, sourceIndex + Math.min(2, itemSize - 1));
-      pixels[targetIndex + 3] = itemSize >= 4 ? readTextureValue(data, sourceIndex + 3) : 1;
+  if (canReusePixels) {
+    if (kind === "exr") {
+      flipPixelRows(pixels, width, height);
+    }
+  } else {
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const sourcePixel = kind === "exr" ? (height - 1 - y) * width + x : y * width + x;
+        const sourceIndex = sourcePixel * itemSize;
+        const targetIndex = (y * width + x) * 4;
+        pixels[targetIndex] = readTextureValue(data, sourceIndex);
+        pixels[targetIndex + 1] = readTextureValue(data, sourceIndex + Math.min(1, itemSize - 1));
+        pixels[targetIndex + 2] = readTextureValue(data, sourceIndex + Math.min(2, itemSize - 1));
+        pixels[targetIndex + 3] = itemSize >= 4 ? readTextureValue(data, sourceIndex + 3) : 1;
+      }
     }
   }
 
   parsed.dispose?.();
   return createImageRecord(file, width, height, kind === "exr" ? "openexr/linear" : "radiance-hdr/linear", pixels, kind);
+}
+
+function flipPixelRows(pixels, width, height) {
+  const rowLength = width * 4;
+  const topRow = new Float32Array(rowLength);
+  for (let top = 0, bottom = height - 1; top < bottom; top += 1, bottom -= 1) {
+    const topOffset = top * rowLength;
+    const bottomOffset = bottom * rowLength;
+    topRow.set(pixels.subarray(topOffset, topOffset + rowLength));
+    pixels.copyWithin(topOffset, bottomOffset, bottomOffset + rowLength);
+    pixels.set(topRow, bottomOffset);
+  }
 }
 
 function extractTextureData(parsed) {
@@ -676,199 +750,6 @@ function extractTextureData(parsed) {
   throw new Error("Decoded HDR/EXR data did not contain pixel data, width, and height.");
 }
 
-function parseUncompressedExr(buffer) {
-  const view = new DataView(buffer);
-  if (view.byteLength < 16 || view.getUint32(0, true) !== 20000630) {
-    return null;
-  }
-
-  const version = view.getUint32(4, true);
-  if ((version & 0x200) || (version & 0x800) || (version & 0x1000)) {
-    return null;
-  }
-
-  let offset = 8;
-  const attributes = new Map();
-
-  while (offset < view.byteLength) {
-    const nameResult = readCString(view, offset);
-    const name = nameResult.value;
-    offset = nameResult.offset;
-    if (name === "") {
-      break;
-    }
-
-    const typeResult = readCString(view, offset);
-    const type = typeResult.value;
-    offset = typeResult.offset;
-    const size = view.getUint32(offset, true);
-    offset += 4;
-    attributes.set(name, {
-      type,
-      offset,
-      size
-    });
-    offset += size;
-  }
-
-  const compressionAttr = attributes.get("compression");
-  const dataWindowAttr = attributes.get("dataWindow");
-  const channelsAttr = attributes.get("channels");
-  if (!compressionAttr || !dataWindowAttr || !channelsAttr) {
-    return null;
-  }
-  if (view.getUint8(compressionAttr.offset) !== 0) {
-    return null;
-  }
-
-  const dataWindow = readBox2i(view, dataWindowAttr.offset);
-  const width = dataWindow.maxX - dataWindow.minX + 1;
-  const height = dataWindow.maxY - dataWindow.minY + 1;
-  if (width <= 0 || height <= 0) {
-    return null;
-  }
-
-  const channels = readExrChannels(view, channelsAttr.offset, channelsAttr.size);
-  if (channels.length === 0 || channels.some((channel) => !channel.supported)) {
-    return null;
-  }
-
-  const offsetTableStart = offset;
-  const scanlineOffsets = [];
-  for (let y = 0; y < height; y += 1) {
-    scanlineOffsets.push(readU64(view, offsetTableStart + y * 8));
-  }
-
-  const pixels = new Float32Array(width * height * 4);
-  for (let i = 3; i < pixels.length; i += 4) {
-    pixels[i] = 1;
-  }
-
-  const fallbackChannel = channels.find((channel) => channel.name === "Y") || channels[0];
-  for (let row = 0; row < height; row += 1) {
-    const chunkOffset = scanlineOffsets[row];
-    if (chunkOffset <= 0 || chunkOffset + 8 > view.byteLength) {
-      return null;
-    }
-
-    const yCoord = view.getInt32(chunkOffset, true);
-    const packedSize = view.getUint32(chunkOffset + 4, true);
-    let dataOffset = chunkOffset + 8;
-    const yOffset = yCoord - dataWindow.minY;
-    const rowIndex = yOffset;
-    if (rowIndex < 0 || rowIndex >= height || dataOffset + packedSize > view.byteLength) {
-      return null;
-    }
-
-    const channelValues = new Map();
-    for (const channel of channels) {
-      const values = new Float32Array(width);
-      for (let x = 0; x < width; x += 1) {
-        values[x] = readExrSample(view, dataOffset, channel.pixelType);
-        dataOffset += exrSampleByteSize(channel.pixelType);
-      }
-      channelValues.set(channel.name, values);
-    }
-
-    const r = channelValues.get("R") || channelValues.get("Y") || channelValues.get(fallbackChannel.name);
-    const g = channelValues.get("G") || channelValues.get("Y") || r;
-    const b = channelValues.get("B") || channelValues.get("Y") || r;
-    const a = channelValues.get("A");
-    for (let x = 0; x < width; x += 1) {
-      const target = (rowIndex * width + x) * 4;
-      pixels[target] = r[x];
-      pixels[target + 1] = g[x];
-      pixels[target + 2] = b[x];
-      pixels[target + 3] = a ? a[x] : 1;
-    }
-  }
-
-  return {
-    width,
-    height,
-    pixels
-  };
-}
-
-function readCString(view, offset) {
-  const bytes = [];
-  while (offset < view.byteLength) {
-    const value = view.getUint8(offset);
-    offset += 1;
-    if (value === 0) {
-      break;
-    }
-    bytes.push(value);
-  }
-  return {
-    value: new TextDecoder().decode(new Uint8Array(bytes)),
-    offset
-  };
-}
-
-function readBox2i(view, offset) {
-  return {
-    minX: view.getInt32(offset, true),
-    minY: view.getInt32(offset + 4, true),
-    maxX: view.getInt32(offset + 8, true),
-    maxY: view.getInt32(offset + 12, true)
-  };
-}
-
-function readExrChannels(view, offset, size) {
-  const channels = [];
-  const end = offset + size;
-  while (offset < end) {
-    const nameResult = readCString(view, offset);
-    const name = nameResult.value;
-    offset = nameResult.offset;
-    if (name === "") {
-      break;
-    }
-    const pixelType = view.getInt32(offset, true);
-    offset += 4;
-    offset += 4;
-    const xSampling = view.getInt32(offset, true);
-    const ySampling = view.getInt32(offset + 4, true);
-    offset += 8;
-    channels.push({
-      name,
-      pixelType,
-      supported: xSampling === 1 && ySampling === 1 && exrSampleByteSize(pixelType) > 0
-    });
-  }
-  return channels;
-}
-
-function readExrSample(view, offset, pixelType) {
-  if (pixelType === 0) {
-    return view.getUint32(offset, true);
-  }
-  if (pixelType === 1) {
-    return halfToFloat(view.getUint16(offset, true));
-  }
-  if (pixelType === 2) {
-    return view.getFloat32(offset, true);
-  }
-  return 0;
-}
-
-function exrSampleByteSize(pixelType) {
-  if (pixelType === 0 || pixelType === 2) {
-    return 4;
-  }
-  if (pixelType === 1) {
-    return 2;
-  }
-  return 0;
-}
-
-function readU64(view, offset) {
-  const low = view.getUint32(offset, true);
-  const high = view.getUint32(offset + 4, true);
-  return high * 0x100000000 + low;
-}
-
 function createImageRecord(file, width, height, type, pixels, sourceFormat = "raster") {
   const id = nextId;
   nextId += 1;
@@ -884,7 +765,7 @@ function createImageRecord(file, width, height, type, pixels, sourceFormat = "ra
     pixels,
     range,
     settings: {
-      autoLevel: false,
+      autoLevel: sourceFormat === "hdr" || sourceFormat === "exr",
       brightness: 1,
       channel: "rgba",
       filter: "auto"
@@ -1024,10 +905,7 @@ function createImageWindow(image, dropPoint, placementIndex) {
       return;
     }
     if (!pickerMode && event.button === 0) {
-      const pixel = pixelFromEvent(image, event);
-      if (!pixel) {
-        return;
-      }
+      const pixel = pixelFromEvent(image, event, true);
       event.preventDefault();
       image.selection = normalizePixelRect(pixel, pixel);
       updateSelectionPanel();
@@ -1345,7 +1223,7 @@ function normalizePixelRect(a, b) {
   };
 }
 
-async function copySelection(image, rect) {
+async function copySelection(image, rect, clipboardData = null) {
   internalClipboard = {
     name: `${image.name} crop`,
     type: `${image.type}/crop`,
@@ -1357,6 +1235,11 @@ async function copySelection(image, rect) {
   };
 
   if (internalClipboard.internalOnly) {
+    try {
+      clipboardData?.setData(internalClipboardMime, "1");
+    } catch {
+      // Some browsers reject custom clipboard MIME types. The empty clipboard fallback remains available.
+    }
     fileHint.textContent = `Copied HDR values internally ${rect.width} x ${rect.height}`;
     return;
   }
@@ -2102,53 +1985,335 @@ function updateSelectionPanel() {
   const image = currentImage();
   const rect = image?.selection;
   if (!image || !rect) {
+    cancelSelectionDetailsWork();
+    cancelSelectionMatrixCopy();
     selectionSummary.textContent = "No selection.";
     selectionMatrixText.value = "";
+    copySelectionMatrixButton.disabled = true;
     return;
   }
 
-  const stats = selectionStats(image, rect);
+  const rectKey = selectionRectKey(rect);
+  const matrixKey = selectionMatrixKey(image, rect);
+  if (
+    selectionMatrixCopyInFlight &&
+    (selectionMatrixCopyInFlight.image !== image || selectionMatrixCopyInFlight.matrixKey !== matrixKey)
+  ) {
+    cancelSelectionMatrixCopy();
+  }
+  const cached = selectionDetailsCache.get(image);
+  const stats = cached?.rectKey === rectKey ? cached.stats : null;
   const channels = valueChannels(image);
-  selectionSummary.textContent = [
+  const summaryLines = [
     `Image: ${image.name}`,
     `Rect: x ${rect.x}, y ${rect.y}, ${rect.width} x ${rect.height} px`,
-    `Count: ${stats.count}`,
-    `Display: ${displayChannelLabel(image)}`,
-    `Min: ${formatChannelStats(stats.min, channels)}`,
-    `Max: ${formatChannelStats(stats.max, channels)}`
-  ].join("\n");
-  selectionMatrixText.value = selectionMatrixValue(image, rect, pickerValueMode.value);
+    `Count: ${rect.width * rect.height}`,
+    `Display: ${displayChannelLabel(image)}`
+  ];
+
+  if (stats) {
+    summaryLines.push(
+      `Min: ${formatChannelStats(stats.min, channels)}`,
+      `Max: ${formatChannelStats(stats.max, channels)}`,
+      `Average RGB: ${formatRgbStats(stats.average)}; Luminance ${formatNumber(stats.averageLuminance)}`
+    );
+  } else {
+    summaryLines.push("Statistics: pending...");
+  }
+  selectionSummary.textContent = summaryLines.join("\n");
+  const matrixReady = cached?.matrixKey === matrixKey;
+  const nextMatrixText = matrixReady ? cached.matrix : "";
+  if (selectionMatrixText.value !== nextMatrixText) {
+    selectionMatrixText.value = nextMatrixText;
+  }
+  copySelectionMatrixButton.disabled = !matrixReady || Boolean(selectionMatrixCopyInFlight);
+
+  const matchingJob = selectionDetailsInFlight?.image === image && selectionDetailsInFlight.matrixKey === matrixKey;
+  if (activeDrag?.kind === "selectRect") {
+    cancelSelectionDetailsWork();
+  } else if ((!stats || cached?.matrixKey !== matrixKey) && !matchingJob) {
+    scheduleSelectionDetails(image, rect, rectKey, matrixKey);
+  }
 }
 
-function selectionStats(image, rect) {
-  const min = [Infinity, Infinity, Infinity, Infinity];
-  const max = [-Infinity, -Infinity, -Infinity, -Infinity];
-  forEachPixelInRect(image, rect, (linear) => {
-    for (let channel = 0; channel < 4; channel += 1) {
-      min[channel] = Math.min(min[channel], linear[channel]);
-      max[channel] = Math.max(max[channel], linear[channel]);
+function selectionRectKey(rect) {
+  return `${rect.x},${rect.y},${rect.width},${rect.height}`;
+}
+
+function selectionMatrixKey(image, rect) {
+  return `${selectionRectKey(rect)}:${pickerValueMode.value}:${image.settings.channel}`;
+}
+
+function scheduleSelectionDetails(image, rect, rectKey, matrixKey) {
+  cancelSelectionDetailsWork();
+  const jobId = selectionJobId;
+  const savedRect = { ...rect };
+  const valueMode = pickerValueMode.value;
+  const channels = valueChannels(image).map((channel) => channel.index);
+  selectionDetailsInFlight = { image, rectKey, matrixKey, jobId };
+  selectionDetailsTimer = setTimeout(() => {
+    selectionDetailsTimer = null;
+    if (activeDrag?.kind === "selectRect") {
+      scheduleSelectionDetails(image, savedRect, rectKey, matrixKey);
+      return;
+    }
+    if (!selectionJobIsCurrent(image, rectKey, matrixKey, jobId)) {
+      return;
+    }
+    copySelectionPixelsInChunks(image, savedRect, rectKey, matrixKey, valueMode, channels, jobId);
+  }, 120);
+}
+
+function cancelSelectionDetailsWork() {
+  selectionJobId += 1;
+  clearTimeout(selectionDetailsTimer);
+  selectionDetailsTimer = null;
+  if (selectionCopyFrame !== null) {
+    cancelAnimationFrame(selectionCopyFrame);
+    selectionCopyFrame = null;
+  }
+  selectionWorker?.terminate();
+  selectionWorker = null;
+  selectionDetailsInFlight = null;
+}
+
+function selectionJobIsCurrent(image, rectKey, matrixKey, jobId) {
+  return (
+    jobId === selectionJobId &&
+    currentImage() === image &&
+    image.selection &&
+    selectionRectKey(image.selection) === rectKey &&
+    selectionMatrixKey(image, image.selection) === matrixKey
+  );
+}
+
+function copySelectionPixelsInChunks(image, rect, rectKey, matrixKey, valueMode, channels, jobId) {
+  const pixels = new Float32Array(rect.width * rect.height * 4);
+  let row = 0;
+  const copyRows = () => {
+    selectionCopyFrame = null;
+    if (!selectionJobIsCurrent(image, rectKey, matrixKey, jobId)) {
+      return;
+    }
+    const deadline = performance.now() + 2;
+    do {
+      const sourceStart = ((rect.y + row) * image.width + rect.x) * 4;
+      const targetStart = row * rect.width * 4;
+      pixels.set(image.pixels.subarray(sourceStart, sourceStart + rect.width * 4), targetStart);
+      row += 1;
+    } while (row < rect.height && performance.now() < deadline);
+
+    if (row < rect.height) {
+      selectionCopyFrame = requestAnimationFrame(copyRows);
+      return;
+    }
+    runSelectionWorker(image, rect, rectKey, matrixKey, valueMode, channels, pixels, jobId);
+  };
+  selectionCopyFrame = requestAnimationFrame(copyRows);
+}
+
+function runSelectionWorker(image, rect, rectKey, matrixKey, valueMode, channels, pixels, jobId) {
+  if (!selectionJobIsCurrent(image, rectKey, matrixKey, jobId)) {
+    return;
+  }
+  try {
+    selectionWorker = new Worker(new URL("./selection-worker.js?v=20260801-3", import.meta.url));
+  } catch (error) {
+    selectionDetailsInFlight = null;
+    console.error("Selection worker could not start.", error);
+    return;
+  }
+
+  selectionWorker.addEventListener("message", (event) => {
+    if (!selectionJobIsCurrent(image, rectKey, matrixKey, jobId) || event.data.jobId !== jobId) {
+      return;
+    }
+    if (event.data.kind === "stats") {
+      selectionDetailsCache.set(image, {
+        rectKey,
+        stats: event.data.stats,
+        matrixKey: null,
+        matrix: ""
+      });
+      updateSelectionPanel();
+      drawSelectionGraph();
+      return;
+    }
+    if (event.data.kind === "preview") {
+      const cached = selectionDetailsCache.get(image);
+      selectionDetailsCache.set(image, {
+        rectKey,
+        stats: cached?.rectKey === rectKey ? cached.stats : event.data.stats,
+        matrixKey,
+        matrix: event.data.matrix ?? ""
+      });
+      selectionDetailsInFlight = null;
+      selectionWorker?.terminate();
+      selectionWorker = null;
+      updateSelectionPanel();
     }
   });
-  return {
-    count: rect.width * rect.height,
-    min,
-    max
+  selectionWorker.addEventListener("error", (error) => {
+    if (jobId === selectionJobId) {
+      selectionDetailsInFlight = null;
+      selectionWorker?.terminate();
+      selectionWorker = null;
+    }
+    console.error("Selection worker failed.", error);
+  });
+  selectionWorker.postMessage({
+    jobId,
+    pixels: pixels.buffer,
+    width: rect.width,
+    height: rect.height,
+    valueMode,
+    channels,
+    previewRows: selectionMatrixPreviewRows,
+    previewColumns: selectionMatrixPreviewColumns
+  }, [pixels.buffer]);
+}
+function copyFullSelectionMatrix() {
+  const image = currentImage();
+  const rect = image?.selection;
+  if (!image || !rect || selectionMatrixCopyInFlight) {
+    return;
+  }
+
+  cancelSelectionMatrixCopy();
+  const savedRect = { ...rect };
+  const rectKey = selectionRectKey(savedRect);
+  const matrixKey = selectionMatrixKey(image, savedRect);
+  const valueMode = pickerValueMode.value;
+  const channels = valueChannels(image).map((channel) => channel.index);
+  const jobId = selectionMatrixCopyJobId;
+  const pixels = new Float32Array(savedRect.width * savedRect.height * 4);
+  let row = 0;
+
+  selectionMatrixCopyInFlight = { image, rectKey, matrixKey, jobId };
+  copySelectionMatrixButton.disabled = true;
+  copySelectionMatrixButton.textContent = "Preparing...";
+
+  const copyRows = () => {
+    selectionMatrixCopyFrame = null;
+    if (!selectionMatrixCopyJobIsCurrent(image, matrixKey, jobId)) {
+      cancelSelectionMatrixCopy();
+      updateSelectionPanel();
+      return;
+    }
+    const deadline = performance.now() + 2;
+    do {
+      const sourceStart = ((savedRect.y + row) * image.width + savedRect.x) * 4;
+      const targetStart = row * savedRect.width * 4;
+      pixels.set(image.pixels.subarray(sourceStart, sourceStart + savedRect.width * 4), targetStart);
+      row += 1;
+    } while (row < savedRect.height && performance.now() < deadline);
+
+    if (row < savedRect.height) {
+      selectionMatrixCopyFrame = requestAnimationFrame(copyRows);
+      return;
+    }
+    runFullSelectionMatrixWorker(image, savedRect, matrixKey, valueMode, channels, pixels, jobId);
   };
+  selectionMatrixCopyFrame = requestAnimationFrame(copyRows);
 }
 
-function selectionMatrixValue(image, rect, mode) {
-  const lines = [];
-  const channels = valueChannels(image);
-  const multiChannel = channels.length > 1;
-  for (let y = 0; y < rect.height; y += 1) {
-    const row = [];
-    for (let x = 0; x < rect.width; x += 1) {
-      const tuple = pixelTupleForMode(image, rect.x + x, rect.y + y, mode, channels);
-      row.push(multiChannel ? `(${tuple.join(",")})` : tuple[0]);
-    }
-    lines.push(`${row.join(",")},`);
+function selectionMatrixCopyJobIsCurrent(image, matrixKey, jobId) {
+  return (
+    jobId === selectionMatrixCopyJobId &&
+    selectionMatrixCopyInFlight?.jobId === jobId &&
+    currentImage() === image &&
+    image.selection &&
+    selectionMatrixKey(image, image.selection) === matrixKey
+  );
+}
+
+function runFullSelectionMatrixWorker(image, rect, matrixKey, valueMode, channels, pixels, jobId) {
+  if (!selectionMatrixCopyJobIsCurrent(image, matrixKey, jobId)) {
+    return;
   }
-  return lines.join("\n");
+  try {
+    selectionMatrixCopyWorker = new Worker(new URL("./selection-worker.js?v=20260801-3", import.meta.url));
+  } catch (error) {
+    console.error("Matrix copy worker could not start.", error);
+    fileHint.textContent = "Matrix copy failed.";
+    finishSelectionMatrixCopy(jobId);
+    return;
+  }
+
+  selectionMatrixCopyWorker.addEventListener("message", (event) => {
+    if (
+      event.data.kind !== "fullMatrix" ||
+      event.data.jobId !== jobId ||
+      !selectionMatrixCopyJobIsCurrent(image, matrixKey, jobId)
+    ) {
+      return;
+    }
+    void writeFullSelectionMatrixToClipboard(event.data.matrix, rect, jobId);
+  });
+  selectionMatrixCopyWorker.addEventListener("error", (error) => {
+    if (jobId !== selectionMatrixCopyJobId) {
+      return;
+    }
+    console.error("Matrix copy worker failed.", error);
+    fileHint.textContent = "Matrix copy failed.";
+    finishSelectionMatrixCopy(jobId);
+  });
+  selectionMatrixCopyWorker.postMessage({
+    task: "matrix",
+    jobId,
+    pixels: pixels.buffer,
+    width: rect.width,
+    height: rect.height,
+    valueMode,
+    channels
+  }, [pixels.buffer]);
+}
+
+async function writeFullSelectionMatrixToClipboard(matrix, rect, jobId) {
+  try {
+    await navigator.clipboard.writeText(matrix);
+    fileHint.textContent = `Copied Matrix ${rect.width} x ${rect.height}`;
+  } catch (error) {
+    const preview = selectionMatrixText.value;
+    selectionMatrixText.value = matrix;
+    selectionMatrixText.select();
+    const copied = document.execCommand("copy");
+    selectionMatrixText.value = preview;
+    if (copied) {
+      fileHint.textContent = `Copied Matrix ${rect.width} x ${rect.height}`;
+    } else {
+      console.error("Matrix clipboard write failed.", error);
+      fileHint.textContent = "Matrix copy failed.";
+    }
+  } finally {
+    finishSelectionMatrixCopy(jobId);
+  }
+}
+
+function finishSelectionMatrixCopy(jobId) {
+  if (selectionMatrixCopyInFlight?.jobId !== jobId) {
+    return;
+  }
+  selectionMatrixCopyWorker?.terminate();
+  selectionMatrixCopyWorker = null;
+  selectionMatrixCopyInFlight = null;
+  copySelectionMatrixButton.textContent = "Copy Matrix";
+  updateSelectionPanel();
+}
+
+function cancelSelectionMatrixCopy() {
+  selectionMatrixCopyJobId += 1;
+  if (selectionMatrixCopyFrame !== null) {
+    cancelAnimationFrame(selectionMatrixCopyFrame);
+    selectionMatrixCopyFrame = null;
+  }
+  selectionMatrixCopyWorker?.terminate();
+  selectionMatrixCopyWorker = null;
+  selectionMatrixCopyInFlight = null;
+  copySelectionMatrixButton.textContent = "Copy Matrix";
+}
+function formatRgbStats(values) {
+  return `R ${formatNumber(values[0])}, G ${formatNumber(values[1])}, B ${formatNumber(values[2])}`;
 }
 
 function selectionCsvText(image, rect) {
@@ -2169,6 +2334,17 @@ function selectionCsvText(image, rect) {
   return lines.join("\n");
 }
 
+function requestSelectionGraphDraw() {
+  if (graphRafPending) {
+    return;
+  }
+  graphRafPending = true;
+  requestAnimationFrame(() => {
+    graphRafPending = false;
+    drawSelectionGraph();
+  });
+}
+
 function drawSelectionGraph() {
   const image = currentImage();
   const rect = image?.selection;
@@ -2178,7 +2354,11 @@ function drawSelectionGraph() {
   }
 
   selectionGraphPanel.classList.remove("hidden");
-  selectionGraphLabel.textContent = `${rect.width} x ${rect.height} px ${graphModeLabel(image)}`;
+  const sampling = selectionGraphSampling(rect);
+  const samplingLabel = sampling.stepped ? "" : sampling.downsampled ? " · Downsampled" : " · Interpolated";
+  const graphLabel = `${rect.width} x ${rect.height} px ${graphModeLabel(image)}${samplingLabel}`;
+  selectionGraphLabel.textContent = graphLabel;
+  selectionGraphLabel.title = graphLabel;
   if (selectionGraphPanel.classList.contains("collapsed")) {
     return;
   }
@@ -2200,13 +2380,14 @@ function drawSelectionGraph() {
   graphCtx.fillStyle = "#07090c";
   graphCtx.fillRect(0, 0, width, height);
 
-  const samples = selectionGraphSamples(image, rect);
+  const samples = selectionGraphSamples(image, rect, sampling);
   if (!samples.values.length) {
     return;
   }
 
-  const min = samples.min;
-  const max = samples.max;
+  const statistics = activeDrag?.kind === "selectRect" ? null : selectionGraphStatistics(image, rect);
+  const min = statistics?.min ?? samples.min;
+  const max = statistics?.max ?? samples.max;
   const range = max - min || 1;
   const projector = makeGraphProjector(samples, rect, width, height, min, range);
 
@@ -2219,14 +2400,26 @@ function drawSelectionGraph() {
     drawInterpolatedGraph(samples, projector, min, range);
   }
 
-  drawGraphLegend(width, height, min, max);
+  drawGraphLegend(width, height, min, max, statistics);
+  drawGraphSamplingNotice(sampling);
   graphCtx.restore();
 }
 
-function selectionGraphSamples(image, rect) {
-  const stepped = rect.width <= 18 && rect.height <= 18;
-  const cols = stepped ? rect.width : Math.max(2, Math.min(36, rect.width));
-  const rows = stepped ? rect.height : Math.max(2, Math.min(36, rect.height));
+function selectionGraphSampling(rect) {
+  const stepped = !activeDrag && rect.width <= 64 && rect.height <= 64;
+  const sampleLimit = activeDrag ? 20 : 64;
+  const cols = stepped ? rect.width : Math.max(2, Math.min(sampleLimit, rect.width));
+  const rows = stepped ? rect.height : Math.max(2, Math.min(sampleLimit, rect.height));
+  return {
+    stepped,
+    cols,
+    rows,
+    downsampled: cols < rect.width || rows < rect.height
+  };
+}
+
+function selectionGraphSamples(image, rect, sampling = selectionGraphSampling(rect)) {
+  const { stepped, cols, rows } = sampling;
   const values = [];
   let min = Infinity;
   let max = -Infinity;
@@ -2257,6 +2450,50 @@ function selectionGraphSamples(image, rect) {
   return { cols, rows, values, min, max, stepped };
 }
 
+function drawGraphSamplingNotice(sampling) {
+  if (sampling.stepped) {
+    return;
+  }
+  const label = sampling.downsampled
+    ? `Downsampled: ${sampling.cols} x ${sampling.rows}`
+    : "Interpolated";
+  graphCtx.font = "10px Consolas, monospace";
+  graphCtx.textAlign = "left";
+  const x = 10;
+  const y = 10;
+  const width = Math.ceil(graphCtx.measureText(label).width) + 12;
+  const height = 18;
+  graphCtx.fillStyle = "rgba(50, 35, 5, 0.9)";
+  graphCtx.fillRect(x, y, width, height);
+  graphCtx.strokeStyle = "#e5a62b";
+  graphCtx.lineWidth = 1;
+  graphCtx.strokeRect(x + 0.5, y + 0.5, width - 1, height - 1);
+  graphCtx.fillStyle = "#ffd36b";
+  graphCtx.fillText(label, x + 6, y + 12);
+}
+
+function selectionGraphStatistics(image, rect) {
+  const cached = selectionDetailsCache.get(image);
+  if (cached?.rectKey !== selectionRectKey(rect) || !cached.stats) {
+    return null;
+  }
+
+  const stats = cached.stats;
+  const mode = image.settings.channel;
+  if (["r", "g", "b", "a"].includes(mode)) {
+    const channel = { r: 0, g: 1, b: 2, a: 3 }[mode];
+    return {
+      min: stats.min[channel],
+      max: stats.max[channel],
+      average: stats.average[channel]
+    };
+  }
+  return {
+    min: stats.luminanceMin,
+    max: stats.luminanceMax,
+    average: stats.averageLuminance
+  };
+}
 function graphPixelValue(image, x, y) {
   const index = (y * image.width + x) * 4;
   const r = image.pixels[index];
@@ -2554,7 +2791,7 @@ function drawGraphBase(samples, projector) {
   graphCtx.stroke();
 }
 
-function drawGraphLegend(width, height, min, max) {
+function drawGraphLegend(width, height, min, max, statistics = null) {
   const barX = Math.max(20, width - 32);
   const barY = 32;
   const barW = 10;
@@ -2570,8 +2807,35 @@ function drawGraphLegend(width, height, min, max) {
   graphCtx.textAlign = "right";
   graphCtx.fillText(formatNumber(max), barX - 4, barY + 8);
   graphCtx.fillText(formatNumber(min), barX - 4, barY + barH);
-}
 
+  if (!statistics) {
+    return;
+  }
+  const range = max - min || 1;
+  const markers = [
+    { label: "Avg", value: statistics.average, color: "#ffffff" }
+  ].map((marker) => ({
+    ...marker,
+    y: barY + (1 - clamp01((marker.value - min) / range)) * barH,
+    labelY: clamp(barY + (1 - clamp01((marker.value - min) / range)) * barH + 3, barY + 20, barY + barH - 10)
+  }));
+
+  for (const marker of markers) {
+    graphCtx.strokeStyle = marker.color;
+    graphCtx.fillStyle = marker.color;
+    graphCtx.lineWidth = 1.5;
+    graphCtx.beginPath();
+    graphCtx.moveTo(barX - 2, marker.y);
+    graphCtx.lineTo(barX + barW + 3, marker.y);
+    graphCtx.stroke();
+    graphCtx.lineWidth = 1;
+    graphCtx.beginPath();
+    graphCtx.moveTo(barX - 5, marker.labelY - 3);
+    graphCtx.lineTo(barX - 2, marker.y);
+    graphCtx.stroke();
+    graphCtx.fillText(`${marker.label} ${formatNumber(marker.value)}`, barX - 7, marker.labelY);
+  }
+}
 function graphColor(value) {
   const t = clamp01(value);
   const stops = [
@@ -2877,8 +3141,54 @@ function renderImage(image) {
     image.width * image.view.scale,
     image.height * image.view.scale
   );
+  drawPixelGrid(image, ctx, width, height);
   drawPickers(image, ctx);
   drawSelection(image, ctx);
+}
+
+function drawPixelGrid(image, ctx, canvasWidth, canvasHeight) {
+  if (image.view.scale < 12) {
+    return;
+  }
+
+  const scale = image.view.scale;
+  const offsetX = image.view.offsetX;
+  const offsetY = image.view.offsetY;
+  const firstX = Math.max(0, Math.floor(-offsetX / scale));
+  const lastX = Math.min(image.width, Math.ceil((canvasWidth - offsetX) / scale));
+  const firstY = Math.max(0, Math.floor(-offsetY / scale));
+  const lastY = Math.min(image.height, Math.ceil((canvasHeight - offsetY) / scale));
+  if (firstX > lastX || firstY > lastY) {
+    return;
+  }
+
+  const imageLeft = offsetX + firstX * scale;
+  const imageTop = offsetY + firstY * scale;
+  const imageRight = offsetX + lastX * scale;
+  const imageBottom = offsetY + lastY * scale;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(imageLeft, imageTop, imageRight - imageLeft, imageBottom - imageTop);
+  ctx.clip();
+  ctx.beginPath();
+  for (let x = firstX; x <= lastX; x += 1) {
+    const screenX = Math.round(offsetX + x * scale) + 0.5;
+    ctx.moveTo(screenX, imageTop);
+    ctx.lineTo(screenX, imageBottom);
+  }
+  for (let y = firstY; y <= lastY; y += 1) {
+    const screenY = Math.round(offsetY + y * scale) + 0.5;
+    ctx.moveTo(imageLeft, screenY);
+    ctx.lineTo(imageRight, screenY);
+  }
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = "rgba(0, 0, 0, 0.62)";
+  ctx.setLineDash([]);
+  ctx.stroke();
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.38)";
+  ctx.setLineDash([2, 3]);
+  ctx.stroke();
+  ctx.restore();
 }
 
 function ensureDisplayCanvas(image) {
@@ -3026,13 +3336,19 @@ function updatePixelReadout(image, event) {
   srgbValue.textContent = `sRGB: ${formatTuple(srgb)}`;
 }
 
-function pixelFromEvent(image, event) {
+function pixelFromEvent(image, event, clampToImage = false) {
   const rect = image.elements.canvas.getBoundingClientRect();
   const viewX = event.clientX - rect.left;
   const viewY = event.clientY - rect.top;
   const x = Math.floor((viewX - image.view.offsetX) / image.view.scale);
   const y = Math.floor((viewY - image.view.offsetY) / image.view.scale);
 
+  if (clampToImage) {
+    return {
+      x: clamp(x, 0, image.width - 1),
+      y: clamp(y, 0, image.height - 1)
+    };
+  }
   if (x < 0 || y < 0 || x >= image.width || y >= image.height) {
     return null;
   }

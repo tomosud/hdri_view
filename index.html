@@ -4,12 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>HDRI Value Viewer</title>
-  <link rel="stylesheet" href="./style.css">
+  <link rel="stylesheet" href="./style.css?v=20260801-1">
   <script type="importmap">
     {
       "imports": {
-        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+        "three": "https://cdn.jsdelivr.net/npm/three@0.185.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.185.0/examples/jsm/"
       }
     }
   </script>
@@ -81,6 +81,10 @@
                 <input id="brightnessInput" type="number" value="1" min="0" step="0.01" inputmode="decimal">
                 <button id="brightnessReset" type="button">Reset</button>
               </div>
+              <div class="ev-buttons">
+                <button id="brightnessHalf" type="button" title="Decrease exposure by 1 EV">−1 EV (×0.5)</button>
+                <button id="brightnessDouble" type="button" title="Increase exposure by 1 EV">+1 EV (×2)</button>
+              </div>
             </div>
 
             <div class="field">
@@ -144,7 +148,7 @@
             </div>
           </div>
           <div id="selectionTabContent" class="panel-tab-content hidden">
-            <div id="selectionSummary" class="selection-summary">No selection.</div>
+            <div id="selectionSummary" class="selection-summary" tabindex="0" aria-label="Selection summary; text can be selected and copied">No selection.</div>
             <textarea id="selectionMatrixText" class="picker-copy-text" readonly spellcheck="false"></textarea>
             <div class="panel-actions">
               <button id="copySelectionMatrixButton" class="copy-button" type="button">Copy Matrix</button>
@@ -163,6 +167,6 @@
     </footer>
   </div>
 
-  <script type="module" src="./app.js?v=20260710-5"></script>
+  <script type="module" src="./app.js?v=20260801-10"></script>
 </body>
 </html>
