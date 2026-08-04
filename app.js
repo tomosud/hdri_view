@@ -767,7 +767,8 @@ function createImageRecord(file, width, height, type, pixels, sourceFormat = "ra
     settings: {
       autoLevel: sourceFormat === "hdr" || sourceFormat === "exr",
       brightness: 1,
-      channel: "rgba",
+      // UE 書き出しの EXR などアルファが全面 0 の画像は RGBA 表示だと真っ黒になるため RGB を既定にする
+      channel: range.max[3] > 0 ? "rgba" : "rgb",
       filter: "auto"
     },
     view: {
