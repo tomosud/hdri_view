@@ -112,6 +112,20 @@ textarea {
   white-space: nowrap;
 }
 
+.github-link {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 12px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.github-link:hover {
+  color: var(--text);
+  text-decoration: underline;
+}
+
 .workspace {
   min-width: 0;
   min-height: 0;

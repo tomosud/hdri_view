@@ -2118,7 +2118,7 @@ function runSelectionWorker(image, rect, rectKey, matrixKey, valueMode, channels
     return;
   }
   try {
-    selectionWorker = new Worker(new URL("./selection-worker.js?v=20260801-3", import.meta.url));
+    selectionWorker = new Worker(new URL("./selection-worker.js?v=20260806-1", import.meta.url));
   } catch (error) {
     selectionDetailsInFlight = null;
     console.error("Selection worker could not start.", error);
@@ -2233,7 +2233,7 @@ function runFullSelectionMatrixWorker(image, rect, matrixKey, valueMode, channel
     return;
   }
   try {
-    selectionMatrixCopyWorker = new Worker(new URL("./selection-worker.js?v=20260801-3", import.meta.url));
+    selectionMatrixCopyWorker = new Worker(new URL("./selection-worker.js?v=20260806-1", import.meta.url));
   } catch (error) {
     console.error("Matrix copy worker could not start.", error);
     fileHint.textContent = "Matrix copy failed.";
@@ -3442,9 +3442,12 @@ function formatNumber(value) {
   if (!Number.isFinite(value)) {
     return String(value);
   }
-  const abs = Math.abs(value);
-  if (abs !== 0 && (abs < 0.0001 || abs >= 10000)) {
-    return value.toExponential(5);
+  if (value === 0) {
+    return "0";
   }
-  return value.toFixed(abs < 10 ? 6 : 3).replace(/\.?0+$/, "");
+  // Plain decimal notation (no scientific notation), keeping ~7 significant digits.
+  const magnitude = Math.floor(Math.log10(Math.abs(value)));
+  const decimals = Math.min(20, Math.max(0, 6 - magnitude));
+  const text = value.toFixed(decimals);
+  return text.includes(".") ? text.replace(/0+$/, "").replace(/\.$/, "") : text;
 }
