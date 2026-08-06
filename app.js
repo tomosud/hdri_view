@@ -71,7 +71,6 @@ const pickerColors = [
 
 let selectedId = null;
 let nextId = 1;
-let nextPickerId = 1;
 let topZ = 10;
 let activeDrag = null;
 let rafPending = false;
@@ -1114,15 +1113,23 @@ function togglePickerAtEvent(image, event) {
   }
 
   image.pickers.push({
-    id: nextPickerId,
+    id: nextAvailablePickerId(),
     x: pixel.x,
     y: pixel.y,
     color: nextPickerColor()
   });
-  nextPickerId += 1;
   updatePickerPanel();
   requestRender();
   scheduleSessionSave();
+}
+
+function nextAvailablePickerId() {
+  const usedIds = new Set(allPickers().map(({ picker }) => picker.id));
+  let id = 1;
+  while (usedIds.has(id)) {
+    id += 1;
+  }
+  return id;
 }
 
 function removePicker(pickerId) {
@@ -1625,7 +1632,6 @@ async function restoreSavedSession() {
     }
 
     nextId = Math.max(nextId, ...images.map((image) => image.id + 1), session.nextId || 1);
-    nextPickerId = Math.max(nextPickerId, ...allPickers().map(({ picker }) => picker.id + 1), session.nextPickerId || 1);
     topZ = Math.max(topZ, ...images.map((image) => image.window.z), session.topZ || topZ);
     topUiZ = Math.max(topUiZ, session.topUiZ || topUiZ);
     selectedId = images.some((image) => image.id === session.selectedId) ? session.selectedId : images.at(-1)?.id ?? null;
@@ -1664,7 +1670,6 @@ function buildSessionRecord() {
     savedAt: Date.now(),
     selectedId,
     nextId,
-    nextPickerId,
     topZ,
     topUiZ,
     activePanelTab,
