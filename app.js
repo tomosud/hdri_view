@@ -62,7 +62,6 @@ const sessionDbName = "hdri-value-viewer";
 const sessionDbVersion = 1;
 const sessionStoreName = "session";
 const sessionKey = "current";
-const internalClipboardMime = "application/x-hdri-value-viewer";
 const pickerColors = [
   "#ff365e", "#35d0ff", "#ffe156", "#69f28d", "#c77dff",
   "#ff9f1c", "#2ec4b6", "#f15bb5", "#b8f35a", "#4d96ff",
@@ -264,19 +263,13 @@ document.addEventListener("paste", (event) => {
     return;
   }
   const clipboardData = event.clipboardData;
-  if (internalClipboard && clipboardHasType(clipboardData, internalClipboardMime)) {
-    event.preventDefault();
-    pasteInternalClipboard();
-    return;
-  }
-
   const files = clipboardImageFiles(clipboardData);
   if (files.length > 0) {
     event.preventDefault();
     void openFiles(files, null, { embedded: true });
     return;
   }
-  if (internalClipboard && (!clipboardData || clipboardData.types.length === 0)) {
+  if (internalClipboard) {
     event.preventDefault();
     pasteInternalClipboard();
   }
@@ -291,7 +284,7 @@ document.addEventListener("copy", (event) => {
     return;
   }
   event.preventDefault();
-  void copySelection(image, image.selection, event.clipboardData);
+  void copySelection(image, image.selection);
 });
 
 function shouldKeepNativeClipboardEvent(event) {
@@ -329,10 +322,6 @@ function clipboardImageFiles(clipboardData) {
     }
   }
   return files.filter(isSupportedClipboardFile);
-}
-
-function clipboardHasType(clipboardData, type) {
-  return Array.from(clipboardData?.types || []).some((value) => value.toLowerCase() === type);
 }
 
 zoomSelect.addEventListener("change", () => {
@@ -1238,7 +1227,7 @@ function normalizePixelRect(a, b) {
   };
 }
 
-async function copySelection(image, rect, clipboardData = null) {
+async function copySelection(image, rect) {
   internalClipboard = {
     name: `${image.name} crop`,
     type: `${image.type}/crop`,
@@ -1250,11 +1239,6 @@ async function copySelection(image, rect, clipboardData = null) {
   };
 
   if (internalClipboard.internalOnly) {
-    try {
-      clipboardData?.setData(internalClipboardMime, "1");
-    } catch {
-      // Some browsers reject custom clipboard MIME types. The empty clipboard fallback remains available.
-    }
     fileHint.textContent = `Copied HDR values internally ${rect.width} x ${rect.height}`;
     return;
   }
