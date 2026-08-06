@@ -17,7 +17,8 @@ self.addEventListener("message", (event) => {
   }
 
   const stats = selectionStats(pixels, width, height);
-  self.postMessage({ kind: "stats", jobId, stats });
+  const pooled = selectionPooledGrid(pixels, width, height);
+  self.postMessage({ kind: "stats", jobId, stats, pooled }, [pooled.values.buffer]);
   const matrix = selectionMatrixValue(
     pixels,
     width,
@@ -81,6 +82,38 @@ function selectionStats(pixels, width, height) {
     luminanceMin,
     luminanceMax
   };
+}
+
+// Box-averaged linear RGBA grid (up to maxCols x maxRows cells) used to render the
+// selection graph without missing small bright/dark spots that point sampling would skip.
+function selectionPooledGrid(pixels, width, height, maxCols = 64, maxRows = 64) {
+  const cols = Math.max(1, Math.min(maxCols, width));
+  const rows = Math.max(1, Math.min(maxRows, height));
+  const sums = new Float64Array(cols * rows * 4);
+  const counts = new Float64Array(cols * rows * 4);
+
+  for (let y = 0; y < height; y += 1) {
+    const rowIndex = Math.min(rows - 1, Math.floor((y * rows) / height));
+    for (let x = 0; x < width; x += 1) {
+      const colIndex = Math.min(cols - 1, Math.floor((x * cols) / width));
+      const cellBase = (rowIndex * cols + colIndex) * 4;
+      const index = (y * width + x) * 4;
+      for (let channel = 0; channel < 4; channel += 1) {
+        const value = pixels[index + channel];
+        if (Number.isFinite(value)) {
+          sums[cellBase + channel] += value;
+          counts[cellBase + channel] += 1;
+        }
+      }
+    }
+  }
+
+  const values = new Float32Array(cols * rows * 4);
+  for (let i = 0; i < values.length; i += 1) {
+    values[i] = counts[i] ? sums[i] / counts[i] : 0;
+  }
+
+  return { cols, rows, values };
 }
 
 function selectionMatrixValue(

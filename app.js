@@ -2118,7 +2118,7 @@ function runSelectionWorker(image, rect, rectKey, matrixKey, valueMode, channels
     return;
   }
   try {
-    selectionWorker = new Worker(new URL("./selection-worker.js?v=20260806-1", import.meta.url));
+    selectionWorker = new Worker(new URL("./selection-worker.js?v=20260806-2", import.meta.url));
   } catch (error) {
     selectionDetailsInFlight = null;
     console.error("Selection worker could not start.", error);
@@ -2133,6 +2133,7 @@ function runSelectionWorker(image, rect, rectKey, matrixKey, valueMode, channels
       selectionDetailsCache.set(image, {
         rectKey,
         stats: event.data.stats,
+        pooled: event.data.pooled,
         matrixKey: null,
         matrix: ""
       });
@@ -2145,6 +2146,7 @@ function runSelectionWorker(image, rect, rectKey, matrixKey, valueMode, channels
       selectionDetailsCache.set(image, {
         rectKey,
         stats: cached?.rectKey === rectKey ? cached.stats : event.data.stats,
+        pooled: cached?.rectKey === rectKey ? cached.pooled : event.data.pooled,
         matrixKey,
         matrix: event.data.matrix ?? ""
       });
@@ -2233,7 +2235,7 @@ function runFullSelectionMatrixWorker(image, rect, matrixKey, valueMode, channel
     return;
   }
   try {
-    selectionMatrixCopyWorker = new Worker(new URL("./selection-worker.js?v=20260806-1", import.meta.url));
+    selectionMatrixCopyWorker = new Worker(new URL("./selection-worker.js?v=20260806-2", import.meta.url));
   } catch (error) {
     console.error("Matrix copy worker could not start.", error);
     fileHint.textContent = "Matrix copy failed.";
@@ -2420,6 +2422,16 @@ function selectionGraphSampling(rect) {
 }
 
 function selectionGraphSamples(image, rect, sampling = selectionGraphSampling(rect)) {
+  if (!activeDrag) {
+    const cached = selectionDetailsCache.get(image);
+    if (cached?.rectKey === selectionRectKey(rect) && cached.pooled) {
+      const pooled = pooledGraphSamples(image, cached.pooled);
+      if (pooled) {
+        return { ...pooled, stepped: sampling.stepped };
+      }
+    }
+  }
+
   const { stepped, cols, rows } = sampling;
   const values = [];
   let min = Infinity;
@@ -2449,6 +2461,36 @@ function selectionGraphSamples(image, rect, sampling = selectionGraphSampling(re
     max = 0;
   }
   return { cols, rows, values, min, max, stepped };
+}
+
+// Averages each pooled cell's linear RGBA into the current channel/luminance value.
+function pooledGraphSamples(image, pooled) {
+  const { cols, rows, values } = pooled;
+  if (!cols || !rows || !values?.length) {
+    return null;
+  }
+  const mode = image.settings.channel;
+  const grid = [];
+  let min = Infinity;
+  let max = -Infinity;
+  for (let row = 0; row < rows; row += 1) {
+    const line = [];
+    for (let col = 0; col < cols; col += 1) {
+      const index = (row * cols + col) * 4;
+      const value = channelValueFromRgba(mode, values[index], values[index + 1], values[index + 2], values[index + 3]);
+      line.push(value);
+      if (Number.isFinite(value)) {
+        min = Math.min(min, value);
+        max = Math.max(max, value);
+      }
+    }
+    grid.push(line);
+  }
+  if (!Number.isFinite(min) || !Number.isFinite(max)) {
+    min = 0;
+    max = 0;
+  }
+  return { cols, rows, values: grid, min, max };
 }
 
 function drawGraphSamplingNotice(sampling) {
@@ -2497,11 +2539,16 @@ function selectionGraphStatistics(image, rect) {
 }
 function graphPixelValue(image, x, y) {
   const index = (y * image.width + x) * 4;
-  const r = image.pixels[index];
-  const g = image.pixels[index + 1];
-  const b = image.pixels[index + 2];
-  const a = image.pixels[index + 3];
-  const mode = image.settings.channel;
+  return channelValueFromRgba(
+    image.settings.channel,
+    image.pixels[index],
+    image.pixels[index + 1],
+    image.pixels[index + 2],
+    image.pixels[index + 3]
+  );
+}
+
+function channelValueFromRgba(mode, r, g, b, a) {
   if (mode === "r") {
     return r;
   }
