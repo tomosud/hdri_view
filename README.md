@@ -1,8 +1,17 @@
 # HDRI Value Viewer
 
-ブラウザだけで動く HDR / EXR 画像ビューア。ピクセルの実数値（linear / sRGB）をその場で確認しながら、露出やチャンネルを切り替えて画像を検証できます。サーバー処理なしの静的ページなので、GitHub Pages でそのまま公開しています。
 
-**デモ: https://tomosud.github.io/hdri_view/**
+
+https://github.com/user-attachments/assets/53fd2ff5-9d39-4b50-b34e-35220dcfc0dd
+
+
+
+ブラウザだけで動く HDR / EXR 等の画像の値を計測するためのビューア。
+
+https://tomosud.github.io/hdri_view/
+
+
+
 
 ![アプリ全体のスクリーンショット](doc_asset/ui_all.png)
 
