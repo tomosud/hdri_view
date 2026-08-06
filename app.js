@@ -3111,6 +3111,24 @@ function computeRange(pixels) {
   };
 }
 
+function getDisplayNormalizationRange(image) {
+  const channelIndex = { r: 0, g: 1, b: 2, a: 3 }[image.settings.channel];
+
+  // R/G/B/A単独表示時はそのチャンネル専用の範囲を使う
+  if (channelIndex !== undefined) {
+    return {
+      min: image.range.min[channelIndex],
+      max: image.range.max[channelIndex]
+    };
+  }
+
+  // RGB/RGBA表示はRGB全体の範囲
+  return {
+    min: image.range.rgbMin,
+    max: image.range.rgbMax
+  };
+}
+
 function updateSettingsPanel() {
   const image = currentImage();
   emptySettings.classList.toggle("hidden", Boolean(image));
@@ -3127,7 +3145,8 @@ function updateSettingsPanel() {
   metaName.textContent = image.name;
   metaSize.textContent = `${image.width} x ${image.height}`;
   metaType.textContent = `${image.type} / ${image.sourceFormat}`;
-  metaRange.textContent = `${formatNumber(image.range.rgbMin)} - ${formatNumber(image.range.rgbMax)}`;
+  const normalizationRange = getDisplayNormalizationRange(image);
+  metaRange.textContent = `${formatNumber(normalizationRange.min)} - ${formatNumber(normalizationRange.max)}`;
 
   for (const button of channelButtons.querySelectorAll("button")) {
     button.classList.toggle("active", button.dataset.channel === image.settings.channel);
@@ -3272,14 +3291,11 @@ function ensureDisplayCanvas(image) {
   output.height = image.height;
   const outputCtx = output.getContext("2d");
   const imageData = outputCtx.createImageData(image.width, image.height);
-  const rgbRange = image.range.rgbMax - image.range.rgbMin;
-  const alphaRange = image.range.max[3] - image.range.min[3];
+  const normalizationRange = getDisplayNormalizationRange(image);
+  const normalizationWidth = normalizationRange.max - normalizationRange.min;
   const brightness = image.settings.brightness;
-  const rgbLogNormalize = logDisplayMode
-    ? graphValueNormalizer(image.range.rgbMin, image.range.rgbMax, "log")
-    : null;
-  const alphaLogNormalize = logDisplayMode
-    ? graphValueNormalizer(image.range.min[3], image.range.max[3], "log")
+  const logNormalize = logDisplayMode
+    ? graphValueNormalizer(normalizationRange.min, normalizationRange.max, "log")
     : null;
 
   for (let i = 0, j = 0; i < image.pixels.length; i += 4, j += 4) {
@@ -3293,32 +3309,33 @@ function ensureDisplayCanvas(image) {
 
     for (let channel = 0; channel < 3; channel += 1) {
       let value = display[channel];
-      if (rgbLogNormalize) {
-        imageData.data[j + channel] = Math.round(rgbLogNormalize(value * brightness) * 255);
+      if (logNormalize) {
+        imageData.data[j + channel] = Math.round(logNormalize(value * brightness) * 255);
         continue;
       }
-      if (image.settings.autoLevel && rgbRange > 0) {
-        value = (value - image.range.rgbMin) / rgbRange;
+      if (image.settings.autoLevel && normalizationWidth > 0) {
+        value = (value - normalizationRange.min) / normalizationWidth;
       }
       imageData.data[j + channel] = Math.round(clamp01(linearToSrgb(value * brightness)) * 255);
     }
 
-    let alpha = display[3];
     if (image.settings.channel === "a") {
-      if (alphaLogNormalize) {
-        alpha = alphaLogNormalize(source[3] * brightness);
-      } else if (image.settings.autoLevel && alphaRange > 0) {
-        alpha = (source[3] - image.range.min[3]) / alphaRange;
+      let alpha = source[3];
+      if (logNormalize) {
+        alpha = logNormalize(alpha * brightness);
+      } else if (image.settings.autoLevel && normalizationWidth > 0) {
+        alpha = (alpha - normalizationRange.min) / normalizationWidth;
         alpha = clamp01(alpha * brightness);
       } else {
         alpha = clamp01(alpha * brightness);
       }
-      imageData.data[j] = Math.round(alpha * 255);
-      imageData.data[j + 1] = imageData.data[j];
-      imageData.data[j + 2] = imageData.data[j];
+      const alphaByte = Math.round(alpha * 255);
+      imageData.data[j] = alphaByte;
+      imageData.data[j + 1] = alphaByte;
+      imageData.data[j + 2] = alphaByte;
       imageData.data[j + 3] = 255;
     } else {
-      imageData.data[j + 3] = Math.round(clamp01(alpha) * 255);
+      imageData.data[j + 3] = Math.round(clamp01(display[3]) * 255);
     }
   }
 
