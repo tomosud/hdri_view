@@ -188,6 +188,39 @@ textarea {
   cursor: move;
 }
 
+.log-display-toggle {
+  height: 24px;
+  padding: 0 12px;
+  border: 1px solid #33404d;
+  border-radius: 6px;
+  background: #182028;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.log-display-toggle:hover {
+  border-color: var(--accent);
+}
+
+.log-display-toggle.active {
+  animation: logDisplayBlink 1.8s ease-in-out infinite;
+}
+
+@keyframes logDisplayBlink {
+  0%, 100% {
+    border-color: #7a4210;
+    background: #3a2408;
+    color: #ffb066;
+  }
+  50% {
+    border-color: #ff9a2e;
+    background: #ff9a2e;
+    color: #1a0f00;
+  }
+}
+
 .graph-titlebar span,
 .graph-titlebar strong {
   min-width: 0;

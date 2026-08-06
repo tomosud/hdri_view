@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import { EXRLoader } from "three/addons/loaders/EXRLoader.js";
-import { RGBELoader } from "three/addons/loaders/RGBELoader.js";
+import { HDRLoader } from "three/addons/loaders/HDRLoader.js";
 
 const fileInput = document.querySelector("#fileInput");
 const fileHint = document.querySelector("#fileHint");
@@ -10,6 +10,7 @@ const selectionGraphPanel = document.querySelector("#selectionGraphPanel");
 const selectionGraphCanvas = document.querySelector("#selectionGraphCanvas");
 const selectionGraphLabel = document.querySelector("#selectionGraphLabel");
 const selectionGraphResize = document.querySelector("#selectionGraphResize");
+const logDisplayButton = document.querySelector("#logDisplayButton");
 const windowLayer = document.querySelector("#windowLayer");
 const dropPrompt = document.querySelector("#dropPrompt");
 const inspector = document.querySelector("#inspector");
@@ -86,6 +87,7 @@ const graphView = {
   yaw: -0.72,
   pitch: 0.92
 };
+let logDisplayMode = false;
 const graphCtx = selectionGraphCanvas.getContext("2d");
 const selectionDetailsCache = new WeakMap();
 let selectionDetailsTimer = null;
@@ -141,6 +143,17 @@ copyPickersButton.addEventListener("click", async () => {
 
 copySelectionMatrixButton.addEventListener("click", () => {
   void copyFullSelectionMatrix();
+});
+
+logDisplayButton.addEventListener("click", () => {
+  logDisplayMode = !logDisplayMode;
+  updateLogDisplayButton();
+  for (const image of images) {
+    image.displayDirty = true;
+  }
+  requestRender();
+  requestSelectionGraphDraw();
+  scheduleSessionSave();
 });
 
 selectionSummary.addEventListener("pointerdown", (event) => event.stopPropagation());
@@ -518,6 +531,7 @@ makeFloatingPanelDraggable(inspector);
 makeFloatingPanelDraggable(pickerPanel);
 makeFloatingPanelDraggable(selectionGraphPanel);
 updatePickerPanel();
+updateLogDisplayButton();
 requestRender();
 drawSelectionGraph();
 void restoreSavedSession();
@@ -686,7 +700,7 @@ async function loadRasterImage(file) {
 
 async function loadDataTexture(file, kind) {
   const buffer = await file.arrayBuffer();
-  const loader = kind === "exr" ? new EXRLoader() : new RGBELoader();
+  const loader = kind === "exr" ? new EXRLoader() : new HDRLoader();
   if (typeof loader.setDataType === "function") {
     loader.setDataType(THREE.FloatType);
   }
@@ -1674,6 +1688,7 @@ function buildSessionRecord() {
     pickerValueMode: pickerValueMode.value,
     pickerCopyMode: pickerCopyMode.value,
     graphView: { ...graphView },
+    logDisplayMode,
     panels: {
       inspector: panelSessionState(inspector),
       picker: panelSessionState(pickerPanel),
@@ -1748,6 +1763,10 @@ function applyAppSessionState(session) {
   if (session.graphView) {
     graphView.yaw = finiteOrDefault(session.graphView.yaw, graphView.yaw);
     graphView.pitch = finiteOrDefault(session.graphView.pitch, graphView.pitch);
+  }
+  if (typeof session.logDisplayMode === "boolean") {
+    logDisplayMode = session.logDisplayMode;
+    updateLogDisplayButton();
   }
   applyPanelSessionState(inspector, session.panels?.inspector);
   applyPanelSessionState(pickerPanel, session.panels?.picker);
@@ -2348,6 +2367,13 @@ function requestSelectionGraphDraw() {
   });
 }
 
+function updateLogDisplayButton() {
+  logDisplayButton.classList.toggle("active", logDisplayMode);
+  logDisplayButton.title = logDisplayMode
+    ? "Log color scale (click for Linear)"
+    : "Linear color scale (click for Log)";
+}
+
 function drawSelectionGraph() {
   const image = currentImage();
   const rect = image?.selection;
@@ -2391,21 +2417,37 @@ function drawSelectionGraph() {
   const statistics = activeDrag?.kind === "selectRect" ? null : selectionGraphStatistics(image, rect);
   const min = statistics?.min ?? samples.min;
   const max = statistics?.max ?? samples.max;
-  const range = max - min || 1;
-  const projector = makeGraphProjector(samples, rect, width, height, min, range);
+  const normalize = graphValueNormalizer(min, max, logDisplayMode ? "log" : "linear");
+  const projector = makeGraphProjector(samples, rect, width, height, normalize);
 
   graphCtx.save();
   drawGraphBase(samples, projector);
 
   if (samples.stepped) {
-    drawSteppedGraph(samples, projector, min, range);
+    drawSteppedGraph(samples, projector, normalize, min);
   } else {
-    drawInterpolatedGraph(samples, projector, min, range);
+    drawInterpolatedGraph(samples, projector, normalize);
   }
 
-  drawGraphLegend(width, height, min, max, statistics);
+  drawGraphLegend(width, height, min, max, statistics, normalize);
   drawGraphSamplingNotice(sampling);
   graphCtx.restore();
+}
+
+// Maps a raw value to a 0-1 position for color/height, either linearly or on a log10 scale.
+function graphValueNormalizer(min, max, mode) {
+  if (mode === "log") {
+    const epsilon = Math.max(1e-6, Math.abs(max) * 1e-6);
+    const logMin = Math.log10(Math.max(min, 0) + epsilon);
+    const logMax = Math.log10(Math.max(max, 0) + epsilon);
+    const logRange = (logMax - logMin) || 1;
+    return (value) => {
+      const safeValue = Number.isFinite(value) ? Math.max(value, 0) : 0;
+      return clamp01((Math.log10(safeValue + epsilon) - logMin) / logRange);
+    };
+  }
+  const range = (max - min) || 1;
+  return (value) => clamp01(((Number.isFinite(value) ? value : min) - min) / range);
 }
 
 function selectionGraphSampling(rect) {
@@ -2572,7 +2614,7 @@ function graphModeLabel(image) {
   return "Luminance";
 }
 
-function drawInterpolatedGraph(samples, projector, min, range) {
+function drawInterpolatedGraph(samples, projector, normalize) {
   const quads = [];
   for (let row = 0; row < samples.rows - 1; row += 1) {
     for (let col = 0; col < samples.cols - 1; col += 1) {
@@ -2583,7 +2625,7 @@ function drawInterpolatedGraph(samples, projector, min, range) {
       const avg = (v00 + v10 + v11 + v01) / 4;
       quads.push({
         depth: graphFaceDepth(projector, col, row, col + 1, row + 1),
-        color: graphColor((avg - min) / range),
+        color: graphColor(normalize(avg)),
         alpha: 1,
         stroke: "rgba(8, 12, 18, 0.36)",
         points: [
@@ -2599,36 +2641,35 @@ function drawInterpolatedGraph(samples, projector, min, range) {
   drawGraphFaces(quads, 0.6);
 }
 
-function drawSteppedGraph(samples, projector, min, range) {
+function drawSteppedGraph(samples, projector, normalize, min) {
   const faces = [];
   const valueAt = (col, row) => samples.values[row][col];
-  const normalized = (value) => (value - min) / range;
 
   for (let row = 0; row < samples.rows; row += 1) {
     for (let col = 0; col < samples.cols; col += 1) {
       const value = valueAt(col, row);
-      addSteppedTopFace(faces, projector, col, row, value, normalized(value));
+      addSteppedTopFace(faces, projector, col, row, value, normalize(value));
 
       if (col === 0) {
-        addSteppedSideFace(faces, projector, col, row, col, row + 1, value, min, normalized(value));
+        addSteppedSideFace(faces, projector, col, row, col, row + 1, value, min, normalize(value));
       }
       if (row === 0) {
-        addSteppedSideFace(faces, projector, col, row, col + 1, row, value, min, normalized(value));
+        addSteppedSideFace(faces, projector, col, row, col + 1, row, value, min, normalize(value));
       }
       if (col === samples.cols - 1) {
-        addSteppedSideFace(faces, projector, col + 1, row, col + 1, row + 1, value, min, normalized(value));
+        addSteppedSideFace(faces, projector, col + 1, row, col + 1, row + 1, value, min, normalize(value));
       } else {
         const next = valueAt(col + 1, row);
         if (Math.abs(next - value) > 1e-12) {
-          addSteppedSideFace(faces, projector, col + 1, row, col + 1, row + 1, value, next, normalized((value + next) / 2));
+          addSteppedSideFace(faces, projector, col + 1, row, col + 1, row + 1, value, next, normalize((value + next) / 2));
         }
       }
       if (row === samples.rows - 1) {
-        addSteppedSideFace(faces, projector, col, row + 1, col + 1, row + 1, value, min, normalized(value));
+        addSteppedSideFace(faces, projector, col, row + 1, col + 1, row + 1, value, min, normalize(value));
       } else {
         const next = valueAt(col, row + 1);
         if (Math.abs(next - value) > 1e-12) {
-          addSteppedSideFace(faces, projector, col, row + 1, col + 1, row + 1, value, next, normalized((value + next) / 2));
+          addSteppedSideFace(faces, projector, col, row + 1, col + 1, row + 1, value, next, normalize((value + next) / 2));
         }
       }
     }
@@ -2690,7 +2731,7 @@ function drawGraphFaces(faces, lineWidth) {
   }
 }
 
-function makeGraphProjector(samples, rect, width, height, min, range) {
+function makeGraphProjector(samples, rect, width, height, normalize) {
   const plot = {
     left: 12,
     top: 12,
@@ -2762,7 +2803,6 @@ function makeGraphProjector(samples, rect, width, height, min, range) {
   ) * 0.92;
   const offsetX = plot.left + availableWidth / 2 - ((extent.minX + extent.maxX) / 2) * scale;
   const offsetY = plot.top + availableHeight / 2 - ((extent.minY + extent.maxY) / 2) * scale;
-  const normalizeValue = (value) => clamp01(((Number.isFinite(value) ? value : min) - min) / range);
   const toCanvas = (point) => ({
     x: offsetX + point.x * scale,
     y: offsetY + point.y * scale
@@ -2770,7 +2810,7 @@ function makeGraphProjector(samples, rect, width, height, min, range) {
 
   return {
     base: (col, row) => toCanvas(projectGraphPoint(col, row, 0, samples, worldWidth, worldDepth, worldHeight)),
-    surface: (col, row, value) => toCanvas(projectGraphPoint(col, row, normalizeValue(value), samples, worldWidth, worldDepth, worldHeight)),
+    surface: (col, row, value) => toCanvas(projectGraphPoint(col, row, normalize(value), samples, worldWidth, worldDepth, worldHeight)),
     depth: (col, row) => graphWorldPoint(col, row, samples, worldWidth, worldDepth).viewDepth
   };
 }
@@ -2839,7 +2879,7 @@ function drawGraphBase(samples, projector) {
   graphCtx.stroke();
 }
 
-function drawGraphLegend(width, height, min, max, statistics = null) {
+function drawGraphLegend(width, height, min, max, statistics = null, normalize = graphValueNormalizer(min, max, "linear")) {
   const barX = Math.max(20, width - 32);
   const barY = 32;
   const barW = 10;
@@ -2859,13 +2899,12 @@ function drawGraphLegend(width, height, min, max, statistics = null) {
   if (!statistics) {
     return;
   }
-  const range = max - min || 1;
   const markers = [
     { label: "Avg", value: statistics.average, color: "#ffffff" }
   ].map((marker) => ({
     ...marker,
-    y: barY + (1 - clamp01((marker.value - min) / range)) * barH,
-    labelY: clamp(barY + (1 - clamp01((marker.value - min) / range)) * barH + 3, barY + 20, barY + barH - 10)
+    y: barY + (1 - normalize(marker.value)) * barH,
+    labelY: clamp(barY + (1 - normalize(marker.value)) * barH + 3, barY + 20, barY + barH - 10)
   }));
 
   for (const marker of markers) {
@@ -3252,6 +3291,12 @@ function ensureDisplayCanvas(image) {
   const rgbRange = image.range.rgbMax - image.range.rgbMin;
   const alphaRange = image.range.max[3] - image.range.min[3];
   const brightness = image.settings.brightness;
+  const rgbLogNormalize = logDisplayMode
+    ? graphValueNormalizer(image.range.rgbMin, image.range.rgbMax, "log")
+    : null;
+  const alphaLogNormalize = logDisplayMode
+    ? graphValueNormalizer(image.range.min[3], image.range.max[3], "log")
+    : null;
 
   for (let i = 0, j = 0; i < image.pixels.length; i += 4, j += 4) {
     const source = [
@@ -3264,6 +3309,10 @@ function ensureDisplayCanvas(image) {
 
     for (let channel = 0; channel < 3; channel += 1) {
       let value = display[channel];
+      if (rgbLogNormalize) {
+        imageData.data[j + channel] = Math.round(rgbLogNormalize(value * brightness) * 255);
+        continue;
+      }
       if (image.settings.autoLevel && rgbRange > 0) {
         value = (value - image.range.rgbMin) / rgbRange;
       }
@@ -3272,10 +3321,15 @@ function ensureDisplayCanvas(image) {
 
     let alpha = display[3];
     if (image.settings.channel === "a") {
-      if (image.settings.autoLevel && alphaRange > 0) {
+      if (alphaLogNormalize) {
+        alpha = alphaLogNormalize(source[3] * brightness);
+      } else if (image.settings.autoLevel && alphaRange > 0) {
         alpha = (source[3] - image.range.min[3]) / alphaRange;
+        alpha = clamp01(alpha * brightness);
+      } else {
+        alpha = clamp01(alpha * brightness);
       }
-      imageData.data[j] = Math.round(clamp01(alpha * brightness) * 255);
+      imageData.data[j] = Math.round(alpha * 255);
       imageData.data[j + 1] = imageData.data[j];
       imageData.data[j + 2] = imageData.data[j];
       imageData.data[j + 3] = 255;

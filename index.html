@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>HDRI Value Viewer</title>
-  <link rel="stylesheet" href="./style.css?v=20260806-1">
+  <link rel="stylesheet" href="./style.css?v=20260806-3">
   <script type="importmap">
     {
       "imports": {
@@ -75,6 +75,11 @@
               <input id="autoLevelInput" type="checkbox">
               <span>Auto level</span>
             </label>
+
+            <div class="field">
+              <span>Color Scale</span>
+              <button id="logDisplayButton" class="log-display-toggle" type="button" title="Toggle linear/log color scale for viewer and Selection Graph">Log</button>
+            </div>
 
             <div class="field">
               <span>Brightness</span>
@@ -168,6 +173,6 @@
     </footer>
   </div>
 
-  <script type="module" src="./app.js?v=20260806-2"></script>
+  <script type="module" src="./app.js?v=20260806-6"></script>
 </body>
 </html>
