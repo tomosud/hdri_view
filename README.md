@@ -42,7 +42,9 @@ https://tomosud.github.io/hdri_view/
 - **Filtering**: Auto / Nearest / Linear（拡大時の補間）
 - **Auto level**: HDR画像の輝度を自動でレベル補正
 - **Brightness**: 露出値を数値入力、または ±1 EV ボタンで調整
-- **Channel**: RGBA / RGB / R / G / B / A の表示切り替え
+- **Channel**: RGBA / RGB / R / G / B / A の表示切り替え。**RGBA を選んでいる間は、Picker /
+  Selection / ステータスバーが返す RGB 値に alpha を乗算します**（黒背景と合成された、
+  実際に画面で見えている値に合わせるため）。alpha を掛けない素の値が欲しいときは **RGB** を選びます
 - **Save**: 表示中の画像を各フォーマットで保存（HDR/EXRはHDRI画像のみ）
 
 パネル下部には開いている画像の **Name / Size / Type / Range**（値域）も表示されます。
@@ -82,7 +84,27 @@ https://tomosud.github.io/hdri_view/
 
 - ビルド不要の静的サイト（GitHub Pages でホスト可能）
 - [three.js](https://threejs.org/) の `EXRLoader` / `RGBELoader` を利用して HDR/EXR を読み込み
+- PNG は `png-decoder.js` で自前デコード（後述）
 - 選択範囲の集計処理は Web Worker（`selection-worker.js`）にオフロード
+
+### 値の正確性について
+
+計測用途のため、PNG は Canvas を経由せず `png-decoder.js` で直接デコードしています
+（IDAT の展開はブラウザ内蔵の `DecompressionStream` を使用、外部ライブラリなし）。
+
+Canvas 2D 経由（`drawImage` → `getImageData`）だと以下の非可逆変換が入るためです。
+
+- **premultiplied alpha の往復**: alpha < 255 の画素で RGB が量子化される。誤差は alpha に反比例し、
+  alpha=1 では 129 → 255、**alpha=0 では RGB が完全に失われる**（マスクを alpha に入れた
+  テクスチャなどで実害が出る）
+- **8bit 固定**: 16bit PNG の下位ビットが落ちる
+
+自前デコードでは、ビット深度 1/2/4/8/16、カラータイプ gray / rgb / palette / gray+alpha / rgba、
+`tRNS`、Adam7 インタレースに対応し、ファイルに書かれた値をそのまま取り出します。
+
+PNG 以外（JPEG / WebP / AVIF / GIF / BMP）は従来どおり Canvas 経由です。alpha を持たない画像は
+この経路でも値は一致します。半透明を含む画像を Canvas 経由で読み込んだ場合は、View Settings の
+**Type** 欄に `(canvas: RGB approximate where alpha < 1)` と表示されます。
 
 ## ローカルで動かす
 

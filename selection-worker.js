@@ -6,10 +6,23 @@ self.addEventListener("message", (event) => {
     height,
     valueMode,
     channels,
+    alphaWeighted = false,
     previewRows,
     previewColumns
   } = event.data;
   const pixels = new Float32Array(event.data.pixels);
+
+  // RGBA 表示のときは、見えている合成結果に合わせて RGB に alpha を掛けてから集計する。
+  // ワーカ側でやることでメインスレッドのコピー処理を増やさずに済む。
+  if (alphaWeighted) {
+    for (let index = 0; index < pixels.length; index += 4) {
+      const alpha = pixels[index + 3];
+      pixels[index] *= alpha;
+      pixels[index + 1] *= alpha;
+      pixels[index + 2] *= alpha;
+    }
+  }
+
   if (task === "matrix") {
     const matrix = selectionMatrixValue(pixels, width, height, valueMode, channels);
     self.postMessage({ kind: "fullMatrix", jobId, matrix });

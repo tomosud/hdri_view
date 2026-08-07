@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { EXRLoader } from "three/addons/loaders/EXRLoader.js";
 import { HDRLoader } from "three/addons/loaders/HDRLoader.js";
+import { decodePng, isPngFile, pngTypeLabel } from "./png-decoder.js?v=20260808-2";
 
 const fileInput = document.querySelector("#fileInput");
 const fileHint = document.querySelector("#fileHint");
@@ -666,6 +667,76 @@ async function loadImageFile(file) {
 }
 
 async function loadRasterImage(file) {
+  // PNG は自前デコードを優先する。Canvas 2D 経由だと premultiplied alpha の往復で
+  // alpha < 255 の画素の RGB が壊れ、さらに getImageData が 8bit 固定なので
+  // 16bit PNG の精度も落ちる（値を計測するツールとしては許容できない）。
+  const exact = await loadPngExact(file);
+  if (exact) {
+    return exact;
+  }
+  return loadCanvasRasterImage(file);
+}
+
+async function loadPngExact(file) {
+  let bytes;
+  try {
+    // まず先頭 8 バイトだけ見てシグネチャを判定し、PNG のときだけ全体を読む
+    const head = new Uint8Array(await file.slice(0, 8).arrayBuffer());
+    if (!isPngFile(head)) {
+      return null;
+    }
+    bytes = new Uint8Array(await file.arrayBuffer());
+  } catch (error) {
+    return null;
+  }
+
+  let decoded;
+  try {
+    decoded = await decodePng(bytes);
+  } catch (error) {
+    // 未対応の派生仕様などは Canvas 経路に落として読み込み自体は成功させる
+    console.warn(`Exact PNG decode failed, falling back to canvas: ${error.message}`);
+    return null;
+  }
+
+  // 画素ごとに Math.pow を 3 回呼ぶと大きい画像で重いので、取りうるサンプル値
+  // （最大 65536 通り）ぶんの LUT を先に作ってから引く。
+  const sampleMax = decoded.sampleMax;
+  const toLinear = new Float32Array(sampleMax + 1);
+  for (let sample = 0; sample <= sampleMax; sample += 1) {
+    toLinear[sample] = srgbToLinear(sample / sampleMax);
+  }
+
+  const pixels = new Float32Array(decoded.width * decoded.height * 4);
+  const data = decoded.data;
+  for (let i = 0; i < data.length; i += 4) {
+    pixels[i] = toLinear[Math.round(data[i] * sampleMax)];
+    pixels[i + 1] = toLinear[Math.round(data[i + 1] * sampleMax)];
+    pixels[i + 2] = toLinear[Math.round(data[i + 2] * sampleMax)];
+    pixels[i + 3] = data[i + 3];
+  }
+
+  const record = createImageRecord(file, decoded.width, decoded.height, pngTypeLabel(decoded), pixels, "raster");
+  const note = pngTransferNote(decoded);
+  if (note) {
+    record.type = `${record.type} ${note}`;
+  }
+  return record;
+}
+
+// sRGB 前提で線形化しているので、それと食い違う指定が入っている場合は Type 欄に出す。
+function pngTransferNote(decoded) {
+  if (decoded.hasIccProfile) {
+    return "(iCCP ignored)";
+  }
+  // sRGB の gAMA は 1/2.2 ≒ 0.4545。そこから外れる指定は sRGB 前提と矛盾する
+  if (decoded.gamma !== null && Math.abs(decoded.gamma - 0.45455) > 0.02) {
+    return `(gAMA ${decoded.gamma.toFixed(4)} ignored)`;
+  }
+  return "";
+}
+
+async function loadCanvasRasterImage(file) {
   const bitmap = await createImageBitmap(file, { colorSpaceConversion: "none" }).catch(() => createImageBitmap(file));
   const sourceCanvas = document.createElement("canvas");
   sourceCanvas.width = bitmap.width;
@@ -675,15 +746,26 @@ async function loadRasterImage(file) {
   bitmap.close?.();
 
   const imageData = sourceCtx.getImageData(0, 0, sourceCanvas.width, sourceCanvas.height);
+  const toLinear = new Float32Array(256);
+  for (let sample = 0; sample < 256; sample += 1) {
+    toLinear[sample] = srgbToLinear(sample / 255);
+  }
+
   const pixels = new Float32Array(sourceCanvas.width * sourceCanvas.height * 4);
   for (let i = 0, j = 0; i < imageData.data.length; i += 4, j += 4) {
-    pixels[j] = srgbToLinear(imageData.data[i] / 255);
-    pixels[j + 1] = srgbToLinear(imageData.data[i + 1] / 255);
-    pixels[j + 2] = srgbToLinear(imageData.data[i + 2] / 255);
+    pixels[j] = toLinear[imageData.data[i]];
+    pixels[j + 1] = toLinear[imageData.data[i + 1]];
+    pixels[j + 2] = toLinear[imageData.data[i + 2]];
     pixels[j + 3] = imageData.data[i + 3] / 255;
   }
 
-  return createImageRecord(file, sourceCanvas.width, sourceCanvas.height, "raster/srgb", pixels, "raster");
+  const record = createImageRecord(file, sourceCanvas.width, sourceCanvas.height, "raster/srgb", pixels, "raster");
+  if (record.range.min[3] < 1) {
+    // Canvas 経路は premultiplied alpha の往復を通るため、半透明画素の RGB は
+    // ファイルの値と一致しない（alpha が小さいほど誤差が大きい）。計測前に気付けるよう明示する。
+    record.type = `${record.type} (canvas: RGB approximate where alpha < 1)`;
+  }
+  return record;
 }
 
 async function loadDataTexture(file, kind) {
@@ -1285,9 +1367,9 @@ function makeRawCanvas(image, rect = null) {
     for (let x = 0; x < sourceRect.width; x += 1) {
       const sourceIndex = ((sourceRect.y + y) * image.width + sourceRect.x + x) * 4;
       const targetIndex = (y * sourceRect.width + x) * 4;
-      imageData.data[targetIndex] = Math.round(clamp01(linearToSrgb(image.pixels[sourceIndex])) * 255);
-      imageData.data[targetIndex + 1] = Math.round(clamp01(linearToSrgb(image.pixels[sourceIndex + 1])) * 255);
-      imageData.data[targetIndex + 2] = Math.round(clamp01(linearToSrgb(image.pixels[sourceIndex + 2])) * 255);
+      imageData.data[targetIndex] = linearToSrgbByte(image.pixels[sourceIndex]);
+      imageData.data[targetIndex + 1] = linearToSrgbByte(image.pixels[sourceIndex + 1]);
+      imageData.data[targetIndex + 2] = linearToSrgbByte(image.pixels[sourceIndex + 2]);
       imageData.data[targetIndex + 3] = Math.round(clamp01(image.pixels[sourceIndex + 3]) * 255);
     }
   }
@@ -2002,7 +2084,7 @@ function updateSelectionPanel() {
     return;
   }
 
-  const rectKey = selectionRectKey(rect);
+  const rectKey = selectionRectKey(image, rect);
   const matrixKey = selectionMatrixKey(image, rect);
   if (
     selectionMatrixCopyInFlight &&
@@ -2045,12 +2127,17 @@ function updateSelectionPanel() {
   }
 }
 
-function selectionRectKey(rect) {
+// 統計値は alpha 乗算の有無で変わるので、キャッシュキーにもその状態を含める
+function selectionRectKey(image, rect) {
+  return `${rawSelectionRectKey(rect)}:${usesAlphaWeightedValues(image) ? "pma" : "straight"}`;
+}
+
+function rawSelectionRectKey(rect) {
   return `${rect.x},${rect.y},${rect.width},${rect.height}`;
 }
 
 function selectionMatrixKey(image, rect) {
-  return `${selectionRectKey(rect)}:${pickerValueMode.value}:${image.settings.channel}`;
+  return `${rawSelectionRectKey(rect)}:${pickerValueMode.value}:${image.settings.channel}`;
 }
 
 function scheduleSelectionDetails(image, rect, rectKey, matrixKey) {
@@ -2091,7 +2178,7 @@ function selectionJobIsCurrent(image, rectKey, matrixKey, jobId) {
     jobId === selectionJobId &&
     currentImage() === image &&
     image.selection &&
-    selectionRectKey(image.selection) === rectKey &&
+    selectionRectKey(image, image.selection) === rectKey &&
     selectionMatrixKey(image, image.selection) === matrixKey
   );
 }
@@ -2126,7 +2213,7 @@ function runSelectionWorker(image, rect, rectKey, matrixKey, valueMode, channels
     return;
   }
   try {
-    selectionWorker = new Worker(new URL("./selection-worker.js?v=20260806-2", import.meta.url));
+    selectionWorker = new Worker(new URL("./selection-worker.js?v=20260808-1", import.meta.url));
   } catch (error) {
     selectionDetailsInFlight = null;
     console.error("Selection worker could not start.", error);
@@ -2179,6 +2266,7 @@ function runSelectionWorker(image, rect, rectKey, matrixKey, valueMode, channels
     height: rect.height,
     valueMode,
     channels,
+    alphaWeighted: usesAlphaWeightedValues(image),
     previewRows: selectionMatrixPreviewRows,
     previewColumns: selectionMatrixPreviewColumns
   }, [pixels.buffer]);
@@ -2192,7 +2280,7 @@ function copyFullSelectionMatrix() {
 
   cancelSelectionMatrixCopy();
   const savedRect = { ...rect };
-  const rectKey = selectionRectKey(savedRect);
+  const rectKey = selectionRectKey(image, savedRect);
   const matrixKey = selectionMatrixKey(image, savedRect);
   const valueMode = pickerValueMode.value;
   const channels = valueChannels(image).map((channel) => channel.index);
@@ -2243,7 +2331,7 @@ function runFullSelectionMatrixWorker(image, rect, matrixKey, valueMode, channel
     return;
   }
   try {
-    selectionMatrixCopyWorker = new Worker(new URL("./selection-worker.js?v=20260806-2", import.meta.url));
+    selectionMatrixCopyWorker = new Worker(new URL("./selection-worker.js?v=20260808-1", import.meta.url));
   } catch (error) {
     console.error("Matrix copy worker could not start.", error);
     fileHint.textContent = "Matrix copy failed.";
@@ -2276,7 +2364,8 @@ function runFullSelectionMatrixWorker(image, rect, matrixKey, valueMode, channel
     width: rect.width,
     height: rect.height,
     valueMode,
-    channels
+    channels,
+    alphaWeighted: usesAlphaWeightedValues(image)
   }, [pixels.buffer]);
 }
 
@@ -2455,7 +2544,7 @@ function selectionGraphSampling(rect) {
 function selectionGraphSamples(image, rect, sampling = selectionGraphSampling(rect)) {
   if (!activeDrag) {
     const cached = selectionDetailsCache.get(image);
-    if (cached?.rectKey === selectionRectKey(rect) && cached.pooled) {
+    if (cached?.rectKey === selectionRectKey(image, rect) && cached.pooled) {
       const pooled = pooledGraphSamples(image, cached.pooled);
       if (pooled) {
         return { ...pooled, stepped: sampling.stepped };
@@ -2548,7 +2637,7 @@ function drawGraphSamplingNotice(sampling) {
 
 function selectionGraphStatistics(image, rect) {
   const cached = selectionDetailsCache.get(image);
-  if (cached?.rectKey !== selectionRectKey(rect) || !cached.stats) {
+  if (cached?.rectKey !== selectionRectKey(image, rect) || !cached.stats) {
     return null;
   }
 
@@ -2569,14 +2658,8 @@ function selectionGraphStatistics(image, rect) {
   };
 }
 function graphPixelValue(image, x, y) {
-  const index = (y * image.width + x) * 4;
-  return channelValueFromRgba(
-    image.settings.channel,
-    image.pixels[index],
-    image.pixels[index + 1],
-    image.pixels[index + 2],
-    image.pixels[index + 3]
-  );
+  const linear = readDisplayedLinear(image, x, y);
+  return channelValueFromRgba(image.settings.channel, linear[0], linear[1], linear[2], linear[3]);
 }
 
 function channelValueFromRgba(mode, r, g, b, a) {
@@ -2934,29 +3017,42 @@ function graphColor(value) {
 }
 
 function forEachPixelInRect(image, rect, callback) {
+  const alphaWeighted = usesAlphaWeightedValues(image);
   for (let y = 0; y < rect.height; y += 1) {
     for (let x = 0; x < rect.width; x += 1) {
       const index = ((rect.y + y) * image.width + rect.x + x) * 4;
+      const alpha = image.pixels[index + 3];
+      const scale = alphaWeighted ? alpha : 1;
       callback([
-        image.pixels[index],
-        image.pixels[index + 1],
-        image.pixels[index + 2],
-        image.pixels[index + 3]
+        image.pixels[index] * scale,
+        image.pixels[index + 1] * scale,
+        image.pixels[index + 2] * scale,
+        alpha
       ], rect.x + x, rect.y + y);
     }
   }
 }
 
 function pixelTupleForMode(image, x, y, mode, channels = valueChannels(image)) {
+  return valueTupleForMode(valuesFromLinear(readDisplayedLinear(image, x, y)), mode, channels);
+}
+
+// RGBA 表示ではキャンバス上で色に alpha が乗った状態（黒背景との合成結果）が見えているため、
+// 値の取得も alpha 乗算後にそろえる。RGB / 単チャンネル表示は alpha を乗算しない。
+function usesAlphaWeightedValues(image) {
+  return image.settings.channel === "rgba";
+}
+
+function readDisplayedLinear(image, x, y) {
   const index = (y * image.width + x) * 4;
-  const linear = [
-    image.pixels[index],
-    image.pixels[index + 1],
-    image.pixels[index + 2],
-    image.pixels[index + 3]
+  const alpha = image.pixels[index + 3];
+  const scale = usesAlphaWeightedValues(image) ? alpha : 1;
+  return [
+    image.pixels[index] * scale,
+    image.pixels[index + 1] * scale,
+    image.pixels[index + 2] * scale,
+    alpha
   ];
-  const values = valuesFromLinear(linear);
-  return valueTupleForMode(values, mode, channels);
 }
 
 function valuesFromLinear(linear) {
@@ -2984,14 +3080,7 @@ function csvCell(value) {
 }
 
 function pickerValues(image, picker) {
-  const index = (picker.y * image.width + picker.x) * 4;
-  const linear = [
-    image.pixels[index],
-    image.pixels[index + 1],
-    image.pixels[index + 2],
-    image.pixels[index + 3]
-  ];
-  return valuesFromLinear(linear);
+  return valuesFromLinear(readDisplayedLinear(image, picker.x, picker.y));
 }
 
 function formatPickerValue(image, values) {
@@ -3055,7 +3144,8 @@ function displayChannelLabel(image) {
     return "RGB";
   }
   if (mode === "rgba") {
-    return "RGBA";
+    // RGBA 表示では RGB に alpha を乗算した値を出しているので、そのことを明示する
+    return "RGBA (RGB x alpha)";
   }
   return mode.toUpperCase();
 }
@@ -3088,18 +3178,42 @@ function updatePickerCursor() {
 }
 
 function computeRange(pixels) {
-  const min = [Infinity, Infinity, Infinity, Infinity];
-  const max = [-Infinity, -Infinity, -Infinity, -Infinity];
+  // 読み込みのたびに全画素を走るので、min/max は配列ではなくローカル変数で回す
+  let minR = Infinity;
+  let minG = Infinity;
+  let minB = Infinity;
+  let minA = Infinity;
+  let maxR = -Infinity;
+  let maxG = -Infinity;
+  let maxB = -Infinity;
+  let maxA = -Infinity;
+
   for (let i = 0; i < pixels.length; i += 4) {
-    for (let channel = 0; channel < 4; channel += 1) {
-      const value = pixels[i + channel];
-      if (!Number.isFinite(value)) {
-        continue;
-      }
-      min[channel] = Math.min(min[channel], value);
-      max[channel] = Math.max(max[channel], value);
+    const r = pixels[i];
+    const g = pixels[i + 1];
+    const b = pixels[i + 2];
+    const a = pixels[i + 3];
+    // ±Infinity / NaN は範囲に含めない（EXR にはそのまま入っていることがある）
+    if (Number.isFinite(r)) {
+      if (r < minR) minR = r;
+      if (r > maxR) maxR = r;
+    }
+    if (Number.isFinite(g)) {
+      if (g < minG) minG = g;
+      if (g > maxG) maxG = g;
+    }
+    if (Number.isFinite(b)) {
+      if (b < minB) minB = b;
+      if (b > maxB) maxB = b;
+    }
+    if (Number.isFinite(a)) {
+      if (a < minA) minA = a;
+      if (a > maxA) maxA = a;
     }
   }
+
+  const min = [minR, minG, minB, minA];
+  const max = [maxR, maxG, maxB, maxA];
 
   for (let channel = 0; channel < 4; channel += 1) {
     if (min[channel] === Infinity) {
@@ -3303,44 +3417,58 @@ function ensureDisplayCanvas(image) {
     ? graphValueNormalizer(normalizationRange.min, normalizationRange.max, "log")
     : null;
 
-  for (let i = 0, j = 0; i < image.pixels.length; i += 4, j += 4) {
-    const source = [
-      image.pixels[i],
-      image.pixels[i + 1],
-      image.pixels[i + 2],
-      image.pixels[i + 3]
-    ];
-    const display = displayChannels(source, image.settings.channel);
+  // チャンネル切り替えのたびに全画素を処理するので、分岐と配列確保はループの外に出す
+  const target = imageData.data;
+  const pixels = image.pixels;
+  const mode = image.settings.channel;
+  const autoLevel = image.settings.autoLevel && normalizationWidth > 0;
+  const levelOffset = normalizationRange.min;
+  const levelScale = normalizationWidth > 0 ? 1 / normalizationWidth : 1;
 
-    for (let channel = 0; channel < 3; channel += 1) {
-      let value = display[channel];
-      if (logNormalize) {
-        imageData.data[j + channel] = Math.round(logNormalize(value * brightness) * 255);
-        continue;
-      }
-      if (image.settings.autoLevel && normalizationWidth > 0) {
-        value = (value - normalizationRange.min) / normalizationWidth;
-      }
-      imageData.data[j + channel] = Math.round(clamp01(linearToSrgb(value * brightness)) * 255);
-    }
-
-    if (image.settings.channel === "a") {
-      let alpha = source[3];
+  if (mode === "a") {
+    // アルファ単独表示は sRGB 変換せずリニアのまま濃淡にする
+    for (let i = 0, j = 0; i < pixels.length; i += 4, j += 4) {
+      let alpha = pixels[i + 3];
       if (logNormalize) {
         alpha = logNormalize(alpha * brightness);
-      } else if (image.settings.autoLevel && normalizationWidth > 0) {
-        alpha = (alpha - normalizationRange.min) / normalizationWidth;
-        alpha = clamp01(alpha * brightness);
+      } else if (autoLevel) {
+        alpha = clamp01((alpha - levelOffset) * levelScale * brightness);
       } else {
         alpha = clamp01(alpha * brightness);
       }
       const alphaByte = Math.round(alpha * 255);
-      imageData.data[j] = alphaByte;
-      imageData.data[j + 1] = alphaByte;
-      imageData.data[j + 2] = alphaByte;
-      imageData.data[j + 3] = 255;
-    } else {
-      imageData.data[j + 3] = Math.round(clamp01(display[3]) * 255);
+      target[j] = alphaByte;
+      target[j + 1] = alphaByte;
+      target[j + 2] = alphaByte;
+      target[j + 3] = 255;
+    }
+  } else {
+    // どのソースチャンネルを R/G/B に流すかを先に決めておく（単チャンネル表示はグレースケール）
+    let sourceR = 0;
+    let sourceG = 1;
+    let sourceB = 2;
+    if (mode === "r" || mode === "g" || mode === "b") {
+      sourceR = mode === "r" ? 0 : mode === "g" ? 1 : 2;
+      sourceG = sourceR;
+      sourceB = sourceR;
+    }
+    const useSourceAlpha = mode === "rgba";
+
+    for (let i = 0, j = 0; i < pixels.length; i += 4, j += 4) {
+      if (logNormalize) {
+        target[j] = Math.round(logNormalize(pixels[i + sourceR] * brightness) * 255);
+        target[j + 1] = Math.round(logNormalize(pixels[i + sourceG] * brightness) * 255);
+        target[j + 2] = Math.round(logNormalize(pixels[i + sourceB] * brightness) * 255);
+      } else if (autoLevel) {
+        target[j] = linearToSrgbByte((pixels[i + sourceR] - levelOffset) * levelScale * brightness);
+        target[j + 1] = linearToSrgbByte((pixels[i + sourceG] - levelOffset) * levelScale * brightness);
+        target[j + 2] = linearToSrgbByte((pixels[i + sourceB] - levelOffset) * levelScale * brightness);
+      } else {
+        target[j] = linearToSrgbByte(pixels[i + sourceR] * brightness);
+        target[j + 1] = linearToSrgbByte(pixels[i + sourceG] * brightness);
+        target[j + 2] = linearToSrgbByte(pixels[i + sourceB] * brightness);
+      }
+      target[j + 3] = useSourceAlpha ? Math.round(clamp01(pixels[i + 3]) * 255) : 255;
     }
   }
 
@@ -3425,13 +3553,7 @@ function updatePixelReadout(image, event) {
     return;
   }
 
-  const index = (pixel.y * image.width + pixel.x) * 4;
-  const linear = [
-    image.pixels[index],
-    image.pixels[index + 1],
-    image.pixels[index + 2],
-    image.pixels[index + 3]
-  ];
+  const linear = readDisplayedLinear(image, pixel.x, pixel.y);
   const srgb = [
     linearToSrgb(linear[0]),
     linearToSrgb(linear[1]),
@@ -3528,6 +3650,33 @@ function linearToSrgb(value) {
     return value * 12.92;
   }
   return 1.055 * Math.pow(value, 1 / 2.4) - 0.055;
+}
+
+// 表示用の linear -> sRGB 8bit 変換。画素ごとに Math.pow を呼ぶと 2048x1024 で 500ms 以上
+// かかるため、[0,1) を 65536 分割した LUT を引く。linearToSrgb は単調増加なので、
+// bin の両端で出力バイトが一致すれば bin 内のどの値でも同じバイトになることが保証できる。
+// 一致しない bin（全体の 0.39%）だけ従来どおり厳密計算するので、結果は Math.pow と完全一致する。
+const SRGB_BYTE_BINS = 65536;
+const srgbByteTable = new Uint8Array(SRGB_BYTE_BINS);
+const srgbByteNeedsExact = new Uint8Array(SRGB_BYTE_BINS);
+
+for (let bin = 0; bin < SRGB_BYTE_BINS; bin += 1) {
+  const low = Math.round(linearToSrgb(bin / SRGB_BYTE_BINS) * 255);
+  const high = Math.round(linearToSrgb((bin + 1) / SRGB_BYTE_BINS) * 255);
+  srgbByteTable[bin] = low;
+  srgbByteNeedsExact[bin] = low === high ? 0 : 1;
+}
+
+function linearToSrgbByte(value) {
+  // clamp01 と同じく、Inf / NaN は 0 として扱う
+  if (!Number.isFinite(value) || value <= 0) {
+    return 0;
+  }
+  if (value >= 1) {
+    return 255;
+  }
+  const bin = (value * SRGB_BYTE_BINS) | 0;
+  return srgbByteNeedsExact[bin] ? Math.round(linearToSrgb(value) * 255) : srgbByteTable[bin];
 }
 
 function clamp(value, min, max) {
