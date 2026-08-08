@@ -17,6 +17,7 @@ import {
   getGlslSupport,
   runGlslShader
 } from "./glsl-runtime.js?v=20260808-5";
+import { decodeGlslShareHash, encodeGlslShareHash } from "./glsl-share.js?v=20260808-1";
 
 const fileInput = document.querySelector("#fileInput");
 const fileHint = document.querySelector("#fileHint");
@@ -303,6 +304,10 @@ document.addEventListener("paste", (event) => {
     event.preventDefault();
     void pasteFromAsyncClipboard(pasteJobId);
   }
+});
+
+window.addEventListener("hashchange", () => {
+  openGlslShareFromLocation();
 });
 
 document.addEventListener("copy", (event) => {
@@ -769,7 +774,7 @@ updatePickerPanel();
 updateLogDisplayButton();
 requestRender();
 drawSelectionGraph();
-void restoreSavedSession();
+queueMicrotask(initializeApp);
 
 async function openFilesWithPicker() {
   try {
@@ -1346,12 +1351,14 @@ function selectImage(image) {
   drawSelectionGraph();
   updateViewState();
   syncGlslEditorForSelection();
+  syncGlslShareUrl(image);
   scheduleSessionSave();
 }
 
 function clearActiveSelection() {
   selectedId = null;
   syncGlslEditorForSelection();
+  syncGlslShareUrl(null);
   for (const image of images) {
     image.elements?.frame.classList.remove("active");
   }
@@ -1567,6 +1574,7 @@ function switchImageMode(image, mode) {
     }
   }
   syncGlslEditorForSelection(mode === "glsl");
+  syncGlslShareUrl(image);
 }
 
 function updateImageModeTabs(image) {
@@ -1630,11 +1638,20 @@ function openGlslEditor(sourceImage) {
     return;
   }
 
+  addGeneratedGlslImage({ code, renderedCode: code, pixels, width, height, focusEditor: true });
+}
+
+function addGeneratedGlslImage({ code, renderedCode, pixels, width, height, focusEditor, errorMessage = "" }) {
   glslGeneratedCount += 1;
   const image = createImageRecord({ name: `glsl${glslGeneratedCount}` }, width, height, "glsl/linear", pixels, "glsl");
   image.source = { kind: "glsl-generated" };
   image.mode = "glsl";
   image.glsl = glslVariant(code, pixels, width, height);
+  image.glsl.renderedCode = renderedCode;
+  if (errorMessage) {
+    image.glsl.statusKind = "error";
+    image.glsl.status = errorMessage;
+  }
 
   images.push(image);
   createImageWindow(image, null, 0);
@@ -1644,8 +1661,95 @@ function openGlslEditor(sourceImage) {
   fileHint.textContent = `${images.length} image${images.length === 1 ? "" : "s"} opened`;
   requestRender();
   scheduleSessionSave();
+  if (focusEditor) {
+    glslCodeInput.focus();
+  }
+  return image;
+}
 
-  bindGlslEditor(image, true);
+function initializeApp() {
+  if (openGlslShareFromLocation()) {
+    return;
+  }
+  void restoreSavedSession();
+}
+
+function openGlslShareFromLocation() {
+  let shared;
+  try {
+    shared = decodeGlslShareHash(window.location.hash);
+  } catch (error) {
+    fileHint.textContent = error.message;
+    return true;
+  }
+  if (shared) {
+    openSharedGlslImage(shared);
+    return true;
+  }
+  return false;
+}
+
+function openSharedGlslImage({ code, width, height }) {
+  const support = getGlslSupport();
+  if (!support.ok) {
+    fileHint.textContent = `Shared GLSL unavailable: ${support.reason}`;
+    return;
+  }
+
+  let pixels;
+  let renderedCode = code;
+  let errorMessage = "";
+  try {
+    pixels = runGlslShader({ code, input: null, width, height });
+  } catch (error) {
+    errorMessage = error?.log || error?.message || String(error);
+    renderedCode = DEFAULT_GENERATOR_CODE;
+    try {
+      pixels = runGlslShader({ code: renderedCode, input: null, width, height });
+    } catch (fallbackError) {
+      fileHint.textContent = `Shared GLSL failed: ${fallbackError.message}`;
+      return;
+    }
+  }
+
+  addGeneratedGlslImage({ code, renderedCode, pixels, width, height, focusEditor: false, errorMessage });
+  fileHint.textContent = errorMessage ? "Opened shared GLSL with a compile error" : "Opened shared GLSL image";
+}
+
+function isShareableGlslImage(image) {
+  return Boolean(image?.glsl && !image.original && image.source?.kind === "glsl-generated");
+}
+
+function replaceUrlHash(hash) {
+  if (window.location.hash === hash) {
+    return true;
+  }
+  try {
+    const url = new URL(window.location.href);
+    url.hash = hash;
+    window.history.replaceState(window.history.state, "", url);
+    return true;
+  } catch (error) {
+    console.warn("GLSL share URL update skipped.", error);
+    return false;
+  }
+}
+
+function syncGlslShareUrl(image = currentImage()) {
+  if (!isShareableGlslImage(image) || image.id !== selectedId) {
+    replaceUrlHash("");
+    return;
+  }
+
+  const editorBound = glslTargetId === image.id;
+  const width = editorBound ? glslSizeValue(glslWidthInput, image.glsl.width) : image.glsl.width;
+  const height = editorBound ? glslSizeValue(glslHeightInput, image.glsl.height) : image.glsl.height;
+  try {
+    replaceUrlHash(encodeGlslShareHash({ width, height, code: image.glsl.code }));
+  } catch (error) {
+    replaceUrlHash("");
+    fileHint.textContent = `GLSL share URL unavailable: ${error.message}`;
+  }
 }
 
 function bindGlslEditor(image, focusEditor = false) {
@@ -1806,6 +1910,7 @@ function applyGlslResult(image, pixels, width, height, code) {
   updateSelectionPanel();
   drawSelectionGraph();
   requestRender();
+  syncGlslShareUrl(image);
   scheduleSessionSave();
 }
 
@@ -1855,11 +1960,18 @@ function initGlslEditor() {
       target.glsl.code = glslCodeInput.value;
     }
     glslPresetSelect.value = "";
+    syncGlslShareUrl(target);
     scheduleGlslRun();
     scheduleSessionSave();
   });
-  glslWidthInput.addEventListener("input", scheduleGlslRun);
-  glslHeightInput.addEventListener("input", scheduleGlslRun);
+  glslWidthInput.addEventListener("input", () => {
+    syncGlslShareUrl(glslTargetImage());
+    scheduleGlslRun();
+  });
+  glslHeightInput.addEventListener("input", () => {
+    syncGlslShareUrl(glslTargetImage());
+    scheduleGlslRun();
+  });
 
   glslPresetSelect.addEventListener("change", () => {
     // "Custom" の value は空文字。Number("") は 0 になってしまうので数値として扱わない。
@@ -1873,6 +1985,7 @@ function initGlslEditor() {
     if (target?.glsl) {
       target.glsl.code = preset.code;
     }
+    syncGlslShareUrl(target);
     scheduleGlslRun();
   });
 
@@ -1899,6 +2012,7 @@ function initGlslEditor() {
       target.glsl.code = glslCodeInput.value;
     }
     glslPresetSelect.value = "";
+    syncGlslShareUrl(target);
     scheduleGlslRun();
     scheduleSessionSave();
   });
