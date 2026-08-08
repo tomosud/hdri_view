@@ -3,12 +3,20 @@ import { EXRLoader } from "three/addons/loaders/EXRLoader.js";
 import { HDRLoader } from "three/addons/loaders/HDRLoader.js";
 import { decodePng, isPngFile, pngTypeLabel } from "./png-decoder.js?v=20260808-3";
 import {
+  MAX_VALUE_MATRIX_PIXELS,
+  isValueMatrixText,
+  parseGenericValueMatrix,
+  parseValueMatrix,
+  serializeInternalValueReference,
+  serializeValueMatrix
+} from "./clipboard-matrix.js?v=20260808-1";
+import {
   DEFAULT_FILTER_CODE,
   DEFAULT_GENERATOR_CODE,
   GLSL_PRESETS,
   getGlslSupport,
   runGlslShader
-} from "./glsl-runtime.js?v=20260808-4";
+} from "./glsl-runtime.js?v=20260808-5";
 
 const fileInput = document.querySelector("#fileInput");
 const fileHint = document.querySelector("#fileHint");
@@ -23,6 +31,7 @@ const glslMatchInputButton = document.querySelector("#glslMatchInput");
 const glslPresetSelect = document.querySelector("#glslPreset");
 const glslCodeInput = document.querySelector("#glslCode");
 const glslStatus = document.querySelector("#glslStatus");
+const glslResize = document.querySelector("#glslResize");
 const pickerModeButton = document.querySelector("#pickerModeButton");
 const viewport = document.querySelector("#viewport");
 const selectionGraphPanel = document.querySelector("#selectionGraphPanel");
@@ -74,6 +83,7 @@ const minWindowWidth = 220;
 const minWindowHeight = 160;
 const minGraphWidth = 180;
 const minGraphHeight = 140;
+const minGlslPanelHeight = 300;
 const maxPickers = 20;
 const selectionMatrixPreviewRows = 8;
 const selectionMatrixPreviewColumns = 12;
@@ -96,6 +106,9 @@ let rafPending = false;
 let graphRafPending = false;
 let pickerMode = false;
 let internalClipboard = null;
+const portableClipboardMatrixPixels = 512 * 512;
+const maxInternalClipboardPixels = 4096 * 2048;
+let clipboardReadJobId = 0;
 let topUiZ = 100000;
 let activePanelTab = "pickers";
 let saveSessionTimer = null;
@@ -280,16 +293,15 @@ document.addEventListener("paste", (event) => {
   if (shouldKeepNativeClipboardEvent(event)) {
     return;
   }
-  const clipboardData = event.clipboardData;
-  const files = clipboardImageFiles(clipboardData);
-  if (files.length > 0) {
+  const pasteJobId = ++clipboardReadJobId;
+  const payload = clipboardPastePayload(event.clipboardData);
+  const candidate = decodeClipboardPaste(payload);
+  if (candidate) {
     event.preventDefault();
-    void openFiles(files, null, { embedded: true });
-    return;
-  }
-  if (internalClipboard) {
+    void applyClipboardPasteCandidate(candidate);
+  } else if (shouldTryAsyncClipboardRead(payload)) {
     event.preventDefault();
-    pasteInternalClipboard();
+    void pasteFromAsyncClipboard(pasteJobId);
   }
 });
 
@@ -302,7 +314,7 @@ document.addEventListener("copy", (event) => {
     return;
   }
   event.preventDefault();
-  void copySelection(image, image.selection);
+  void copySelection(image, image.selection, event.clipboardData);
 });
 
 function shouldKeepNativeClipboardEvent(event) {
@@ -327,19 +339,230 @@ function isSupportedClipboardFile(file) {
 }
 
 function clipboardImageFiles(clipboardData) {
-  const files = Array.from(clipboardData?.files || []);
-  if (files.length === 0) {
-    for (const item of Array.from(clipboardData?.items || [])) {
-      if (item.kind !== "file") {
-        continue;
-      }
-      const file = item.getAsFile();
-      if (file) {
-        files.push(file);
-      }
+  const files = [];
+  const seen = new Set();
+  const addFile = (file) => {
+    if (!file || !isSupportedClipboardFile(file)) {
+      return;
+    }
+    const key = `${file.name}:${file.type}:${file.size}:${file.lastModified}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      files.push(file);
+    }
+  };
+  for (const file of Array.from(clipboardData?.files || [])) {
+    addFile(file);
+  }
+  for (const item of Array.from(clipboardData?.items || [])) {
+    if (item.kind === "file") {
+      addFile(item.getAsFile());
     }
   }
-  return files.filter(isSupportedClipboardFile);
+  return files;
+}
+
+function clipboardPastePayload(clipboardData) {
+  let text = "";
+  try {
+    text = clipboardData?.getData("text/plain") || "";
+  } catch {
+    // Some browsers expose image files but deny text access. The file candidate still works.
+  }
+  return {
+    text,
+    files: clipboardImageFiles(clipboardData),
+    types: Array.from(clipboardData?.types || [])
+  };
+}
+
+const clipboardPasteDecoders = [
+  {
+    id: "hdri-value-matrix",
+    decode(payload) {
+      if (!isValueMatrixText(payload.text)) {
+        return null;
+      }
+      return {
+        kind: "pixels",
+        source: "HDRI Value Matrix",
+        image: parseValueMatrix(payload.text, {
+          resolveInternal: (token) => internalClipboard?.token === token ? internalClipboard : null
+        })
+      };
+    }
+  },
+  {
+    id: "external-images",
+    decode(payload) {
+      return payload.files.length ? { kind: "files", files: payload.files } : null;
+    }
+  },
+  {
+    id: "generic-value-matrix",
+    decode(payload) {
+      const image = parseGenericValueMatrix(payload.text);
+      return image ? { kind: "pixels", source: "value matrix", image } : null;
+    }
+  },
+  {
+    id: "internal-fallback",
+    decode(payload) {
+      const clipboardIsEmpty = !payload.text && payload.files.length === 0 && payload.types.length === 0;
+      const asyncReadUnavailable = typeof navigator.clipboard?.read !== "function";
+      return clipboardIsEmpty && asyncReadUnavailable && internalClipboard
+        ? { kind: "pixels", source: "internal values", image: internalClipboard }
+        : null;
+    }
+  }
+];
+
+function decodeClipboardPaste(payload) {
+  for (const decoder of clipboardPasteDecoders) {
+    try {
+      const candidate = decoder.decode(payload);
+      if (candidate) {
+        return candidate;
+      }
+    } catch (error) {
+      if (error?.code === "VALUE_MATRIX_INTERNAL_UNAVAILABLE" && payload.files.length > 0) {
+        continue;
+      }
+      console.error(`Clipboard decoder failed: ${decoder.id}`, error);
+      return { kind: "error", message: error?.message || String(error) };
+    }
+  }
+  return null;
+}
+
+async function applyClipboardPasteCandidate(candidate) {
+  if (candidate.kind === "error") {
+    fileHint.textContent = `Paste failed: ${candidate.message}`;
+    return;
+  }
+  if (candidate.kind === "files") {
+    await openFiles(candidate.files, null, { embedded: true });
+    return;
+  }
+  pasteClipboardPixels(candidate.image, candidate.source);
+}
+
+function shouldTryAsyncClipboardRead(payload) {
+  return typeof navigator.clipboard?.read === "function" && (
+    payload.types.length === 0 ||
+    payload.types.some((type) =>
+      type === "Files" || type.startsWith("image/") || type.includes("exr") || type.includes("radiance")
+    )
+  );
+}
+
+async function pasteFromAsyncClipboard(jobId) {
+  try {
+    const items = await navigator.clipboard.read();
+    const files = [];
+    const seenFiles = new Set();
+    let text = "";
+    for (const [itemIndex, item] of items.entries()) {
+      if (item.types.includes("text/plain") && !text) {
+        try {
+          text = await (await item.getType("text/plain")).text();
+        } catch (error) {
+          console.warn("Clipboard text/plain could not be read.", error);
+        }
+      }
+      const imageTypes = item.types
+        .filter((type) => type !== "text/plain")
+        .sort((left, right) => clipboardMimePriority(left) - clipboardMimePriority(right));
+      for (const type of imageTypes) {
+        try {
+          const blob = await item.getType(type);
+          const file = await clipboardBlobAsImageFile(blob, type, itemIndex);
+          if (!file) {
+            continue;
+          }
+          const key = `${file.name}:${file.type}:${file.size}`;
+          if (!seenFiles.has(key)) {
+            seenFiles.add(key);
+            files.push(file);
+          }
+          // A ClipboardItem may expose the same image in several MIME representations.
+          // Use only the highest-priority supported representation from each item.
+          break;
+        } catch (error) {
+          console.warn(`Clipboard type could not be read: ${type}`, error);
+        }
+      }
+    }
+    if (jobId !== clipboardReadJobId) {
+      return;
+    }
+    const candidate = decodeClipboardPaste({
+      text,
+      files,
+      types: items.flatMap((item) => item.types)
+    });
+    if (candidate) {
+      await applyClipboardPasteCandidate(candidate);
+    } else {
+      fileHint.textContent = "Paste failed: no supported image or value data was found.";
+    }
+  } catch (error) {
+    if (jobId !== clipboardReadJobId) {
+      return;
+    }
+    console.error("Async clipboard read failed.", error);
+    fileHint.textContent = `Paste failed: ${error?.message || "clipboard data could not be read"}`;
+  }
+}
+
+function clipboardMimePriority(type) {
+  const normalized = String(type || "").toLowerCase();
+  if (normalized.includes("exr") || normalized.includes("radiance") || normalized.includes("hdr")) return 0;
+  if (normalized === "application/octet-stream" || !normalized) return 1;
+  if (normalized === "image/png") return 2;
+  return normalized.startsWith("image/") ? 3 : 4;
+}
+
+async function clipboardBlobAsImageFile(blob, mimeType, index) {
+  const normalizedType = String(mimeType || blob.type || "").toLowerCase();
+  let extension = clipboardExtensionForMime(normalizedType);
+  if (!extension && (normalizedType === "application/octet-stream" || !normalizedType)) {
+    extension = await detectHdrClipboardExtension(blob);
+  }
+  if (!extension) {
+    return null;
+  }
+  return new File([blob], `clipboard-${index + 1}.${extension}`, {
+    type: blob.type || normalizedType,
+    lastModified: Date.now()
+  });
+}
+
+function clipboardExtensionForMime(type) {
+  const extensions = new Map([
+    ["image/png", "png"],
+    ["image/jpeg", "jpg"],
+    ["image/webp", "webp"],
+    ["image/avif", "avif"],
+    ["image/gif", "gif"],
+    ["image/bmp", "bmp"],
+    ["image/vnd.radiance", "hdr"],
+    ["image/x-hdr", "hdr"],
+    ["image/hdr", "hdr"],
+    ["image/x-exr", "exr"],
+    ["image/exr", "exr"],
+    ["application/x-exr", "exr"]
+  ]);
+  return extensions.get(type) || null;
+}
+
+async function detectHdrClipboardExtension(blob) {
+  const head = new Uint8Array(await blob.slice(0, 16).arrayBuffer());
+  if (head.length >= 4 && head[0] === 0x76 && head[1] === 0x2f && head[2] === 0x31 && head[3] === 0x01) {
+    return "exr";
+  }
+  const signature = new TextDecoder("ascii").decode(head);
+  return signature.startsWith("#?RADIANCE") || signature.startsWith("#?RGBE") ? "hdr" : null;
 }
 
 zoomSelect.addEventListener("change", () => {
@@ -496,6 +719,10 @@ document.addEventListener("pointermove", (event) => {
     selectionGraphPanel.style.width = `${Math.max(minGraphWidth, activeDrag.width + dx)}px`;
     selectionGraphPanel.style.height = `${Math.max(minGraphHeight, activeDrag.height + dy)}px`;
     requestSelectionGraphDraw();
+  } else if (activeDrag.kind === "glslResize") {
+    const viewportRect = viewport.getBoundingClientRect();
+    const maxHeight = Math.max(minGlslPanelHeight, viewportRect.bottom - activeDrag.top - 8);
+    glslPanel.style.height = `${clamp(activeDrag.height + dy, minGlslPanelHeight, maxHeight)}px`;
   } else if (activeDrag.kind === "graphRotate") {
     graphView.yaw = activeDrag.yaw + dx * 0.01;
     graphView.pitch = clamp(activeDrag.pitch - dy * 0.006, 0.28, 1.22);
@@ -1114,16 +1341,17 @@ function selectImage(image) {
     }
   }
   updateSettingsPanel();
+  ensureFloatingPanelAccessible(inspector);
   updateSelectionPanel();
   drawSelectionGraph();
   updateViewState();
-  syncGlslEditorForSelection(image);
+  syncGlslEditorForSelection();
   scheduleSessionSave();
 }
 
 function clearActiveSelection() {
   selectedId = null;
-  closeGlslEditor();
+  syncGlslEditorForSelection();
   for (const image of images) {
     image.elements?.frame.classList.remove("active");
   }
@@ -1198,6 +1426,32 @@ function clampPanelPosition(panel, x, y) {
   };
 }
 
+function ensureFloatingPanelAccessible(panel) {
+  if (panel.classList.contains("hidden")) {
+    return;
+  }
+  const viewportRect = viewport.getBoundingClientRect();
+  const panelRect = panel.getBoundingClientRect();
+  if (panelRect.width <= 0 || panelRect.height <= 0) {
+    return;
+  }
+
+  const currentX = panelRect.left - viewportRect.left;
+  const currentY = panelRect.top - viewportRect.top;
+  const next = clampPanelPosition(panel, currentX, currentY);
+  if (Math.abs(next.x - currentX) > 0.5 || Math.abs(next.y - currentY) > 0.5) {
+    panel.style.left = `${next.x}px`;
+    panel.style.top = `${next.y}px`;
+    panel.style.right = "auto";
+    panel.style.bottom = "auto";
+  }
+
+  const panelZ = Number.parseInt(getComputedStyle(panel).zIndex, 10);
+  if (!Number.isFinite(panelZ) || panelZ <= topZ) {
+    panel.style.zIndex = String(++topUiZ);
+  }
+}
+
 function closeImage(image) {
   const index = images.findIndex((item) => item.id === image.id);
   if (index === -1) {
@@ -1209,14 +1463,7 @@ function closeImage(image) {
     closeGlslEditor();
   }
   if (selectedId === image.id) {
-    selectedId = images.length ? images[images.length - 1].id : null;
-    const nextImage = currentImage();
-    if (nextImage) {
-      selectImage(nextImage);
-    } else {
-      updateSettingsPanel();
-      updateViewState();
-    }
+    clearActiveSelection();
   }
   dropPrompt.classList.toggle("hidden", images.length > 0);
   fileHint.textContent = images.length ? `${images.length} image${images.length === 1 ? "" : "s"} opened` : "Drop images on the black view";
@@ -1224,6 +1471,7 @@ function closeImage(image) {
   updatePickerPanel();
   updateSelectionPanel();
   drawSelectionGraph();
+  syncGlslEditorForSelection();
   requestRender();
   scheduleSessionSave();
 }
@@ -1318,7 +1566,7 @@ function switchImageMode(image, mode) {
       return;
     }
   }
-  syncGlslEditorForSelection(image, mode === "glsl");
+  syncGlslEditorForSelection(mode === "glsl");
 }
 
 function updateImageModeTabs(image) {
@@ -1411,6 +1659,7 @@ function bindGlslEditor(image, focusEditor = false) {
   updateGlslInputLabel(image);
   glslPanel.classList.remove("hidden");
   glslPanel.style.zIndex = String(++topUiZ);
+  ensureFloatingPanelAccessible(glslPanel);
   setGlslStatus(image.glsl.statusKind || "ok", image.glsl.status || "Ready.");
   if (focusEditor) {
     glslCodeInput.focus();
@@ -1434,12 +1683,11 @@ function updateGlslInputLabel(image) {
   glslInputLabel.textContent = "none (generate)";
 }
 
-function syncGlslEditorForSelection(image, focusEditor = false) {
-  const shouldShow = selectedId === image?.id && image.mode === "glsl" && image.glsl;
+function syncGlslEditorForSelection(focusEditor = false) {
+  const image = currentImage();
+  const shouldShow = Boolean(image && image.mode === "glsl" && image.glsl);
   if (!shouldShow) {
-    if (glslTargetId !== null) {
-      closeGlslEditor();
-    }
+    closeGlslEditor();
     return;
   }
   if (glslTargetId !== image.id || glslPanel.classList.contains("hidden")) {
@@ -1574,6 +1822,29 @@ function initGlslEditor() {
     glslPresetSelect.append(option);
   }
   makeFloatingPanelDraggable(glslPanel);
+
+  glslResize.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || glslPanel.classList.contains("collapsed")) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    const panelRect = glslPanel.getBoundingClientRect();
+    const viewportRect = viewport.getBoundingClientRect();
+    glslPanel.style.left = `${panelRect.left - viewportRect.left}px`;
+    glslPanel.style.top = `${panelRect.top - viewportRect.top}px`;
+    glslPanel.style.right = "auto";
+    glslPanel.style.bottom = "auto";
+    glslPanel.style.zIndex = String(++topUiZ);
+    activeDrag = {
+      kind: "glslResize",
+      startX: event.clientX,
+      startY: event.clientY,
+      top: panelRect.top,
+      height: panelRect.height
+    };
+    glslResize.setPointerCapture(event.pointerId);
+  });
 
   glslCloseButton.addEventListener("click", closeGlslEditor);
   newImageButton.addEventListener("click", () => openGlslEditor(null));
@@ -1778,34 +2049,74 @@ function normalizePixelRect(a, b) {
   };
 }
 
-async function copySelection(image, rect) {
+async function copySelection(image, rect, clipboardData = null) {
+  if (rect.width * rect.height > maxInternalClipboardPixels) {
+    internalClipboard = null;
+    try {
+      clipboardData?.setData("text/plain", "HDRI Viewer: selection is too large to copy safely.");
+    } catch {
+      // The UI message still explains why no value data was copied.
+    }
+    fileHint.textContent = `Copy is limited to ${maxInternalClipboardPixels.toLocaleString("en-US")} pixels.`;
+    return;
+  }
+  const token = typeof globalThis.crypto?.randomUUID === "function"
+    ? globalThis.crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   internalClipboard = {
+    token,
     name: `${image.name} crop`,
     type: `${image.type}/crop`,
     sourceFormat: image.sourceFormat,
     width: rect.width,
     height: rect.height,
-    pixels: cropPixels(image, rect),
-    internalOnly: isHdrImage(image)
+    pixels: cropPixels(image, rect)
   };
 
-  if (internalClipboard.internalOnly) {
-    fileHint.textContent = `Copied HDR values internally ${rect.width} x ${rect.height}`;
+  const portable = rect.width * rect.height <= portableClipboardMatrixPixels;
+  const matrixText = portable
+    ? serializeValueMatrix({
+      ...internalClipboard,
+      channels: [0, 1, 2, 3],
+      encoding: "linear",
+      alphaWeighted: false
+    })
+    : serializeInternalValueReference(internalClipboard);
+  try {
+    clipboardData?.setData("text/plain", matrixText);
+  } catch {
+    // Async Clipboard below may still succeed; the in-page value copy remains available either way.
+  }
+
+  if (isHdrImage(image)) {
+    try {
+      await navigator.clipboard?.writeText(matrixText);
+    } catch {
+      // The synchronous copy-event payload or internal reference remains usable.
+    }
+    fileHint.textContent = portable
+      ? `Copied HDRI Value Matrix ${rect.width} x ${rect.height}`
+      : `Copied HDR values internally ${rect.width} x ${rect.height} (use Copy Matrix for portable text)`;
     return;
   }
 
   const canvas = makeRawCanvas(image, rect);
   try {
-    await writeCanvasToClipboard(canvas);
+    await writeCanvasToClipboard(canvas, matrixText);
     fileHint.textContent = `Copied ${rect.width} x ${rect.height}`;
   } catch {
-    fileHint.textContent = `Copied internally ${rect.width} x ${rect.height}`;
+    fileHint.textContent = portable
+      ? `Copied Value Matrix ${rect.width} x ${rect.height}`
+      : `Copied internally ${rect.width} x ${rect.height}`;
   }
 }
 
 function isHdrImage(image) {
   // GLSL 出力は linear float なので HDR と同じ扱いにする
-  return image.type.startsWith("openexr/") || image.type.startsWith("radiance-hdr/") || image.type.startsWith("glsl/");
+  return image.type.startsWith("openexr/") ||
+    image.type.startsWith("radiance-hdr/") ||
+    image.type.startsWith("glsl/") ||
+    image.sourceFormat === "values";
 }
 
 function cropPixels(image, rect) {
@@ -1841,36 +2152,52 @@ function makeRawCanvas(image, rect = null) {
   return canvas;
 }
 
-async function writeCanvasToClipboard(canvas) {
+async function writeCanvasToClipboard(canvas, matrixText) {
   if (!navigator.clipboard || typeof ClipboardItem === "undefined") {
     throw new Error("Clipboard image write is not available.");
   }
-  const blob = await new Promise((resolve, reject) => {
+  const blob = new Promise((resolve, reject) => {
     canvas.toBlob((result) => result ? resolve(result) : reject(new Error("Failed to encode clipboard image.")), "image/png");
   });
-  await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+  await navigator.clipboard.write([new ClipboardItem({
+    "image/png": blob,
+    "text/plain": new Blob([matrixText], { type: "text/plain" })
+  })]);
 }
 
-function pasteInternalClipboard() {
-  const copied = internalClipboard;
+function pasteClipboardPixels(copied, sourceLabel = "values") {
   if (!copied) {
     return;
   }
+  if (
+    !Number.isInteger(copied.width) ||
+    !Number.isInteger(copied.height) ||
+    copied.width < 1 ||
+    copied.height < 1 ||
+    !(copied.pixels instanceof Float32Array) ||
+    copied.pixels.length !== copied.width * copied.height * 4
+  ) {
+    fileHint.textContent = "Paste failed: clipboard pixel data is invalid.";
+    return;
+  }
   const image = createImageRecord(
-    { name: copied.name },
+    { name: copied.name || "pasted values" },
     copied.width,
     copied.height,
-    copied.type,
+    copied.type || "clipboard-values/linear",
     new Float32Array(copied.pixels),
-    copied.sourceFormat
+    copied.sourceFormat || "values"
   );
   image.source = { kind: "embedded" };
+  if (image.range.rgbMin < 0 || image.range.rgbMax > 1) {
+    image.settings.autoLevel = true;
+  }
   images.push(image);
   createImageWindow(image, null, 0);
   selectImage(image);
   fitImageToWindow(image, false);
   dropPrompt.classList.add("hidden");
-  fileHint.textContent = `${images.length} image${images.length === 1 ? "" : "s"} opened`;
+  fileHint.textContent = `Pasted ${sourceLabel} ${image.width} x ${image.height}`;
   requestRender();
   scheduleSessionSave();
 }
@@ -2747,7 +3074,7 @@ function runSelectionWorker(image, rect, rectKey, matrixKey, valueMode, channels
     return;
   }
   try {
-    selectionWorker = new Worker(new URL("./selection-worker.js?v=20260808-1", import.meta.url));
+    selectionWorker = new Worker(new URL("./selection-worker.js?v=20260808-2", import.meta.url), { type: "module" });
   } catch (error) {
     selectionDetailsInFlight = null;
     console.error("Selection worker could not start.", error);
@@ -2811,6 +3138,10 @@ function copyFullSelectionMatrix() {
   if (!image || !rect || selectionMatrixCopyInFlight) {
     return;
   }
+  if (rect.width * rect.height > MAX_VALUE_MATRIX_PIXELS) {
+    fileHint.textContent = `Copy Matrix is limited to ${MAX_VALUE_MATRIX_PIXELS.toLocaleString("en-US")} pixels.`;
+    return;
+  }
 
   cancelSelectionMatrixCopy();
   const savedRect = { ...rect };
@@ -2865,7 +3196,7 @@ function runFullSelectionMatrixWorker(image, rect, matrixKey, valueMode, channel
     return;
   }
   try {
-    selectionMatrixCopyWorker = new Worker(new URL("./selection-worker.js?v=20260808-1", import.meta.url));
+    selectionMatrixCopyWorker = new Worker(new URL("./selection-worker.js?v=20260808-2", import.meta.url), { type: "module" });
   } catch (error) {
     console.error("Matrix copy worker could not start.", error);
     fileHint.textContent = "Matrix copy failed.";
@@ -3819,8 +4150,8 @@ function updateSaveFormatOptions(image) {
 }
 
 function allowedSaveFormats(image) {
-  if (image.sourceFormat === "glsl") {
-    // GLSL 出力は元フォーマットの制約が無いので、すべての形式で書き出せる
+  if (image.sourceFormat === "glsl" || image.sourceFormat === "values") {
+    // GLSL 出力と値マトリクスは元フォーマットの制約が無いので、すべての形式で書き出せる
     return ["png", "jpeg", "webp", "hdr", "exr"];
   }
   if (image.sourceFormat === "exr") {

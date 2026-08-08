@@ -26,10 +26,12 @@
 
 選択中のウィンドウが `GLSL` 表示のときだけ GLSL エディタを表示する。
 
-- 別のウィンドウまたは `Original` を選ぶとエディタ全体を隠し、予約中の実行を取り消す。
+- 別のウィンドウ、`Original`、または画像の無い背景を選ぶとエディタ全体を隠し、予約中の実行を取り消す。
+- 選択中の画像を閉じた場合は画像選択を解除し、エディタを隠す。残った画像は自動選択しない。
 - GLSL 表示のウィンドウを再選択すると、そのウィンドウのコードと解像度でエディタを再表示する。
 - エディタの `x` で一時的に閉じられる。GLSL ウィンドウを再選択すれば再表示する。
 - View Settings などと同じフローティングパネルで、ドラッグ移動とダブルクリックによる折り畳みに対応する。
+- 下端のグリップで高さを変更でき、コード編集領域を表示範囲内で拡大できる。高さはセッションへ保存する。
 
 ## 2. データ構造と既存機能との接続
 
@@ -116,9 +118,12 @@ outputColor = (left + inputColor + right) / 3.0;
 - Exposure +1 EV
 - Grayscale
 - Blur 3 tap (horizontal)
+- Box blur (loop, adjustable): `radius` を変更してぼかし範囲を調整。負荷が二乗で増えるため 1〜4 を推奨
+- Edge detection (Sobel)
 - Channel swap (BGRA)
 - Gradient (generate)
 - Radial HDR light (generate)
+- Cosine stripes (generate): `stripeCount` と `angle` をコード内で調整
 
 New Image の初期値は `Gradient (generate)`。
 

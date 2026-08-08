@@ -1,3 +1,5 @@
+import { serializeValueMatrix } from "./clipboard-matrix.js?v=20260808-1";
+
 self.addEventListener("message", (event) => {
   const {
     task = "details",
@@ -24,7 +26,16 @@ self.addEventListener("message", (event) => {
   }
 
   if (task === "matrix") {
-    const matrix = selectionMatrixValue(pixels, width, height, valueMode, channels);
+    const matrix = serializeValueMatrix({
+      pixels,
+      width,
+      height,
+      channels,
+      encoding: valueMode,
+      alphaWeighted,
+      name: "selection matrix",
+      type: "clipboard-values/linear"
+    });
     self.postMessage({ kind: "fullMatrix", jobId, matrix });
     return;
   }

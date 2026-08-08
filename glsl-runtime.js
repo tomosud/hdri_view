@@ -103,6 +103,45 @@ outputColor = (left + center + right) / 3.0;
 `
   },
   {
+    name: "Box blur (loop, adjustable)",
+    generator: false,
+    code: `// Change radius to control the blur range. 1-4 is recommended;
+// the sample count grows as (radius * 2 + 1)^2.
+const int radius = 2;
+vec2 texel = 1.0 / inputResolution;
+vec4 sum = vec4(0.0);
+float sampleCount = 0.0;
+
+for (int y = -radius; y <= radius; y += 1) {
+  for (int x = -radius; x <= radius; x += 1) {
+    sum += sampleInput(uv + vec2(float(x), float(y)) * texel);
+    sampleCount += 1.0;
+  }
+}
+
+outputColor = sum / sampleCount;
+`
+  },
+  {
+    name: "Edge detection (Sobel)",
+    generator: false,
+    code: `vec2 texel = 1.0 / inputResolution;
+float tl = luminance(sampleInput(uv + vec2(-texel.x, -texel.y)).rgb);
+float tc = luminance(sampleInput(uv + vec2( 0.0,     -texel.y)).rgb);
+float tr = luminance(sampleInput(uv + vec2( texel.x, -texel.y)).rgb);
+float ml = luminance(sampleInput(uv + vec2(-texel.x,  0.0)).rgb);
+float mr = luminance(sampleInput(uv + vec2( texel.x,  0.0)).rgb);
+float bl = luminance(sampleInput(uv + vec2(-texel.x,  texel.y)).rgb);
+float bc = luminance(sampleInput(uv + vec2( 0.0,      texel.y)).rgb);
+float br = luminance(sampleInput(uv + vec2( texel.x,  texel.y)).rgb);
+
+float gx = -tl + tr - 2.0 * ml + 2.0 * mr - bl + br;
+float gy = -tl - 2.0 * tc - tr + bl + 2.0 * bc + br;
+float edge = length(vec2(gx, gy));
+outputColor = vec4(vec3(edge), inputColor.a);
+`
+  },
+  {
     name: "Channel swap (BGRA)",
     generator: false,
     code: "outputColor = inputColor.bgra;\n"
@@ -120,11 +159,23 @@ float radius = length(centered);
 float intensity = 40.0 / (1.0 + radius * radius * 900.0);
 outputColor = vec4(vec3(intensity), 1.0);
 `
+  },
+  {
+    name: "Cosine stripes (generate)",
+    generator: true,
+    code: `const float tau = 6.28318530718;
+float stripeCount = 24.0;
+float angle = radians(20.0);
+vec2 direction = vec2(cos(angle), sin(angle));
+vec2 position = (uv - 0.5) * vec2(resolution.x / resolution.y, 1.0);
+float stripes = 0.5 + 0.5 * cos(dot(position, direction) * stripeCount * tau);
+outputColor = vec4(vec3(stripes), 1.0);
+`
   }
 ];
 
 export const DEFAULT_FILTER_CODE = GLSL_PRESETS[0].code;
-export const DEFAULT_GENERATOR_CODE = GLSL_PRESETS[5].code;
+export const DEFAULT_GENERATOR_CODE = GLSL_PRESETS.find((preset) => preset.generator).code;
 
 // MAX_TEXTURE_SIZE だけを上限にすると、環境によっては数 GB の CPU/GPU メモリを
 // 確保できてしまう。UI を止めないため、GLSL の入出力は 8 MP までという契約にする。
