@@ -1,10 +1,28 @@
 import * as THREE from "three";
 import { EXRLoader } from "three/addons/loaders/EXRLoader.js";
 import { HDRLoader } from "three/addons/loaders/HDRLoader.js";
-import { decodePng, isPngFile, pngTypeLabel } from "./png-decoder.js?v=20260808-2";
+import { decodePng, isPngFile, pngTypeLabel } from "./png-decoder.js?v=20260808-3";
+import {
+  DEFAULT_FILTER_CODE,
+  DEFAULT_GENERATOR_CODE,
+  GLSL_PRESETS,
+  getGlslSupport,
+  runGlslShader
+} from "./glsl-runtime.js?v=20260808-4";
 
 const fileInput = document.querySelector("#fileInput");
 const fileHint = document.querySelector("#fileHint");
+const newImageButton = document.querySelector("#newImageButton");
+const glslPanel = document.querySelector("#glslPanel");
+const glslTitleText = document.querySelector("#glslTitleText");
+const glslCloseButton = document.querySelector("#glslCloseButton");
+const glslInputLabel = document.querySelector("#glslInputLabel");
+const glslWidthInput = document.querySelector("#glslWidth");
+const glslHeightInput = document.querySelector("#glslHeight");
+const glslMatchInputButton = document.querySelector("#glslMatchInput");
+const glslPresetSelect = document.querySelector("#glslPreset");
+const glslCodeInput = document.querySelector("#glslCode");
+const glslStatus = document.querySelector("#glslStatus");
 const pickerModeButton = document.querySelector("#pickerModeButton");
 const viewport = document.querySelector("#viewport");
 const selectionGraphPanel = document.querySelector("#selectionGraphPanel");
@@ -519,6 +537,7 @@ document.addEventListener("pointerup", (event) => {
 makeFloatingPanelDraggable(inspector);
 makeFloatingPanelDraggable(pickerPanel);
 makeFloatingPanelDraggable(selectionGraphPanel);
+initGlslEditor();
 updatePickerPanel();
 updateLogDisplayButton();
 requestRender();
@@ -872,7 +891,10 @@ function createImageRecord(file, width, height, type, pixels, sourceFormat = "ra
     },
     elements: null,
     displayCanvas: null,
-    displayDirty: true
+    displayDirty: true,
+    mode: "original",
+    original: null,
+    glsl: null
   };
 }
 
@@ -902,12 +924,25 @@ function createImageWindow(image, dropPoint, placementIndex) {
   const size = document.createElement("div");
   size.className = "window-size";
   size.textContent = `${image.width}x${image.height}`;
+  const modeTabs = document.createElement("div");
+  modeTabs.className = "window-mode-tabs";
+  const originalButton = document.createElement("button");
+  originalButton.className = "window-mode-tab";
+  originalButton.type = "button";
+  originalButton.textContent = "Original";
+  originalButton.title = "Show the original image";
+  const glslButton = document.createElement("button");
+  glslButton.className = "window-mode-tab";
+  glslButton.type = "button";
+  glslButton.textContent = "GLSL";
+  glslButton.title = "Show and edit the GLSL result";
+  modeTabs.append(originalButton, glslButton);
   const closeButton = document.createElement("button");
   closeButton.className = "window-close";
   closeButton.type = "button";
   closeButton.ariaLabel = "Close image window";
   closeButton.textContent = "x";
-  titlebar.append(title, size, closeButton);
+  titlebar.append(title, size, modeTabs, closeButton);
 
   const body = document.createElement("div");
   body.className = "window-body";
@@ -929,13 +964,17 @@ function createImageWindow(image, dropPoint, placementIndex) {
     canvas,
     ctx: canvas.getContext("2d", { alpha: false }),
     resizeHandle,
-    closeButton
+    closeButton,
+    size,
+    modeTabs,
+    originalButton,
+    glslButton
   };
 
   frame.addEventListener("pointerdown", () => selectImage(image));
 
   titlebar.addEventListener("pointerdown", (event) => {
-    if (event.target.closest(".window-close")) {
+    if (event.target.closest(".window-close, .window-mode-tabs")) {
       return;
     }
     if (event.button !== 0) {
@@ -952,6 +991,18 @@ function createImageWindow(image, dropPoint, placementIndex) {
       y: image.window.y
     };
     titlebar.setPointerCapture(event.pointerId);
+  });
+
+  modeTabs.addEventListener("pointerdown", (event) => event.stopPropagation());
+  originalButton.addEventListener("click", (event) => {
+    event.stopPropagation();
+    selectImage(image);
+    switchImageMode(image, "original");
+  });
+  glslButton.addEventListener("click", (event) => {
+    event.stopPropagation();
+    selectImage(image);
+    openGlslEditor(image);
   });
 
   closeButton.addEventListener("pointerdown", (event) => event.stopPropagation());
@@ -1049,6 +1100,7 @@ function createImageWindow(image, dropPoint, placementIndex) {
     zoomAt(image, x, y, image.view.scale * factor);
   });
 
+  updateImageModeTabs(image);
   applyWindowGeometry(image);
 }
 
@@ -1065,11 +1117,13 @@ function selectImage(image) {
   updateSelectionPanel();
   drawSelectionGraph();
   updateViewState();
+  syncGlslEditorForSelection(image);
   scheduleSessionSave();
 }
 
 function clearActiveSelection() {
   selectedId = null;
+  closeGlslEditor();
   for (const image of images) {
     image.elements?.frame.classList.remove("active");
   }
@@ -1151,6 +1205,9 @@ function closeImage(image) {
   }
   image.elements?.frame.remove();
   images.splice(index, 1);
+  if (glslTargetId === image.id) {
+    closeGlslEditor();
+  }
   if (selectedId === image.id) {
     selectedId = images.length ? images[images.length - 1].id : null;
     const nextImage = currentImage();
@@ -1169,6 +1226,411 @@ function closeImage(image) {
   drawSelectionGraph();
   requestRender();
   scheduleSessionSave();
+}
+
+// ---- GLSL エディタ ----
+//
+// 画像ウィンドウは Original / GLSL の表示データを内部に持ち、既存機能が読む
+// pixels / width / height だけをタブ切替時に差し替える。New Image は GLSL のみ。
+// エディタは選択中かつ GLSL 表示中のウィンドウにだけ自動で束縛する。
+
+const glslRunDelay = 300;
+let glslTargetId = null;
+let glslRunTimer = null;
+let glslGeneratedCount = 0;
+
+function glslTargetImage() {
+  return images.find((image) => image.id === glslTargetId) || null;
+}
+
+function imageVariant(image) {
+  return {
+    width: image.width,
+    height: image.height,
+    type: image.type,
+    sourceFormat: image.sourceFormat,
+    name: image.name,
+    pixels: image.pixels,
+    range: image.range
+  };
+}
+
+function glslVariant(code, pixels, width, height) {
+  return {
+    code,
+    renderedCode: code,
+    width,
+    height,
+    type: "glsl/linear",
+    sourceFormat: "glsl",
+    pixels,
+    range: computeRange(pixels)
+  };
+}
+
+function glslInputPayload(image) {
+  const input = image?.original;
+  return input
+    ? { pixels: input.pixels, width: input.width, height: input.height, key: `${image.id}:original` }
+    : null;
+}
+
+function applyImageVariant(image, mode) {
+  const variant = mode === "glsl" ? image.glsl : image.original;
+  if (!variant) {
+    return false;
+  }
+  const sizeChanged = image.width !== variant.width || image.height !== variant.height;
+  image.mode = mode;
+  image.width = variant.width;
+  image.height = variant.height;
+  image.type = variant.type;
+  image.sourceFormat = variant.sourceFormat;
+  image.pixels = variant.pixels;
+  image.range = variant.range;
+  image.displayCanvas = null;
+  image.displayDirty = true;
+
+  if (sizeChanged) {
+    image.pickers = image.pickers.filter((picker) => picker.x < image.width && picker.y < image.height);
+    image.selection = image.selection ? clampSavedRect(image.selection, image.width, image.height) : null;
+    if (image.view.fit) {
+      fitImageToWindow(image, false);
+    }
+  }
+  selectionDetailsCache.delete(image);
+  cancelSelectionDetailsWork();
+  cancelSelectionMatrixCopy();
+  updateImageModeTabs(image);
+  updateImageWindowSize(image);
+  updateSettingsPanel();
+  updatePickerPanel();
+  updateSelectionPanel();
+  drawSelectionGraph();
+  requestRender();
+  scheduleSessionSave();
+  return true;
+}
+
+function switchImageMode(image, mode) {
+  if (image.mode !== mode) {
+    if (!applyImageVariant(image, mode)) {
+      return;
+    }
+  }
+  syncGlslEditorForSelection(image, mode === "glsl");
+}
+
+function updateImageModeTabs(image) {
+  const elements = image.elements;
+  if (!elements) {
+    return;
+  }
+  const generatedOnly = Boolean(image.glsl && !image.original);
+  elements.originalButton.hidden = generatedOnly;
+  elements.originalButton.classList.toggle("active", image.mode === "original");
+  elements.glslButton.classList.toggle("active", image.mode === "glsl");
+}
+
+function updateImageWindowSize(image) {
+  if (image.elements?.size) {
+    image.elements.size.textContent = `${image.width}x${image.height}`;
+    return;
+  }
+  const sizeLabel = image.elements?.frame.querySelector(".window-size");
+  if (sizeLabel) {
+    sizeLabel.textContent = `${image.width}x${image.height}`;
+  }
+}
+
+function openGlslEditor(sourceImage) {
+  const support = getGlslSupport();
+  if (!support.ok) {
+    fileHint.textContent = `GLSL unavailable: ${support.reason}`;
+    return;
+  }
+
+  if (sourceImage?.glsl) {
+    switchImageMode(sourceImage, "glsl");
+    return;
+  }
+
+  const code = sourceImage ? DEFAULT_FILTER_CODE : DEFAULT_GENERATOR_CODE;
+  const width = sourceImage ? sourceImage.width : 1024;
+  const height = sourceImage ? sourceImage.height : 1024;
+
+  // 元画像は参照だけを保持するため、タブを増やしても画素配列は複製しない。
+  if (sourceImage) {
+    sourceImage.original = imageVariant(sourceImage);
+  }
+
+  let pixels;
+  try {
+    pixels = runGlslShader({ code, input: glslInputPayload(sourceImage), width, height });
+  } catch (error) {
+    if (sourceImage) {
+      sourceImage.original = null;
+    }
+    fileHint.textContent = `GLSL failed: ${error.message}`;
+    return;
+  }
+
+  if (sourceImage) {
+    sourceImage.glsl = glslVariant(code, pixels, width, height);
+    applyImageVariant(sourceImage, "glsl");
+    bindGlslEditor(sourceImage, true);
+    return;
+  }
+
+  glslGeneratedCount += 1;
+  const image = createImageRecord({ name: `glsl${glslGeneratedCount}` }, width, height, "glsl/linear", pixels, "glsl");
+  image.source = { kind: "glsl-generated" };
+  image.mode = "glsl";
+  image.glsl = glslVariant(code, pixels, width, height);
+
+  images.push(image);
+  createImageWindow(image, null, 0);
+  selectImage(image);
+  fitImageToWindow(image, false);
+  dropPrompt.classList.add("hidden");
+  fileHint.textContent = `${images.length} image${images.length === 1 ? "" : "s"} opened`;
+  requestRender();
+  scheduleSessionSave();
+
+  bindGlslEditor(image, true);
+}
+
+function bindGlslEditor(image, focusEditor = false) {
+  cancelGlslRun();
+  glslTargetId = image.id;
+  glslTitleText.textContent = `GLSL - ${image.name}`;
+  glslCodeInput.value = image.glsl.code;
+  glslWidthInput.value = String(image.glsl.width);
+  glslHeightInput.value = String(image.glsl.height);
+  glslPresetSelect.value = "";
+  updateGlslInputLabel(image);
+  glslPanel.classList.remove("hidden");
+  glslPanel.style.zIndex = String(++topUiZ);
+  setGlslStatus(image.glsl.statusKind || "ok", image.glsl.status || "Ready.");
+  if (focusEditor) {
+    glslCodeInput.focus();
+  }
+}
+
+function closeGlslEditor() {
+  cancelGlslRun();
+  glslTargetId = null;
+  glslPanel.classList.add("hidden");
+}
+
+function updateGlslInputLabel(image) {
+  const input = image.original;
+  if (input) {
+    glslInputLabel.textContent = `${input.name} (${input.width}x${input.height})`;
+    glslMatchInputButton.disabled = false;
+    return;
+  }
+  glslMatchInputButton.disabled = true;
+  glslInputLabel.textContent = "none (generate)";
+}
+
+function syncGlslEditorForSelection(image, focusEditor = false) {
+  const shouldShow = selectedId === image?.id && image.mode === "glsl" && image.glsl;
+  if (!shouldShow) {
+    if (glslTargetId !== null) {
+      closeGlslEditor();
+    }
+    return;
+  }
+  if (glslTargetId !== image.id || glslPanel.classList.contains("hidden")) {
+    bindGlslEditor(image, focusEditor);
+  } else if (focusEditor) {
+    glslCodeInput.focus();
+  }
+}
+
+function setGlslStatus(kind, message) {
+  glslStatus.textContent = message;
+  glslStatus.classList.toggle("error", kind === "error");
+  glslStatus.classList.toggle("pending", kind === "pending");
+}
+
+function cancelGlslRun() {
+  if (glslRunTimer !== null) {
+    clearTimeout(glslRunTimer);
+    glslRunTimer = null;
+  }
+}
+
+function scheduleGlslRun() {
+  const target = glslTargetImage();
+  if (!target || target.mode !== "glsl") {
+    return;
+  }
+  cancelGlslRun();
+  setGlslStatus("pending", "Compiling...");
+  glslRunTimer = setTimeout(() => {
+    glslRunTimer = null;
+    runGlslNow();
+  }, glslRunDelay);
+}
+
+function glslSizeValue(input, fallback) {
+  const value = Math.floor(Number(input.value));
+  return Number.isFinite(value) && value >= 1 ? value : fallback;
+}
+
+function runGlslNow() {
+  const target = glslTargetImage();
+  if (!target) {
+    closeGlslEditor();
+    return;
+  }
+
+  const code = glslCodeInput.value;
+  const width = glslSizeValue(glslWidthInput, target.glsl.width);
+  const height = glslSizeValue(glslHeightInput, target.glsl.height);
+
+  // シェーダ実行だけでなく反映処理まで含めて捕まえる。ここで抜けると
+  // ステータスが "Compiling..." のまま戻らなくなるため、必ずどちらかの結果を出す。
+  try {
+    const shaderStarted = performance.now();
+    const pixels = runGlslShader({ code, input: glslInputPayload(target), width, height });
+    const shaderMs = performance.now() - shaderStarted;
+
+    const applyStarted = performance.now();
+    applyGlslResult(target, pixels, width, height, code);
+    const applyMs = performance.now() - applyStarted;
+
+    setGlslStatus(
+      "ok",
+      `Updated ${width} x ${height} - shader ${Math.round(shaderMs)} ms, display ${Math.round(applyMs)} ms`
+    );
+  } catch (error) {
+    // 失敗しても直前に成功した出力を残す（編集中に画像が壊れないようにする）
+    console.error("GLSL run failed.", error);
+    const message = error?.log || error?.message || String(error);
+    target.glsl.statusKind = "error";
+    target.glsl.status = message;
+    setGlslStatus("error", message);
+    scheduleSessionSave();
+  }
+}
+
+function applyGlslResult(image, pixels, width, height, code) {
+  const sizeChanged = image.width !== width || image.height !== height;
+  image.width = width;
+  image.height = height;
+  image.pixels = pixels;
+  image.range = computeRange(pixels);
+  image.type = "glsl/linear";
+  image.sourceFormat = "glsl";
+  image.glsl = {
+    ...image.glsl,
+    code,
+    renderedCode: code,
+    pixels,
+    width,
+    height,
+    type: image.type,
+    sourceFormat: image.sourceFormat,
+    range: image.range,
+    statusKind: "ok",
+    status: "Ready."
+  };
+  image.displayCanvas = null;
+  image.displayDirty = true;
+
+  if (sizeChanged) {
+    image.pickers = image.pickers.filter((picker) => picker.x < width && picker.y < height);
+    image.selection = image.selection ? clampSavedRect(image.selection, width, height) : null;
+    updateImageWindowSize(image);
+    if (image.view.fit) {
+      fitImageToWindow(image, false);
+    }
+  }
+
+  updateSettingsPanel();
+  selectionDetailsCache.delete(image);
+  cancelSelectionDetailsWork();
+  cancelSelectionMatrixCopy();
+  updatePickerPanel();
+  updateSelectionPanel();
+  drawSelectionGraph();
+  requestRender();
+  scheduleSessionSave();
+}
+
+function initGlslEditor() {
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = "Custom";
+  placeholder.hidden = true;
+  glslPresetSelect.append(placeholder);
+  for (const [index, preset] of GLSL_PRESETS.entries()) {
+    const option = document.createElement("option");
+    option.value = String(index);
+    option.textContent = preset.name;
+    glslPresetSelect.append(option);
+  }
+  makeFloatingPanelDraggable(glslPanel);
+
+  glslCloseButton.addEventListener("click", closeGlslEditor);
+  newImageButton.addEventListener("click", () => openGlslEditor(null));
+
+  glslCodeInput.addEventListener("input", () => {
+    const target = glslTargetImage();
+    if (target?.glsl) {
+      target.glsl.code = glslCodeInput.value;
+    }
+    glslPresetSelect.value = "";
+    scheduleGlslRun();
+    scheduleSessionSave();
+  });
+  glslWidthInput.addEventListener("input", scheduleGlslRun);
+  glslHeightInput.addEventListener("input", scheduleGlslRun);
+
+  glslPresetSelect.addEventListener("change", () => {
+    // "Custom" の value は空文字。Number("") は 0 になってしまうので数値として扱わない。
+    const selected = glslPresetSelect.value;
+    const preset = selected === "" ? null : GLSL_PRESETS[Number(selected)];
+    if (!preset) {
+      return;
+    }
+    glslCodeInput.value = preset.code;
+    const target = glslTargetImage();
+    if (target?.glsl) {
+      target.glsl.code = preset.code;
+    }
+    scheduleGlslRun();
+  });
+
+  glslMatchInputButton.addEventListener("click", () => {
+    const target = glslTargetImage();
+    const input = target?.original;
+    if (!input) {
+      return;
+    }
+    glslWidthInput.value = String(input.width);
+    glslHeightInput.value = String(input.height);
+    scheduleGlslRun();
+  });
+
+  // textarea の Tab はフォーカス移動ではなくインデントとして扱う
+  glslCodeInput.addEventListener("keydown", (event) => {
+    if (event.key !== "Tab" || event.ctrlKey || event.altKey || event.metaKey) {
+      return;
+    }
+    event.preventDefault();
+    glslCodeInput.setRangeText("  ", glslCodeInput.selectionStart, glslCodeInput.selectionEnd, "end");
+    const target = glslTargetImage();
+    if (target?.glsl) {
+      target.glsl.code = glslCodeInput.value;
+    }
+    glslPresetSelect.value = "";
+    scheduleGlslRun();
+    scheduleSessionSave();
+  });
 }
 
 function togglePickerAtEvent(image, event) {
@@ -1342,7 +1804,8 @@ async function copySelection(image, rect) {
 }
 
 function isHdrImage(image) {
-  return image.type.startsWith("openexr/") || image.type.startsWith("radiance-hdr/");
+  // GLSL 出力は linear float なので HDR と同じ扱いにする
+  return image.type.startsWith("openexr/") || image.type.startsWith("radiance-hdr/") || image.type.startsWith("glsl/");
 }
 
 function cropPixels(image, rect) {
@@ -1763,7 +2226,8 @@ function buildSessionRecord() {
     panels: {
       inspector: panelSessionState(inspector),
       picker: panelSessionState(pickerPanel),
-      graph: panelSessionState(selectionGraphPanel)
+      graph: panelSessionState(selectionGraphPanel),
+      glsl: panelSessionState(glslPanel)
     },
     images: images.map(imageSessionState)
   };
@@ -1782,16 +2246,33 @@ function imageSessionState(image) {
     view: { ...image.view },
     pickers: image.pickers.map((picker) => ({ ...picker })),
     selection: image.selection ? { ...image.selection } : null,
-    window: { ...image.window }
+    window: { ...image.window },
+    // 巨大な出力画素は保存せず、復元時に最後に成功したコードから再生成する。
+    glsl: image.glsl ? {
+      code: image.glsl.code,
+      renderedCode: image.glsl.renderedCode || image.glsl.code,
+      width: image.glsl.width,
+      height: image.glsl.height,
+      mode: image.mode,
+      generator: !image.original
+    } : null
   };
 }
 
 function imageSourceSessionState(image) {
   const source = image.source || { kind: "external" };
+  if (source.kind === "glsl-generated") {
+    return { kind: "glsl-generated" };
+  }
   if (source.kind === "embedded") {
+    const stored = image.original || image;
     return {
       kind: "embedded",
-      pixels: image.pixels.buffer.slice(image.pixels.byteOffset, image.pixels.byteOffset + image.pixels.byteLength)
+      width: stored.width,
+      height: stored.height,
+      type: stored.type,
+      sourceFormat: stored.sourceFormat,
+      pixels: stored.pixels.buffer.slice(stored.pixels.byteOffset, stored.pixels.byteOffset + stored.pixels.byteLength)
     };
   }
   if (source.kind === "file-handle" && source.handle) {
@@ -1842,6 +2323,7 @@ function applyAppSessionState(session) {
   applyPanelSessionState(inspector, session.panels?.inspector);
   applyPanelSessionState(pickerPanel, session.panels?.picker);
   applyPanelSessionState(selectionGraphPanel, session.panels?.graph);
+  applyPanelSessionState(glslPanel, session.panels?.glsl);
   setPanelTab(session.activePanelTab === "selection" ? "selection" : "pickers");
   setPickerMode(Boolean(session.pickerMode));
 }
@@ -1860,18 +2342,36 @@ function applyPanelSessionState(panel, state) {
 
 async function restoreImageFromSession(savedImage) {
   const source = savedImage.source || {};
+  if (source.kind === "glsl-generated" && savedImage.glsl && typeof savedImage.glsl.code === "string") {
+    const width = Math.max(1, Math.floor(Number(savedImage.glsl.width) || 1024));
+    const height = Math.max(1, Math.floor(Number(savedImage.glsl.height) || 1024));
+    const renderedCode = savedImage.glsl.renderedCode || savedImage.glsl.code;
+    const pixels = runGlslShader({ code: renderedCode, input: null, width, height });
+    const image = createImageRecord(
+      { name: savedImage.name || "glsl image" },
+      width,
+      height,
+      "glsl/linear",
+      pixels,
+      "glsl"
+    );
+    image.source = { kind: "glsl-generated" };
+    return image;
+  }
   if (source.kind === "embedded" && source.pixels instanceof ArrayBuffer) {
     const pixels = new Float32Array(source.pixels);
-    if (pixels.length !== savedImage.width * savedImage.height * 4) {
+    const width = Math.max(1, Math.floor(Number(source.width) || savedImage.width));
+    const height = Math.max(1, Math.floor(Number(source.height) || savedImage.height));
+    if (pixels.length !== width * height * 4) {
       return null;
     }
     const image = createImageRecord(
       { name: savedImage.name || "pasted image" },
-      savedImage.width,
-      savedImage.height,
-      savedImage.type || "raster/srgb",
+      width,
+      height,
+      source.type || savedImage.type || "raster/srgb",
       pixels,
-      savedImage.sourceFormat || "raster"
+      source.sourceFormat || savedImage.sourceFormat || "raster"
     );
     image.source = { kind: "embedded" };
     return image;
@@ -1896,6 +2396,10 @@ async function restoreImageFromSession(savedImage) {
 function applySavedImageState(image, savedImage) {
   image.id = Number.isInteger(savedImage.id) ? savedImage.id : image.id;
   image.name = savedImage.name || image.name;
+  const generatedNameMatch = /^glsl(\d+)$/.exec(image.name);
+  if (generatedNameMatch) {
+    glslGeneratedCount = Math.max(glslGeneratedCount, Number(generatedNameMatch[1]));
+  }
   image.settings = {
     ...image.settings,
     ...(savedImage.settings || {})
@@ -1904,10 +2408,39 @@ function applySavedImageState(image, savedImage) {
     ...image.view,
     ...(savedImage.view || {})
   };
-  image.pickers = Array.isArray(savedImage.pickers)
+  const savedPickers = Array.isArray(savedImage.pickers)
     ? savedImage.pickers.filter((picker) => Number.isInteger(picker.x) && Number.isInteger(picker.y)).map((picker) => ({ ...picker }))
     : [];
-  image.selection = savedImage.selection ? clampSavedRect(savedImage.selection, image.width, image.height) : null;
+  const savedSelection = savedImage.selection ? { ...savedImage.selection } : null;
+  if (savedImage.glsl && typeof savedImage.glsl.code === "string") {
+    const generator = typeof savedImage.glsl.generator === "boolean"
+      ? savedImage.glsl.generator
+      : savedImage.source?.kind === "embedded" && savedImage.sourceFormat === "glsl";
+    const width = Math.max(1, Math.floor(Number(savedImage.glsl.width) || image.width));
+    const height = Math.max(1, Math.floor(Number(savedImage.glsl.height) || image.height));
+    const renderedCode = savedImage.glsl.renderedCode || savedImage.glsl.code;
+    try {
+      if (generator) {
+        image.original = null;
+        image.glsl = glslVariant(renderedCode, image.pixels, image.width, image.height);
+      } else {
+        image.original = imageVariant(image);
+        const pixels = runGlslShader({ code: renderedCode, input: glslInputPayload(image), width, height });
+        image.glsl = glslVariant(renderedCode, pixels, width, height);
+      }
+      image.glsl.code = savedImage.glsl.code;
+      image.glsl.renderedCode = renderedCode;
+      const mode = generator || savedImage.glsl.mode === "glsl" ? "glsl" : "original";
+      applyImageVariant(image, mode);
+    } catch (error) {
+      console.warn("Saved GLSL state restore skipped.", error);
+      image.glsl = null;
+      image.original = null;
+      image.mode = "original";
+    }
+  }
+  image.pickers = savedPickers.filter((picker) => picker.x < image.width && picker.y < image.height);
+  image.selection = savedSelection ? clampSavedRect(savedSelection, image.width, image.height) : null;
   image.window = {
     ...image.window,
     ...(savedImage.window || {})
@@ -1915,7 +2448,8 @@ function applySavedImageState(image, savedImage) {
   if (image.elements) {
     image.elements.frame.dataset.id = String(image.id);
     image.elements.frame.querySelector(".window-title").textContent = image.name;
-    image.elements.frame.querySelector(".window-size").textContent = `${image.width}x${image.height}`;
+    updateImageWindowSize(image);
+    updateImageModeTabs(image);
   }
   image.displayDirty = true;
 }
@@ -3285,6 +3819,10 @@ function updateSaveFormatOptions(image) {
 }
 
 function allowedSaveFormats(image) {
+  if (image.sourceFormat === "glsl") {
+    // GLSL 出力は元フォーマットの制約が無いので、すべての形式で書き出せる
+    return ["png", "jpeg", "webp", "hdr", "exr"];
+  }
   if (image.sourceFormat === "exr") {
     return ["exr"];
   }

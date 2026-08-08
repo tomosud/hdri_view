@@ -23,6 +23,7 @@ https://tomosud.github.io/hdri_view/
 - 任意の点をピックしてリストに記録、CSV としてコピー
 - 矩形選択した範囲の最小・最大・平均値と、値の分布を **3Dグラフ** で可視化
 - 開いた画像を PNG / JPEG / WebP、HDR 画像は HDR RGBE / EXR Float として保存
+- **GLSL** を書いて画像を加工、またはコードだけから任意サイズの画像を生成
 
 ## 使い方
 
@@ -73,6 +74,51 @@ https://tomosud.github.io/hdri_view/
 
 **Selection** タブでは選択範囲の Rect / Count / Min / Max / Average（RGB・Luminance）が数値で確認でき、生の値マトリクスを **Copy Matrix** または **CSV** で書き出せます。
 
+### 5. GLSL で加工・生成する
+
+画像ウィンドウのタイトルバーには **Original / GLSL** タブがあります。**GLSL** を初めて選ぶと
+Passthrough シェーダが作られ、同じウィンドウ内で結果へ切り替わります。**Original** に戻せば、
+いつでも未加工の元画像を確認できます。GLSL は元画像を書き換えません。
+
+GLSL 表示のウィンドウを選択している間だけエディタが現れます。Original または別ウィンドウを選ぶと
+エディタ全体が隠れ、GLSL 表示へ戻るとその画像のコードで再表示されます。エディタ右上の **x** で
+一時的に閉じることもできます。
+
+トップバーの **New Image** は入力なしで、コードだけから任意サイズの画像を作ります。この場合は
+元画像が無いため、画像ウィンドウは **GLSL** のみです。
+
+コードを打ち終わって 300ms 後に自動で再実行され、同じウィンドウの GLSL 表示が更新されます
+（実行ボタンはありません）。エラー時は直前に成功した画像を残し、エラーのある編集中コードも
+保持します。
+
+書くのは以下の関数の中身だけで、`outputColor` に代入します。
+
+```glsl
+void mainImage(out vec4 outputColor, in vec2 uv, in vec4 inputColor) {
+    // ここを書く
+    outputColor = inputColor;
+}
+```
+
+| 名前 | 内容 |
+| --- | --- |
+| `outputColor` | 出力先。代入する（再宣言しない） |
+| `uv` | 0..1 の座標。(0,0) が左上 |
+| `inputColor` | 入力画像の色（linear） |
+| `resolution` / `inputResolution` | 出力 / 入力の解像度（px） |
+| `inputTexture` | 任意座標をサンプリングする `sampler2D` |
+
+`luminance()` / `srgbToLinear()` / `linearToSrgb()` / `texelSize()` / `sampleInput()` が使えます。
+値は linear float のままクランプされないので、`inputColor.rgb *= 2.0;` の結果を HDR / EXR として
+そのまま保存できます。出力は普通の画像ウィンドウなので Picker も Selection Graph も効きます。
+
+コンパイルエラーは、自分が書いた行番号でパネル下部に表示されます。
+
+WebGL2 と `EXT_color_buffer_float` が必要です。使えない環境では理由がステータスに表示されます。
+GPU メモリと readPixels によるフリーズを避けるため、GLSL の入力と出力は最大 8,388,608 ピクセル
+（例: 4096 x 2048、3840 x 2160）です。通常の画像閲覧にはこの制限はありません。GLSL 出力画素は
+セッションへ複製保存せず、コードと解像度から復元します。
+
 ## 対応フォーマット
 
 | 用途 | 形式 |
@@ -85,6 +131,7 @@ https://tomosud.github.io/hdri_view/
 - ビルド不要の静的サイト（GitHub Pages でホスト可能）
 - [three.js](https://threejs.org/) の `EXRLoader` / `RGBELoader` を利用して HDR/EXR を読み込み
 - PNG は `png-decoder.js` で自前デコード（後述）
+- GLSL 加工・生成は `glsl-runtime.js`（WebGL2 を直接使用、RGBA32F の FBO に描いて `readPixels`）
 - 選択範囲の集計処理は Web Worker（`selection-worker.js`）にオフロード
 
 ### 値の正確性について

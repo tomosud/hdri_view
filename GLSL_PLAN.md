@@ -1,212 +1,144 @@
-# GLSL エディタ機能 計画
+# GLSL エディタ機能
 
-画像ウィンドウごとに GLSL フラグメントシェーダを書いて画像加工できるようにする。
-あわせて「入力画像なし・任意サイズ」でコードだけから画像を生成できるようにする。
+画像ウィンドウごとに GLSL フラグメントシェーダを書き、linear float RGBA のまま画像を加工・生成する。
+ビルド工程や外部エディタライブラリは追加せず、GitHub Pages で動く静的構成を維持する。
 
-結論から言うと **両方とも実現可能**。既存構成（ビルド不要の静的サイト）を崩さずに実装できる。
+## 1. 現在の UI
 
----
+### 読み込んだ画像
 
-## 1. 実現可能性の根拠（既存構成との相性）
+画像ウィンドウのタイトルバーに `Original / GLSL` タブを表示する。
 
-現状のデータフローは以下になっている。
+- `Original`: 読み込んだ元画像を表示する。
+- `GLSL`: 初回選択時に Passthrough シェーダを作り、同じウィンドウ内で結果へ切り替える。
+- 元画像と GLSL 結果は別ウィンドウにしない。GLSL 実行によって元画像を書き換えない。
+- GLSL 結果の解像度が元画像と異なる場合、タイトルバーのサイズ表示も現在のタブに合わせる。
 
-```
-ファイル ──> loadImageFile()
-              ├ raster: ImageData → srgbToLinear → Float32Array RGBA
-              └ hdr/exr: three.js Loader → Float32Array RGBA
-          ──> createImageRecord()  { pixels: Float32Array, width, height, range, ... }
-          ──> ensureDisplayCanvas()  Float32Array → Canvas2D（CPU でトーンマップ表示）
-          ──> Picker / Selection / Graph / Save(HDR/EXR)  ← すべて image.pixels を直接読む
-```
+### New Image
 
-ポイントは **すべての計測・保存機能が `image.pixels`（linear float RGBA）しか見ていない** こと。
+トップバーの `New Image` は入力画像なしの GLSL 画像を作る。
 
-したがって GLSL 処理は
+- 既定サイズは 1024 x 1024。
+- `Original` を持たず、ウィンドウには `GLSL` だけを表示する。
+- 入力テクスチャは 1 x 1 の黒、`inputColor` は `vec4(0, 0, 0, 1)`。
 
-```
-image.pixels ──> WebGL2 テクスチャ(RGBA32F) ──> ユーザーシェーダで描画 ──> readPixels
-             ──> 新しい Float32Array ──> 新しい image レコード（＝普通の画像ウィンドウ）
-```
+### エディタの表示
 
-という「Float32Array を入れて Float32Array を返す純関数」として差し込める。
-出力は普通の画像ウィンドウなので、**Picker も Selection Graph も EXR 保存も自動的に効く**。
-表示パイプライン（Canvas 2D）には一切手を入れない。
+選択中のウィンドウが `GLSL` 表示のときだけ GLSL エディタを表示する。
 
-- WebGL2 は `document.createElement("canvas").getContext("webgl2")` でオフスクリーンに使う。three.js は不要。
-- HDR の値域を保つため `EXT_color_buffer_float` を有効化して RGBA32F の FBO に描画する。
-- 外部ライブラリを増やさない（エディタも素の `<textarea>`）。ライセンス条件・静的ホスティング条件を満たす。
+- 別のウィンドウまたは `Original` を選ぶとエディタ全体を隠し、予約中の実行を取り消す。
+- GLSL 表示のウィンドウを再選択すると、そのウィンドウのコードと解像度でエディタを再表示する。
+- エディタの `x` で一時的に閉じられる。GLSL ウィンドウを再選択すれば再表示する。
+- View Settings などと同じフローティングパネルで、ドラッグ移動とダブルクリックによる折り畳みに対応する。
 
----
+## 2. データ構造と既存機能との接続
 
-## 2. UI 設計
+1つの画像レコードに `original` と `glsl` の表示データを保持する。タブ切替時に、既存機能が参照する
+`pixels / width / height / range / type / sourceFormat` を現在の表示へ差し替える。
 
-### 2.1 起動口
-
-| 場所 | ボタン | 動作 |
-| --- | --- | --- |
-| 画像ウィンドウのタイトルバー | `GLSL` | その画像を入力とした GLSL エディタを開く |
-| トップバー（Open の隣） | `New Image` | 入力なし・任意サイズの生成モードでエディタを開く |
-
-### 2.2 GLSL エディタウィンドウ
-
-既存の `makeFloatingPanelDraggable()` を再利用したフローティングパネル。
-
-```
-┌ GLSL — derelict_airfield_02_2k.hdr ────────────────── [x] ┐
-│ Input : derelict_airfield_02_2k.hdr (2048×1024)          │  ← 生成モードでは "none"
-│ Output: [ 2048 ] × [ 1024 ]  [Match input]               │
-│ Preset: [ Passthrough ▼ ]                                │
-│ ┌──────────────────────────────────────────────────────┐ │
-│ │ 1  vec2 texelSize = 1.0 / resolution;                │ │
-│ │ 2  vec4 center = texture(inputTexture, uv);          │ │  ← textarea（等幅・Tab入力可）
-│ │ 3  ...                                               │ │
-│ └──────────────────────────────────────────────────────┘ │
-│ ● Compiled  /  ✕ ERROR: 0:12: 'foo' : undeclared         │  ← エラー行を表示
-│ [Auto preview ☑]  [Run]  [Replace image]  [New window]   │
-└───────────────────────────────────────────────────────────┘
+```text
+画像レコード
+├ original: 元の Float32Array とメタデータ（New Image では無し）
+├ glsl:     出力 Float32Array、コード、解像度、値域
+└ mode:     original | glsl
 ```
 
-※この件は以下のようにするよりAutoのみにしたいので一本化を提案して。
+元画像の Float32Array は参照を保持し、タブ用に複製しない。現在タブの `image.pixels` を Picker、Selection、
+Selection Graph、保存処理がそのまま読むため、各機能に GLSL 専用分岐を増やさない。
 
-- **Auto preview**: 入力停止 300ms 後に自動コンパイル＆実行。巨大画像は縮小解像度でプレビューし、確定時のみフル解像度。
-- **Run / New window**: 結果を新しい画像ウィンドウとして開く（元画像は残す）。
-- **Replace image**: 元ウィンドウの `pixels` を差し替える。元データは `image.originalPixels` に退避して `Revert` 可能にする（非破壊）。
-- エラー時は前回成功した結果を保持し、画像を壊さない。
+タブ間で View Settings、Picker、Selection は同じウィンドウ状態を共有する。解像度が小さい表示へ
+切り替えたとき、範囲外になった Picker は除外し、Selection は表示範囲内へ収める。
 
----
+## 3. シェーダの契約
 
-## 3. シェーダの契約（ユーザーが書ける変数）
-
-### 3.1 生成されるラッパ
-
-ユーザーが書くのは `main()` の中身だけ。アプリ側が以下で囲む。
+ユーザーが書くのは `mainImage()` の本体だけ。アプリが WebGL2 用のラッパ、uniform、補助関数を付ける。
 
 ```glsl
-#version 300 es
-precision highp float;
-
-uniform sampler2D inputTexture;   // 入力画像（生成モードでは 1x1 の黒）
-uniform vec2  resolution;         // 出力解像度 (px)
-uniform vec2  inputResolution;    // 入力解像度 (px)
-uniform float time;               // 秒（プレビュー用・既定 0）
-
-in  vec2 vUv;
-out vec4 fragColor;
-
-// ---- 補助関数（常に利用可能）----
-float luminance(vec3 c)      { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
-vec3  srgbToLinear(vec3 c)   { ... }
-vec3  linearToSrgb(vec3 c)   { ... }
-vec4  sampleClamped(vec2 p)  { return texture(inputTexture, clamp(p, vec2(0.0), vec2(1.0))); }
-
-void main() {
-  vec2 uv = vUv;                          // ← 自動宣言（ユーザーが再宣言したら省略）
-  vec4 inputColor = texture(inputTexture, uv);   // ← 同上
-  vec4 outputColor = inputColor;                 // ← 同上
-
-/* ===== USER CODE ===== */
-  ...ユーザーのコード...
-/* ===================== */
-
-  fragColor = outputColor;
+void mainImage(out vec4 outputColor, in vec2 uv, in vec4 inputColor) {
+    // ユーザーが書く部分
+    outputColor = inputColor;
 }
 ```
 
-| 名前 | 型 | 内容 |
-| --- | --- | --- |
-| `uv` | `vec2` | 0..1 の正規化座標。**(0,0) が左上**（Picker の px 座標と同じ向き） |
-| `resolution` | `vec2` | 出力解像度（px） |
-| `inputResolution` | `vec2` | 入力解像度（px） |
-| `inputColor` | `vec4` | `texture(inputTexture, uv)` の結果（linear） |
-| `outputColor` | `vec4` | 書き込み先。最終的に `fragColor` になる |
-| `inputTexture` | `sampler2D` | 任意座標サンプリング用 |
-| `time` | `float` | プレビュー用の時間 |
-
-### 3.2 再宣言の扱い（重要）
-
-ユーザーの書き方には 2 通りある。
-※この件は以下のようにするよりglslの通常の書き方にしたいので一本化を提案して。
-
-```glsl
-outputColor = inputColor;              // 代入だけ
-vec4 outputColor = (l + c + r) / 3.0;  // 自分で宣言
-```
-
-そこで **USER CODE を正規表現で走査し、`vec4 outputColor` / `vec2 uv` / `vec4 inputColor` の宣言があればラッパ側の自動宣言を出力しない**。
-どちらの書き方でも通るようにする（宣言が無い場合のみアプリ側が用意する）。
-
-### 3.3 値のレンジ
-
-- 入出力とも **linear float**。0..1 にクランプしない（`inputColor.rgb *= 2.0;` が HDR として正しく保存できる）。
-- 入力が LDR 画像でも、読み込み時点で既に linear 化されているのでシェーダ側の扱いは同一。
-- 出力画像の `range` は `computeRange()` で再計算し、HDR 相当なら Auto level を既定 ON にする。
-
----
-
-## 4. プリセット（Preset ドロップダウン）
-
 | 名前 | 内容 |
 | --- | --- |
-| Passthrough | `outputColor = inputColor;` |
-| Exposure | `inputColor.rgb *= 2.0; outputColor = inputColor;` |
-| Grayscale | `outputColor = vec4(vec3(luminance(inputColor.rgb)), inputColor.a);` |
-| Blur 3tap (H) | ユーザー提示の texelSize を使った横 3 タップ平均 |
-| Channel swap | `outputColor = inputColor.bgra;` |
-| **Gradient (生成)** | `outputColor = vec4(uv.x, uv.y, 0.0, 1.0);` |
-| **Radial (生成)** | 中心からの距離で減衰する HDR 光源っぽいパターン |
+| `outputColor` | 出力先の `out vec4` |
+| `uv` | 0..1 の座標。`(0, 0)` は左上 |
+| `inputColor` | 元画像の同じ座標の色（linear） |
+| `resolution` | GLSL 出力解像度 |
+| `inputResolution` | 元画像解像度。New Image では 1 x 1 |
+| `inputTexture` | 元画像を任意座標で読む `sampler2D` |
+| `time` | 予約済み uniform。現在は常に 0 |
 
-生成用プリセットは「New Image」から開いたときの初期値になる。
+常時使える補助関数は `luminance()`、`srgbToLinear()`、`linearToSrgb()`、`texelSize()`、
+`sampleInput()`。入出力は linear float で、0..1 にクランプしない。
 
----
+### 宣言ルール
 
-## 5. 任意サイズの画像生成について
+書き方は通常の GLSL に一本化する。
 
-「入力なしの GLSL 実行」として、フィルタ機能と**完全に同じ実装で賄える**。
+- `outputColor` は関数引数なので、再宣言せず代入する。
+- `uv` と `inputColor` も関数引数としてそのまま使う。
+- ユーザーが追加するローカル変数は、通常どおり自分で宣言する。
+- アプリは再宣言の検出、削除、自動書き換えを行わない。誤った宣言は通常のコンパイルエラーとして表示する。
 
-- 出力 W/H を入力欄で指定（既定 1024×1024、上限は `MAX_TEXTURE_SIZE` を見て制限）
-- `inputTexture` には 1×1 の黒テクスチャをバインド（`inputColor` は `vec4(0,0,0,1)`）
-- 使えるのは `uv` / `resolution` / `time` と数式のみ
-- 出力は通常の画像ウィンドウ → そのまま HDR / EXR 保存できる
+```glsl
+vec2 texel = 1.0 / resolution;
+vec4 left = texture(inputTexture, uv - vec2(texel.x, 0.0));
+vec4 right = texture(inputTexture, uv + vec2(texel.x, 0.0));
+outputColor = (left + inputColor + right) / 3.0;
+```
 
-つまり **フィルタ機能の出力解像度を可変にした時点で、生成機能は自動的に手に入る**。
-実装上は「入力あり／なし」のフラグ 1 つの差でしかない。
+## 4. 実行と失敗時の扱い
 
----
+- 入力停止から 300 ms 後に自動実行する。Run / Apply ボタンは置かない。
+- コンパイル失敗または実行失敗時は、直前に成功した GLSL 出力を残す。
+- 編集中コードと最後に成功したコードを別々に保持する。エラーのある編集内容もタブ移動やセッション保存で失わない。
+- コンパイルログの行番号はラッパ分を補正し、ユーザーコードの行番号で表示する。
+- タブ切替・ウィンドウ切替・削除時は予約中の自動実行を取り消す。
+- GLSL 結果の反映時は Selection の進行中ジョブとキャッシュを破棄し、古い画素の集計結果を混ぜない。
 
-## 6. 実装ステップ（段階的）
+## 5. 負荷とクラッシュを避けるルール
 
-1. **WebGL2 基盤** — `glsl-runtime.js` を新規追加。オフスクリーン canvas / `EXT_color_buffer_float` 検出 / フルスクリーン三角形 / RGBA32F FBO / `readPixels` → Float32Array。単体で「Passthrough が入力と一致する」ことを確認。
-2. **ラッパ生成とコンパイル** — USER CODE の埋め込み、再宣言検出、コンパイルログの行番号補正（ラッパ分オフセットを引いてユーザー行番号に直す）。
-3. **エディタ UI** — フローティングパネル、textarea、Tab キー、エラー表示、Run で新規ウィンドウ生成。画像ウィンドウに `GLSL` ボタン追加。
-4. **出力サイズ指定＋生成モード** — トップバーに `New Image` を追加。プリセット追加。
-5. **Auto preview / Replace / Revert** — デバウンス実行、低解像度プレビュー、元画像退避。
-6. **セッション保存** — `source: { kind: "glsl", code, inputId, width, height }` を保存し、復元時に再実行（またはピクセルを embedded として保存）。
-7. **README / PROGRESS 更新**、`index.html` のキャッシュバスター更新。
+- WebGL2 と `EXT_color_buffer_float` を必須とする。使えない場合は理由を表示して実行しない。
+- GPU の `MAX_TEXTURE_SIZE` に加え、GLSL の入力と出力を最大 8,388,608 ピクセルに制限する
+  （例: 4096 x 2048、3840 x 2160）。巨大な RGBA32F、readPixels、表示用 ImageData の同時確保を
+  避けるための仕様上限で、通常の画像閲覧には適用しない。
+- 同じ元画像の編集中は GPU 入力テクスチャを再利用し、打鍵ごとの再アップロードを避ける。
+- GLSL 出力の巨大な Float32Array は IndexedDB へ毎回保存しない。コードと解像度を保存し、復元時に再実行する。
+- コンテキストロストを監視し、次の実行時に WebGL2 コンテキストを作り直す。
+- 無限ループなど任意シェーダの完全な安全判定は行わない。静的解析の例外処理を増やさず、通常の GLSL と
+  ブラウザの WebGL コンテキスト保護に従う。
 
-各ステップごとにユーザーが実機確認 → 次へ。
+## 6. プリセット
 
----
+- Passthrough
+- Exposure +1 EV
+- Grayscale
+- Blur 3 tap (horizontal)
+- Channel swap (BGRA)
+- Gradient (generate)
+- Radial HDR light (generate)
 
-## 7. 技術的な注意点・リスク
+New Image の初期値は `Gradient (generate)`。
 
-| 項目 | 内容 | 対応 |
-| --- | --- | --- |
-| float FBO 非対応環境 | `EXT_color_buffer_float` が無いと RGBA32F に描画できない | RGBA16F にフォールバック → それも不可なら機能を無効化して明示メッセージ |
-| float の線形補間 | `OES_texture_float_linear` が無いと float テクスチャは NEAREST のみ | 既定 NEAREST。拡張があれば LINEAR を選択可にする |
-| メモリ | 8k×4k RGBA32F ≒ 536MB。`readPixels` 先の Float32Array も同サイズ | 上限解像度チェック、プレビューは縮小、必要ならタイル分割描画 |
-| 上下反転 | WebGL の v 軸と画像の行順が逆 | アップロード時に行順を保ち、`vUv.y` を反転して **uv(0,0)=左上** に統一。Passthrough で往復一致を必ず検証 |
-| 精度 | `precision highp float` 必須（mediump だと HDR が壊れる） | ラッパで固定 |
-| GLSL のエラー行 | ラッパ分ずれる | コンパイルログをパースして行番号を補正して表示 |
-| 無限ループ | GLSL に `while(true)` を書かれると GPU ハング／コンテキストロスト | `webglcontextlost` を捕捉して復旧＋警告。ループ回数の静的チェックまではしない |
-| セッション容量 | 生成画像を embedded で保存すると IndexedDB が肥大 | コード＋パラメータのみ保存して復元時に再実行する方式を優先 |
+## 7. 実装ファイルと確認状況
 
----
+| ファイル | 内容 |
+| --- | --- |
+| `glsl-runtime.js` | WebGL2 初期化、ラッパ、コンパイル、RGBA32F 描画、readPixels、上限検査、GPU キャッシュ |
+| `app.js` | タブ状態、エディタ、自動実行、既存機能との接続、セッション保存復元 |
+| `index.html` | New Image と GLSL エディタのマークアップ |
+| `style.css` | Original / GLSL タブとエディタパネル |
 
-## 8. 今回のスコープ外（将来）
+Node の構文検査と、ラッパ・プリセット・エラー行補正の非 WebGL テストを行う。
+WebGL 描画を含むブラウザ実機確認は `run.bat` で行う。
 
-- 複数入力テクスチャ（`inputTexture2` で 2 枚合成）
-- スライダ uniform（`u_param0..3`）を UI から調整
-- マルチパス（前パス結果を次パスの入力に）
-- シェーダのローカル保存 / インポート・エクスポート
-- 補完・シンタックスハイライト付きエディタ（外部ライブラリ導入となるため要ライセンス確認）
+## 8. 将来候補（現在は対象外）
+
+- GLSL 結果を別シェーダの入力にするチェーン
+- 複数入力テクスチャ
+- UI から操作する追加 uniform とアニメーション
+- マルチパス
+- シェーダファイルのインポート／エクスポート
+- シンタックスハイライトや補完を持つ外部エディタ

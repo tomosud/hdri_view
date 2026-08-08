@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>HDRI Value Viewer</title>
-  <link rel="stylesheet" href="./style.css?v=20260806-3">
+  <link rel="stylesheet" href="./style.css?v=20260808-4">
   <script type="importmap">
     {
       "imports": {
@@ -22,6 +22,7 @@
         <input id="fileInput" type="file" multiple accept="image/*,.hdr,.pic,.exr">
         Open
       </label>
+      <button id="newImageButton" class="tool-button" type="button" title="Generate a new image from GLSL code only">New Image</button>
       <div id="fileHint" class="file-hint">Drop images on the black view</div>
       <a class="github-link" href="https://github.com/tomosud/hdri_view" target="_blank" rel="noopener noreferrer">GitHub</a>
     </header>
@@ -128,6 +129,36 @@
           </div>
         </aside>
 
+        <aside id="glslPanel" class="glsl-panel hidden" aria-label="GLSL editor">
+          <div class="panel-title glsl-title">
+            <span id="glslTitleText">GLSL</span>
+            <button id="glslCloseButton" class="glsl-close" type="button" aria-label="Close GLSL editor">x</button>
+          </div>
+          <div class="glsl-fields">
+            <div class="glsl-field">
+              <span>Input</span>
+              <strong id="glslInputLabel">none</strong>
+            </div>
+            <div class="glsl-field">
+              <span>Output</span>
+              <div class="glsl-size">
+                <input id="glslWidth" type="number" min="1" step="1" value="1024" aria-label="Output width">
+                <span>x</span>
+                <input id="glslHeight" type="number" min="1" step="1" value="1024" aria-label="Output height">
+                <button id="glslMatchInput" class="tool-button" type="button">Match input</button>
+              </div>
+            </div>
+            <div class="glsl-field">
+              <span>Preset</span>
+              <select id="glslPreset" aria-label="Shader preset"></select>
+            </div>
+          </div>
+          <div class="glsl-signature">void mainImage(out vec4 outputColor, in vec2 uv, in vec4 inputColor) {</div>
+          <textarea id="glslCode" class="glsl-code" spellcheck="false" wrap="off" aria-label="GLSL source"></textarea>
+          <div class="glsl-signature">}</div>
+          <div id="glslStatus" class="glsl-status">Ready.</div>
+        </aside>
+
         <aside id="pickerPanel" class="picker-panel" aria-label="Color picker values">
           <div class="panel-title picker-title">
             <div class="panel-tabs">
@@ -173,6 +204,6 @@
     </footer>
   </div>
 
-  <script type="module" src="./app.js?v=20260808-2"></script>
+  <script type="module" src="./app.js?v=20260808-4"></script>
 </body>
 </html>
