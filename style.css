@@ -377,6 +377,14 @@ textarea {
   cursor: copy;
 }
 
+.image-canvas.picker-hover {
+  cursor: grab;
+}
+
+.image-canvas.picker-moving {
+  cursor: grabbing;
+}
+
 .image-canvas.panning {
   cursor: grabbing;
 }
@@ -540,6 +548,15 @@ textarea {
 
 .picker-row:last-child {
   border-bottom: 0;
+}
+
+.picker-row {
+  cursor: pointer;
+}
+
+.picker-row.selected {
+  background: rgba(53, 208, 255, 0.13);
+  box-shadow: inset 2px 0 #35d0ff;
 }
 
 .picker-marker-chip,

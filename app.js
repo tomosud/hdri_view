@@ -2,10 +2,10 @@ import * as THREE from "three";
 import { EXRLoader } from "three/addons/loaders/EXRLoader.js";
 import { HDRLoader } from "three/addons/loaders/HDRLoader.js";
 import { decodePng, isPngFile, pngTypeLabel } from "./png-decoder.js?v=20260809-7";
-import { canOpenPngAsTiles, openPngRasterSource } from "./png-raster-source.js?v=20260809-1";
-import { decodeTiff, openTiffRasterSource } from "./tiff-decoder.js?v=20260809-5";
-import { decodeJpeg2000, openJpeg2000RasterSource } from "./jp2-decoder.js?v=20260809-5";
-import { createBitmapRasterSource, createMemoryRasterSource, RASTER_TILE_SIZE } from "./raster-source.js?v=20260809-4";
+import { canOpenPngAsTiles, openPngRasterSource } from "./png-raster-source.js?v=20260809-2";
+import { decodeTiff, openTiffRasterSource } from "./tiff-decoder.js?v=20260809-6";
+import { decodeJpeg2000, openJpeg2000RasterSource } from "./jp2-decoder.js?v=20260809-6";
+import { createBitmapRasterSource, createMemoryRasterSource, createSwitchableRasterSource, RASTER_TILE_SIZE } from "./raster-source.js?v=20260809-6";
 import {
   MAX_VALUE_MATRIX_PIXELS,
   isValueMatrixText,
@@ -110,6 +110,8 @@ let activeDrag = null;
 let rafPending = false;
 let graphRafPending = false;
 let pickerMode = false;
+let selectedPickerId = null;
+let hoveredPickerId = null;
 let internalClipboard = null;
 const portableClipboardMatrixPixels = 512 * 512;
 const maxInternalClipboardPixels = 4096 * 2048;
@@ -218,6 +220,8 @@ clearPickersButton.addEventListener("click", () => {
     for (const image of images) {
       image.pickers = [];
     }
+    selectedPickerId = null;
+    hoveredPickerId = null;
     updatePickerPanel();
     requestRender();
     scheduleSessionSave();
@@ -731,6 +735,18 @@ document.addEventListener("pointermove", (event) => {
       requestSelectionGraphDraw();
       requestRender();
     }
+  } else if (activeDrag.kind === "movePicker") {
+    const pixel = pixelFromEvent(activeDrag.image, event, true);
+    if (pixel) {
+      const x = clamp(activeDrag.x + pixel.x - activeDrag.startPixel.x, 0, activeDrag.image.width - 1);
+      const y = clamp(activeDrag.y + pixel.y - activeDrag.startPixel.y, 0, activeDrag.image.height - 1);
+      if (x !== activeDrag.picker.x || y !== activeDrag.picker.y) {
+        activeDrag.picker.x = x;
+        activeDrag.picker.y = y;
+        activeDrag.moved = true;
+        requestRender();
+      }
+    }
   } else if (activeDrag.kind === "graphResize") {
     selectionGraphPanel.style.width = `${Math.max(minGraphWidth, activeDrag.width + dx)}px`;
     selectionGraphPanel.style.height = `${Math.max(minGraphHeight, activeDrag.height + dy)}px`;
@@ -763,6 +779,19 @@ document.addEventListener("pointerup", (event) => {
       updateSelectionPanel();
       drawSelectionGraph();
       requestRender();
+    }
+  } else if (activeDrag?.kind === "movePicker") {
+    const { image, picker, moved } = activeDrag;
+    try {
+      image.elements.canvas.releasePointerCapture(event.pointerId);
+    } catch {
+      // Pointer capture may already be released by the browser.
+    }
+    image.elements.canvas.classList.remove("picker-moving");
+    updatePickerPanel();
+    requestRender();
+    if (moved) {
+      fileHint.textContent = `Moved P${picker.id} to ${picker.x}, ${picker.y}`;
     }
   }
   activeDrag = null;
@@ -953,7 +982,8 @@ async function loadJpeg2000Image(file) {
         format: opened.container,
         bitDepth: `${opened.bitDepth}-bit`,
         rasterSource: opened.rasterSource,
-        range: computeRange(opened.preview.pixels)
+        range: computeRange(opened.preview.pixels),
+        overview: rasterOverview(opened.preview)
       }
     );
   } catch (error) {
@@ -998,6 +1028,7 @@ async function loadTiffImage(file) {
         bitDepth: opened.bitDepthLabel || `${opened.bitDepth}-bit`,
         rasterSource: opened.rasterSource,
         range: computeRange(opened.preview.pixels),
+        overview: rasterOverview(opened.preview),
         hdr: opened.sampleFormat === 3
       }
     );
@@ -1040,27 +1071,71 @@ async function loadPngExact(file) {
       return null;
     }
     if (canOpenPngAsTiles(head, maxLoadedPngPixels)) {
-      const opened = await openPngRasterSource(file, {
-        onProgress: (progress, label) => {
-          fileHint.textContent = `${file.name}: ${label || `${progress}%`}`;
-        }
+      const header = pngHeaderMetadata(head);
+      let thumbnail;
+      try {
+        thumbnail = await createPngThumbnail(file, header.width, header.height);
+      } catch (error) {
+        console.warn("PNG provisional thumbnail failed; waiting for exact tiles.", error);
+        const opened = await openPngRasterSource(file, {
+          onProgress: (progress, label) => {
+            fileHint.textContent = `${file.name}: ${label || `${progress}%`}`;
+          }
+        });
+        return pngTiledImageRecord(file, opened);
+      }
+      const provisionalSource = createBitmapRasterSource(thumbnail, {
+        width: header.width,
+        height: header.height,
+        maxCachedTiles: 12
       });
+      const provisionalPreview = provisionalSource.readPreview(1024);
+      const rasterSource = createSwitchableRasterSource(provisionalSource, header.width, header.height);
       const record = createImageRecord(
         file,
-        opened.width,
-        opened.height,
-        pngTypeLabel(opened),
+        header.width,
+        header.height,
+        pngTypeLabel(header),
         null,
         "raster",
         {
-          format: "PNG",
-          bitDepth: `${opened.bitDepth}-bit`,
-          rasterSource: opened.rasterSource,
-          range: computeRange(opened.preview.pixels)
+          format: "PNG loading",
+          bitDepth: `${header.bitDepth}-bit`,
+          rasterSource,
+          range: computeRange(provisionalPreview.pixels),
+          overview: provisionalPreview
         }
       );
-      const note = pngTransferNote(opened);
-      if (note) record.type = `${record.type} ${note}`;
+      record.type = `${record.type} (provisional thumbnail)`;
+      void openPngRasterSource(file, {
+        onProgress: (progress, label) => {
+          fileHint.textContent = `${file.name}: ${label || `${progress}%`}`;
+        }
+      }).then((opened) => {
+        if (!rasterSource.swap(opened.rasterSource)) return;
+        record.format = "PNG";
+        record.type = pngTypeLabel(opened);
+        const note = pngTransferNote(opened);
+        if (note) record.type = `${record.type} ${note}`;
+        record.range = computeRange(opened.preview.pixels);
+        record.displayDirty = true;
+        record.displayTileCache?.clear();
+        selectionDetailsCache.delete(record);
+        updateImageWindowSize(record);
+        if (currentImage() === record) {
+          updateSettingsPanel();
+          updatePickerPanel();
+          updateSelectionPanel();
+        }
+        fileHint.textContent = `${file.name}: full-resolution tiles ready`;
+        requestRender();
+      }).catch((error) => {
+        console.error("PNG exact tile decode failed; provisional image retained.", error);
+        record.format = "PNG preview";
+        record.type = `${pngTypeLabel(header)} (provisional 8-bit thumbnail; exact tiles failed)`;
+        updateImageWindowSize(record);
+        fileHint.textContent = `${file.name}: exact tiles failed; showing provisional image`;
+      });
       return record;
     }
     bytes = new Uint8Array(await file.arrayBuffer());
@@ -1197,6 +1272,70 @@ async function loadDataTexture(file, kind) {
     ? { format: "EXR", bitDepth: exrBitDepth(buffer) }
     : { format: "HDR", bitDepth: "RGBE8" };
   return createImageRecord(file, width, height, kind === "exr" ? "openexr/linear" : "radiance-hdr/linear", pixels, kind, metadata);
+}
+
+function pngHeaderMetadata(bytes) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const colorType = bytes[25];
+  return {
+    width: view.getUint32(16),
+    height: view.getUint32(20),
+    bitDepth: bytes[24],
+    colorType,
+    interlace: bytes[28],
+    hasAlpha: colorType === 4 || colorType === 6,
+    gamma: null,
+    srgbIntent: null,
+    hasIccProfile: false
+  };
+}
+
+async function createPngThumbnail(file, width, height) {
+  const scale = Math.min(1, 1024 / Math.max(width, height));
+  const resizeWidth = Math.max(1, Math.round(width * scale));
+  const resizeHeight = Math.max(1, Math.round(height * scale));
+  const resize = { resizeWidth, resizeHeight, resizeQuality: "medium" };
+  return createImageBitmap(file, { ...resize, colorSpaceConversion: "none" })
+    .catch(() => createImageBitmap(file, resize));
+}
+
+function pngTiledImageRecord(file, opened) {
+  const record = createImageRecord(
+    file,
+    opened.width,
+    opened.height,
+    pngTypeLabel(opened),
+    null,
+    "raster",
+    {
+      format: "PNG",
+      bitDepth: `${opened.bitDepth}-bit`,
+      rasterSource: opened.rasterSource,
+      range: computeRange(opened.preview.pixels),
+      overview: rasterOverview(opened.preview)
+    }
+  );
+  const note = pngTransferNote(opened);
+  if (note) record.type = `${record.type} ${note}`;
+  return record;
+}
+
+function rasterOverview(preview, maximumEdge = 1024) {
+  if (!preview?.pixels || preview.width < 1 || preview.height < 1) return null;
+  const scale = Math.min(1, maximumEdge / Math.max(preview.width, preview.height));
+  if (scale >= 1) return preview;
+  const width = Math.max(1, Math.round(preview.width * scale));
+  const height = Math.max(1, Math.round(preview.height * scale));
+  const pixels = new Float32Array(width * height * 4);
+  for (let y = 0; y < height; y += 1) {
+    const sourceY = Math.min(preview.height - 1, Math.floor((y + 0.5) / scale));
+    for (let x = 0; x < width; x += 1) {
+      const sourceX = Math.min(preview.width - 1, Math.floor((x + 0.5) / scale));
+      const sourceOffset = (sourceY * preview.width + sourceX) * 4;
+      pixels.set(preview.pixels.subarray(sourceOffset, sourceOffset + 4), (y * width + x) * 4);
+    }
+  }
+  return { width, height, pixels };
 }
 
 async function rasterFileMetadata(file) {
@@ -1362,6 +1501,7 @@ function createImageRecord(file, width, height, type, pixels, sourceFormat = "ra
     pixels,
     rasterSource,
     range,
+    overview: metadata.overview || null,
     settings: {
       autoLevel: false,
       logDisplay: metadata.hdr ?? (sourceFormat === "hdr" || sourceFormat === "exr"),
@@ -1531,6 +1671,29 @@ function createImageWindow(image, dropPoint, placementIndex) {
 
   canvas.addEventListener("pointerdown", (event) => {
     selectImage(image);
+    const hitPicker = event.button === 0 ? pickerAtEvent(image, event) : null;
+    if (hitPicker) {
+      const startPixel = pixelFromEvent(image, event, true);
+      event.preventDefault();
+      selectedPickerId = hitPicker.id;
+      hoveredPickerId = hitPicker.id;
+      activeDrag = {
+        kind: "movePicker",
+        image,
+        picker: hitPicker,
+        startX: event.clientX,
+        startY: event.clientY,
+        startPixel,
+        x: hitPicker.x,
+        y: hitPicker.y,
+        moved: false
+      };
+      canvas.setPointerCapture(event.pointerId);
+      canvas.classList.add("picker-moving");
+      updatePickerPanel();
+      requestRender();
+      return;
+    }
     if (pickerMode && activePanelTab === "pickers" && event.button === 0) {
       event.preventDefault();
       togglePickerAtEvent(image, event);
@@ -1570,6 +1733,15 @@ function createImageWindow(image, dropPoint, placementIndex) {
   });
 
   canvas.addEventListener("pointermove", (event) => {
+    if (!image.pan && activeDrag?.kind !== "movePicker") {
+      const hoveredPicker = pickerAtEvent(image, event);
+      const nextHoveredPickerId = hoveredPicker?.id ?? null;
+      canvas.classList.toggle("picker-hover", Boolean(hoveredPicker));
+      if (nextHoveredPickerId !== hoveredPickerId) {
+        hoveredPickerId = nextHoveredPickerId;
+        requestRender();
+      }
+    }
     if (image.pan) {
       image.view.offsetX = image.pan.offsetX + event.clientX - image.pan.x;
       image.view.offsetY = image.pan.offsetY + event.clientY - image.pan.y;
@@ -1581,6 +1753,11 @@ function createImageWindow(image, dropPoint, placementIndex) {
   canvas.addEventListener("pointerup", (event) => endImagePan(image, event));
   canvas.addEventListener("pointercancel", (event) => endImagePan(image, event));
   canvas.addEventListener("pointerleave", () => {
+    canvas.classList.remove("picker-hover");
+    if (hoveredPickerId !== null) {
+      hoveredPickerId = null;
+      requestRender();
+    }
     if (!image.pan) {
       clearPixelReadout();
     }
@@ -1727,6 +1904,12 @@ function closeImage(image) {
   const index = images.findIndex((item) => item.id === image.id);
   if (index === -1) {
     return;
+  }
+  if (image.pickers.some((picker) => picker.id === selectedPickerId)) {
+    selectedPickerId = null;
+  }
+  if (image.pickers.some((picker) => picker.id === hoveredPickerId)) {
+    hoveredPickerId = null;
   }
   image.elements?.frame.remove();
   const rasterSources = new Set([
@@ -2419,6 +2602,8 @@ function togglePickerAtEvent(image, event) {
 
   const existingIndex = image.pickers.findIndex((picker) => picker.x === pixel.x && picker.y === pixel.y);
   if (existingIndex !== -1) {
+    if (image.pickers[existingIndex].id === selectedPickerId) selectedPickerId = null;
+    if (image.pickers[existingIndex].id === hoveredPickerId) hoveredPickerId = null;
     image.pickers.splice(existingIndex, 1);
     updatePickerPanel();
     requestRender();
@@ -2431,12 +2616,15 @@ function togglePickerAtEvent(image, event) {
     return;
   }
 
-  image.pickers.push({
+  const picker = {
     id: nextAvailablePickerId(),
     x: pixel.x,
     y: pixel.y,
     color: nextPickerColor()
-  });
+  };
+  image.pickers.push(picker);
+  selectedPickerId = picker.id;
+  hoveredPickerId = picker.id;
   updatePickerPanel();
   requestRender();
   scheduleSessionSave();
@@ -2458,6 +2646,8 @@ function removePicker(pickerId) {
   for (const image of images) {
     const index = image.pickers.findIndex((picker) => picker.id === pickerId);
     if (index !== -1) {
+      if (image.pickers[index].id === selectedPickerId) selectedPickerId = null;
+      if (image.pickers[index].id === hoveredPickerId) hoveredPickerId = null;
       image.pickers.splice(index, 1);
       updatePickerPanel();
       requestRender();
@@ -2478,6 +2668,20 @@ function drawPickers(image, ctx) {
 
     const arm = 9;
     ctx.save();
+    if (picker.id === hoveredPickerId) {
+      ctx.beginPath();
+      ctx.arc(x, y, 14, 0, Math.PI * 2);
+      ctx.strokeStyle = "#000";
+      ctx.lineWidth = 4;
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(x, y, 14, 0, Math.PI * 2);
+      ctx.strokeStyle = "#fff";
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([3, 3]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
     ctx.lineCap = "square";
     ctx.strokeStyle = "#000";
     ctx.lineWidth = 4;
@@ -2627,6 +2831,26 @@ function isHdrImage(image) {
 
 async function cropPixels(image, rect) {
   return await image.rasterSource.copyRegion(rect);
+}
+
+function pickerAtEvent(image, event, radius = 14) {
+  if (!image.pickers.length || !image.elements?.canvas) return null;
+  const rect = image.elements.canvas.getBoundingClientRect();
+  const viewX = event.clientX - rect.left;
+  const viewY = event.clientY - rect.top;
+  let closest = null;
+  let closestDistance = radius * radius;
+  for (let index = image.pickers.length - 1; index >= 0; index -= 1) {
+    const picker = image.pickers[index];
+    const x = image.view.offsetX + (picker.x + 0.5) * image.view.scale;
+    const y = image.view.offsetY + (picker.y + 0.5) * image.view.scale;
+    const distance = (viewX - x) ** 2 + (viewY - y) ** 2;
+    if (distance <= closestDistance) {
+      closest = picker;
+      closestDistance = distance;
+    }
+  }
+  return closest;
 }
 
 async function makeRawCanvas(image, rect = null) {
@@ -3379,6 +3603,13 @@ function updatePickerPanel() {
       const values = pickerValues(image, picker);
       const row = document.createElement("div");
       row.className = "picker-row";
+      row.classList.toggle("selected", picker.id === selectedPickerId);
+      row.addEventListener("click", () => {
+        selectedPickerId = picker.id;
+        selectImage(image);
+        updatePickerPanel();
+        requestRender();
+      });
 
       const markerChip = document.createElement("span");
       markerChip.className = "picker-marker-chip";
@@ -3400,7 +3631,10 @@ function updatePickerPanel() {
       remove.type = "button";
       remove.textContent = "x";
       remove.title = "Remove picker";
-      remove.addEventListener("click", () => removePicker(picker.id));
+      remove.addEventListener("click", (event) => {
+        event.stopPropagation();
+        removePicker(picker.id);
+      });
 
       row.append(markerChip, sampleChip, label, value, remove);
       pickerRows.append(row);
@@ -4802,6 +5036,7 @@ function drawImageTiles(image, ctx, canvasWidth, canvasHeight, dpr) {
     return;
   }
   const cache = displayTileCache(image);
+  drawImageOverview(image, ctx);
   const sourcePixelsPerDevicePixel = 1 / Math.max(0.000001, image.view.scale * dpr);
   const maximumLevel = Math.max(0, Math.ceil(Math.log2(Math.max(image.width, image.height))));
   const level = clamp(Math.floor(Math.log2(Math.max(1, sourcePixelsPerDevicePixel))), 0, maximumLevel);
@@ -4852,9 +5087,37 @@ function displayTileCache(image) {
   image.displayTileCache ||= new Map();
   if (image.displayDirty) {
     image.displayTileCache.clear();
+    image.displayOverview = null;
     image.displayDirty = false;
   }
   return image.displayTileCache;
+}
+
+function drawImageOverview(image, ctx) {
+  const overview = image.overview;
+  if (!overview?.pixels || overview.width < 1 || overview.height < 1) return;
+  if (!image.displayOverview) {
+    image.displayOverview = createDisplayTile(image, {
+      width: overview.width,
+      height: overview.height,
+      gutter: 0,
+      stride: overview.width,
+      pixels: overview.pixels
+    });
+  }
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "medium";
+  ctx.drawImage(
+    image.displayOverview.canvas,
+    0,
+    0,
+    overview.width,
+    overview.height,
+    image.view.offsetX,
+    image.view.offsetY,
+    image.width * image.view.scale,
+    image.height * image.view.scale
+  );
 }
 
 function getDisplayTile(image, cache, level, tileX, tileY) {

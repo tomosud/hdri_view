@@ -1,4 +1,4 @@
-import { createWorkerRasterSource } from "./raster-source.js?v=20260809-4";
+import { createWorkerRasterSource } from "./raster-source.js?v=20260809-6";
 
 export function canOpenPngAsTiles(headerBytes, minimumPixels = 4096 * 4096) {
   const bytes = headerBytes instanceof Uint8Array ? headerBytes : new Uint8Array(headerBytes);

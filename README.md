@@ -18,9 +18,9 @@ https://tomosud.github.io/hdri_view/
 ## できること
 
 - PNG / JPEG / WebP / AVIF / GIF / BMP / **JPEG 2000 (JP2/J2K, 1/3ch, 1〜16bit)** / **TIFF / BigTIFF（LZW・Deflate・PackBits・JPEGなど）** に加え、**HDR (Radiance)** / **EXR (OpenEXR)** をブラウザ上でそのまま開ける
-- 16,777,216画素を超える非インターレース8/16bit Gray / Gray+Alpha / RGB(A) PNGは、Worker内で元ビット深度の512pxタイルへストリーム展開し、原寸のまま表示する
-- 通常表示は512pxタイルとズーム率に応じたMipレベルだけを生成・LRUキャッシュし、巨大な表示用Canvasを作らない
-- カーソル位置の **linear値 / sRGB値** をステータスバーにリアルタイム表示
+- 16,777,216画素を超える非インターレース8/16bit Gray / Gray+Alpha / RGB(A) PNGは、まず縮小した仮画像を表示し、Worker内で元ビット深度の512pxタイルへストリーム展開できた時点で原寸表示へ自動で差し替える
+- 通常表示は低解像度の全体プレビューを常に背景へ表示し、その上へ読み込み済みの512pxタイルを重ねる。移動・ズーム先のタイルが未到着でも黒抜けさせず、ズーム率に応じたMipレベルだけを生成・LRUキャッシュする
+- カーソル位置の **linear値 / sRGB値** をステータスバーにリアルタイム表示。配置済みピッカーはクリックで選択し、左ドラッグで移動できる
 - 複数の画像をウィンドウとして並べて比較
 - 任意の点をピックしてリストに記録、CSV としてコピー
 - 矩形選択した範囲の最小・最大・平均値と、値の分布を **3Dグラフ** で可視化
@@ -206,12 +206,12 @@ GPU メモリと readPixels によるフリーズを避けるため、GLSL の�
 
 - ビルド不要の静的サイト（GitHub Pages でホスト可能）
 - [three.js](https://threejs.org/) の `EXRLoader` / `RGBELoader` を利用して HDR/EXR を読み込み
-- PNG は小～中画像を `png-decoder.js`、巨大画像を `png-tile-worker.js` で自前デコードし、巨大画像は圧縮ファイル全体やRGBA Float32全体を確保しない
+- PNG は小～中画像を `png-decoder.js`、巨大画像を `png-tile-worker.js` で自前デコードする。巨大画像は圧縮ファイル全体やRGBA Float32全体を確保せず、待ち時間中だけ最大1024pxの仮画像を使う。ピクセル値は原寸タイルへの切替後に元ビット深度で取得する
 - TIFF はMITライセンスの GeoTIFF.js 3.0.5を常駐Workerで実行し、表示・ピッカー・選択範囲に必要な領域だけを読む。LZW・Deflate・PackBits・JPEGなどの圧縮、strip/tile、整数・浮動小数点サンプルに対応する
 - JPEG 2000 はMITライセンスの `@cornerstonejs/codec-openjpeg` 1.3.0（OpenJPEG純JS版）をWorkerで実行する。Codecの安全メモリ内に収まる画像は原寸タイル表示し、領域デコードAPIが未公開の巨大画像はwaveletサブ解像度へフォールバックする
 - HDRI Value Matrix は `clipboard-matrix.js` でシリアライズ／解析
 - GLSL 加工・生成は `glsl-runtime.js`（WebGL2 を直接使用、RGBA32F の FBO に描いて `readPixels`）
-- 通常画像の表示は `raster-source.js` の共通画素ソースと `app.js` の512pxタイルコンポジタ（Mip選択、raw/display二段LRU）を使用。メモリ・ImageBitmap・非同期Workerを同じプロトコルで扱い、表示・ピッカー・範囲選択は同じ画素ソースを参照する
+- 通常画像の表示は `raster-source.js` の共通画素ソースと `app.js` の512pxタイルコンポジタ（常設全体プレビュー、Mip選択、raw/display二段LRU）を使用。メモリ・ImageBitmap・非同期Workerを同じプロトコルで扱い、表示・ピッカー・範囲選択は同じ画素ソースを参照する
 - 選択範囲の集計処理は Web Worker（`selection-worker.js`）にオフロード
 
 ### 値の正確性について

@@ -1,4 +1,4 @@
-import { createWorkerRasterSource } from "./raster-source.js?v=20260809-4";
+import { createWorkerRasterSource } from "./raster-source.js?v=20260809-6";
 
 export function isTiffFile(source) {
   const bytes = source instanceof Uint8Array ? source : new Uint8Array(source);

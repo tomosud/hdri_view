@@ -158,11 +158,16 @@ export function createMemoryRasterSource(pixels, width, height, { maxCachedTiles
   };
 }
 
-export function createBitmapRasterSource(bitmap, { maxCachedTiles = 24 } = {}) {
+export function createBitmapRasterSource(bitmap, {
+  maxCachedTiles = 24,
+  width: virtualWidth = bitmap?.width,
+  height: virtualHeight = bitmap?.height
+} = {}) {
   if (!bitmap || bitmap.width < 1 || bitmap.height < 1) {
     throw new Error("Bitmap raster source requires a valid ImageBitmap.");
   }
-  const { width, height } = bitmap;
+  const width = virtualWidth;
+  const height = virtualHeight;
   const cache = new Map();
   let disposed = false;
   return {
@@ -178,7 +183,7 @@ export function createBitmapRasterSource(bitmap, { maxCachedTiles = 24 } = {}) {
         cache.set(key, cached);
         return cached;
       }
-      const tile = buildBitmapTile(bitmap, level, tileX, tileY, gutter);
+      const tile = buildBitmapTile(bitmap, width, height, level, tileX, tileY, gutter);
       cache.set(key, tile);
       while (cache.size > maxCachedTiles) cache.delete(cache.keys().next().value);
       return tile;
@@ -233,10 +238,60 @@ export function createBitmapRasterSource(bitmap, { maxCachedTiles = 24 } = {}) {
   };
 }
 
-function buildBitmapTile(bitmap, level, tileX, tileY, gutter) {
+export function createSwitchableRasterSource(initialSource, width, height) {
+  let source = initialSource;
+  let disposed = false;
+  return {
+    width,
+    height,
+    pixels: null,
+    get asynchronous() {
+      return Boolean(source?.asynchronous);
+    },
+    getTile(...args) {
+      return source.getTile(...args);
+    },
+    getPixel(...args) {
+      return source.getPixel(...args);
+    },
+    copyRegion(...args) {
+      return source.copyRegion(...args);
+    },
+    copyRegionInto(...args) {
+      return source.copyRegionInto?.(...args);
+    },
+    materialize(...args) {
+      return source.materialize(...args);
+    },
+    readPreview(...args) {
+      return source.readPreview(...args);
+    },
+    clearCache() {
+      source.clearCache?.();
+    },
+    swap(nextSource) {
+      if (disposed) {
+        nextSource?.dispose?.();
+        return false;
+      }
+      const previous = source;
+      source = nextSource;
+      previous?.dispose?.();
+      return true;
+    },
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      source?.dispose?.();
+      source = null;
+    }
+  };
+}
+
+function buildBitmapTile(bitmap, virtualWidth, virtualHeight, level, tileX, tileY, gutter) {
   const factor = 2 ** level;
-  const levelWidth = Math.ceil(bitmap.width / factor);
-  const levelHeight = Math.ceil(bitmap.height / factor);
+  const levelWidth = Math.ceil(virtualWidth / factor);
+  const levelHeight = Math.ceil(virtualHeight / factor);
   const levelX = tileX * RASTER_TILE_SIZE;
   const levelY = tileY * RASTER_TILE_SIZE;
   const width = Math.min(RASTER_TILE_SIZE, levelWidth - levelX);
@@ -247,13 +302,18 @@ function buildBitmapTile(bitmap, level, tileX, tileY, gutter) {
   canvas.width = stride;
   canvas.height = height + gutter * 2;
   const context = canvas.getContext("2d", { alpha: true, willReadFrequently: true });
-  context.imageSmoothingEnabled = level > 0;
+  context.imageSmoothingEnabled =
+    level > 0 || bitmap.width !== virtualWidth || bitmap.height !== virtualHeight;
   context.imageSmoothingQuality = "high";
   const sourceX = levelX * factor;
   const sourceY = levelY * factor;
-  const sourceWidth = Math.min(bitmap.width - sourceX, width * factor);
-  const sourceHeight = Math.min(bitmap.height - sourceY, height * factor);
-  context.drawImage(bitmap, sourceX, sourceY, sourceWidth, sourceHeight, gutter, gutter, width, height);
+  const sourceWidth = Math.min(virtualWidth - sourceX, width * factor);
+  const sourceHeight = Math.min(virtualHeight - sourceY, height * factor);
+  const bitmapX = sourceX / virtualWidth * bitmap.width;
+  const bitmapY = sourceY / virtualHeight * bitmap.height;
+  const bitmapWidth = sourceWidth / virtualWidth * bitmap.width;
+  const bitmapHeight = sourceHeight / virtualHeight * bitmap.height;
+  context.drawImage(bitmap, bitmapX, bitmapY, bitmapWidth, bitmapHeight, gutter, gutter, width, height);
   const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
   duplicateGutter(imageData.data, canvas.width, canvas.height, gutter, width, height);
   return {
