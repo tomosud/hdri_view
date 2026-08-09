@@ -17,7 +17,7 @@ https://tomosud.github.io/hdri_view/
 
 ## できること
 
-- PNG / JPEG / WebP / AVIF / GIF / BMP に加え、**HDR (Radiance)** / **EXR (OpenEXR)** をブラウザ上でそのまま開ける
+- PNG / JPEG / WebP / AVIF / GIF / BMP / **TIFF (非圧縮8/16bit)** に加え、**HDR (Radiance)** / **EXR (OpenEXR)** をブラウザ上でそのまま開ける
 - カーソル位置の **linear値 / sRGB値** をステータスバーにリアルタイム表示
 - 複数の画像をウィンドウとして並べて比較
 - 任意の点をピックしてリストに記録、CSV としてコピー
@@ -196,7 +196,7 @@ GPU メモリと readPixels によるフリーズを避けるため、GLSL の�
 
 | 用途 | 形式 |
 | --- | --- |
-| 読み込み | PNG, JPEG, WebP, AVIF, GIF, BMP, HDR (Radiance), EXR (OpenEXR) |
+| 読み込み | PNG, JPEG, WebP, AVIF, GIF, BMP, TIFF (非圧縮8/16bit), HDR (Radiance), EXR (OpenEXR) |
 | 保存 | PNG, JPEG, WebP, HDR RGBE（HDRI画像）, EXR Float（HDRI画像） |
 
 ## 技術構成
@@ -204,6 +204,7 @@ GPU メモリと readPixels によるフリーズを避けるため、GLSL の�
 - ビルド不要の静的サイト（GitHub Pages でホスト可能）
 - [three.js](https://threejs.org/) の `EXRLoader` / `RGBELoader` を利用して HDR/EXR を読み込み
 - PNG は `png-decoder.js` で自前デコード（後述）
+- TIFF は `tiff-decoder.js` で非圧縮8/16bit整数のストリップ画像を直接デコード
 - HDRI Value Matrix は `clipboard-matrix.js` でシリアライズ／解析
 - GLSL 加工・生成は `glsl-runtime.js`（WebGL2 を直接使用、RGBA32F の FBO に描いて `readPixels`）
 - 選択範囲の集計処理は Web Worker（`selection-worker.js`）にオフロード

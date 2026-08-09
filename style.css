@@ -351,6 +351,7 @@ textarea {
   color: var(--muted);
   font-family: Consolas, "Courier New", monospace;
   font-size: 11px;
+  white-space: nowrap;
 }
 
 .window-body {

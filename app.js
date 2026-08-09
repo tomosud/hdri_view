@@ -2,6 +2,7 @@ import * as THREE from "three";
 import { EXRLoader } from "three/addons/loaders/EXRLoader.js";
 import { HDRLoader } from "three/addons/loaders/HDRLoader.js";
 import { decodePng, isPngFile, pngTypeLabel } from "./png-decoder.js?v=20260808-3";
+import { decodeTiff } from "./tiff-decoder.js?v=20260809-1";
 import {
   MAX_VALUE_MATRIX_PIXELS,
   isValueMatrixText,
@@ -914,7 +915,23 @@ async function loadImageFile(file) {
   if (extension === "hdr" || extension === "pic") {
     return loadDataTexture(file, "hdr");
   }
+  if (extension === "tif" || extension === "tiff") {
+    return loadTiffImage(file);
+  }
   return loadRasterImage(file);
+}
+
+async function loadTiffImage(file) {
+  const decoded = decodeTiff(await file.arrayBuffer());
+  return createImageRecord(
+    file,
+    decoded.width,
+    decoded.height,
+    `tiff/${decoded.channels}${decoded.bitDepth}`,
+    decoded.pixels,
+    "raster",
+    { format: "TIFF", bitDepth: `${decoded.bitDepth}-bit` }
+  );
 }
 
 async function loadRasterImage(file) {
@@ -968,6 +985,8 @@ async function loadPngExact(file) {
   }
 
   const record = createImageRecord(file, decoded.width, decoded.height, pngTypeLabel(decoded), pixels, "raster");
+  record.format = "PNG";
+  record.bitDepth = `${decoded.bitDepth}-bit`;
   const note = pngTransferNote(decoded);
   if (note) {
     record.type = `${record.type} ${note}`;
@@ -988,6 +1007,7 @@ function pngTransferNote(decoded) {
 }
 
 async function loadCanvasRasterImage(file) {
+  const metadata = await rasterFileMetadata(file);
   const bitmap = await createImageBitmap(file, { colorSpaceConversion: "none" }).catch(() => createImageBitmap(file));
   const sourceCanvas = document.createElement("canvas");
   sourceCanvas.width = bitmap.width;
@@ -1010,7 +1030,7 @@ async function loadCanvasRasterImage(file) {
     pixels[j + 3] = imageData.data[i + 3] / 255;
   }
 
-  const record = createImageRecord(file, sourceCanvas.width, sourceCanvas.height, "raster/srgb", pixels, "raster");
+  const record = createImageRecord(file, sourceCanvas.width, sourceCanvas.height, "raster/srgb", pixels, "raster", metadata);
   if (record.range.min[3] < 1) {
     // Canvas 経路は premultiplied alpha の往復を通るため、半透明画素の RGB は
     // ファイルの値と一致しない（alpha が小さいほど誤差が大きい）。計測前に気付けるよう明示する。
@@ -1050,7 +1070,120 @@ async function loadDataTexture(file, kind) {
   }
 
   parsed.dispose?.();
-  return createImageRecord(file, width, height, kind === "exr" ? "openexr/linear" : "radiance-hdr/linear", pixels, kind);
+  const metadata = kind === "exr"
+    ? { format: "EXR", bitDepth: exrBitDepth(buffer) }
+    : { format: "HDR", bitDepth: "RGBE8" };
+  return createImageRecord(file, width, height, kind === "exr" ? "openexr/linear" : "radiance-hdr/linear", pixels, kind, metadata);
+}
+
+async function rasterFileMetadata(file) {
+  const format = rasterFormat(file);
+  let bitDepth = ["JPEG", "WEBP", "GIF"].includes(format) ? "8-bit" : "";
+  try {
+    const bytes = new Uint8Array(await file.slice(0, 65536).arrayBuffer());
+    if (format === "JPEG") {
+      bitDepth = jpegBitDepth(bytes) || bitDepth;
+    } else if (format === "BMP" && bytes.length >= 30) {
+      bitDepth = `${new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint16(28, true)}-bit/pixel`;
+    }
+  } catch {
+    // Format alone is still useful when source bit depth cannot be inspected.
+  }
+  return { format, bitDepth };
+}
+
+function rasterFormat(file) {
+  const extension = file.name.split(".").pop()?.toUpperCase() || "IMAGE";
+  if (extension === "JPG" || extension === "JPE") {
+    return "JPEG";
+  }
+  if (extension === "TIF") {
+    return "TIFF";
+  }
+  return extension;
+}
+
+function jpegBitDepth(bytes) {
+  if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) {
+    return "";
+  }
+  const sofMarkers = new Set([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf]);
+  for (let offset = 2; offset + 4 < bytes.length;) {
+    if (bytes[offset] !== 0xff) {
+      offset += 1;
+      continue;
+    }
+    while (offset < bytes.length && bytes[offset] === 0xff) {
+      offset += 1;
+    }
+    const marker = bytes[offset++];
+    if (sofMarkers.has(marker)) {
+      return offset + 2 < bytes.length ? `${bytes[offset + 2]}-bit` : "";
+    }
+    if (marker === 0xd8 || marker === 0xd9 || (marker >= 0xd0 && marker <= 0xd7)) {
+      continue;
+    }
+    if (offset + 1 >= bytes.length) {
+      break;
+    }
+    const length = (bytes[offset] << 8) | bytes[offset + 1];
+    if (length < 2) {
+      break;
+    }
+    offset += length;
+  }
+  return "";
+}
+
+function exrBitDepth(buffer) {
+  const bytes = new Uint8Array(buffer);
+  const view = new DataView(buffer);
+  if (bytes.length < 12 || view.getUint32(0, true) !== 20000630) {
+    return "";
+  }
+  let offset = 8;
+  while (offset < bytes.length) {
+    const nameResult = readNullTerminated(bytes, offset, bytes.length);
+    offset = nameResult.next;
+    if (!nameResult.value) {
+      break;
+    }
+    const typeResult = readNullTerminated(bytes, offset, bytes.length);
+    offset = typeResult.next;
+    if (offset + 4 > bytes.length) {
+      break;
+    }
+    const size = view.getUint32(offset, true);
+    offset += 4;
+    const end = Math.min(bytes.length, offset + size);
+    if (nameResult.value === "channels" && typeResult.value === "chlist") {
+      const types = new Set();
+      let channelOffset = offset;
+      while (channelOffset < end) {
+        const channelName = readNullTerminated(bytes, channelOffset, end);
+        channelOffset = channelName.next;
+        if (!channelName.value || channelOffset + 16 > end) {
+          break;
+        }
+        types.add(view.getInt32(channelOffset, true));
+        channelOffset += 16;
+      }
+      return [...types].map((type) => type === 1 ? "16F" : type === 2 ? "32F" : type === 0 ? "32U" : "?").join("/");
+    }
+    offset = end;
+  }
+  return "";
+}
+
+function readNullTerminated(bytes, offset, limit) {
+  let end = offset;
+  while (end < limit && bytes[end] !== 0) {
+    end += 1;
+  }
+  return {
+    value: new TextDecoder().decode(bytes.subarray(offset, end)),
+    next: Math.min(limit, end + 1)
+  };
 }
 
 function flipPixelRows(pixels, width, height) {
@@ -1085,7 +1218,7 @@ function extractTextureData(parsed) {
   throw new Error("Decoded HDR/EXR data did not contain pixel data, width, and height.");
 }
 
-function createImageRecord(file, width, height, type, pixels, sourceFormat = "raster") {
+function createImageRecord(file, width, height, type, pixels, sourceFormat = "raster", metadata = {}) {
   const id = nextId;
   nextId += 1;
   const range = computeRange(pixels);
@@ -1096,6 +1229,8 @@ function createImageRecord(file, width, height, type, pixels, sourceFormat = "ra
     height,
     type,
     sourceFormat,
+    format: metadata.format || (sourceFormat === "glsl" ? "GLSL" : sourceFormat === "values" ? "VALUES" : rasterFormat(file)),
+    bitDepth: metadata.bitDepth || (sourceFormat === "glsl" || sourceFormat === "values" ? "32F" : ""),
     source: { kind: "external", name: file.name },
     pixels,
     range,
@@ -1155,7 +1290,7 @@ function createImageWindow(image, dropPoint, placementIndex) {
   title.textContent = image.name;
   const size = document.createElement("div");
   size.className = "window-size";
-  size.textContent = `${image.width}x${image.height}`;
+  size.textContent = imageInfoLabel(image);
   const modeTabs = document.createElement("div");
   modeTabs.className = "window-mode-tabs";
   const originalButton = document.createElement("button");
@@ -1504,6 +1639,8 @@ function imageVariant(image) {
     height: image.height,
     type: image.type,
     sourceFormat: image.sourceFormat,
+    format: image.format,
+    bitDepth: image.bitDepth,
     name: image.name,
     pixels: image.pixels,
     range: image.range
@@ -1518,6 +1655,8 @@ function glslVariant(code, pixels, width, height) {
     height,
     type: "glsl/linear",
     sourceFormat: "glsl",
+    format: "GLSL",
+    bitDepth: "32F",
     pixels,
     range: computeRange(pixels)
   };
@@ -1541,6 +1680,8 @@ function applyImageVariant(image, mode) {
   image.height = variant.height;
   image.type = variant.type;
   image.sourceFormat = variant.sourceFormat;
+  image.format = variant.format;
+  image.bitDepth = variant.bitDepth;
   image.pixels = variant.pixels;
   image.range = variant.range;
   image.displayCanvas = null;
@@ -1590,13 +1731,17 @@ function updateImageModeTabs(image) {
 
 function updateImageWindowSize(image) {
   if (image.elements?.size) {
-    image.elements.size.textContent = `${image.width}x${image.height}`;
+    image.elements.size.textContent = imageInfoLabel(image);
     return;
   }
   const sizeLabel = image.elements?.frame.querySelector(".window-size");
   if (sizeLabel) {
-    sizeLabel.textContent = `${image.width}x${image.height}`;
+    sizeLabel.textContent = imageInfoLabel(image);
   }
+}
+
+function imageInfoLabel(image) {
+  return [`${image.width}x${image.height}`, image.format, image.bitDepth].filter(Boolean).join(" · ");
 }
 
 function openGlslEditor(sourceImage) {
@@ -1877,6 +2022,8 @@ function applyGlslResult(image, pixels, width, height, code) {
   image.range = computeRange(pixels);
   image.type = "glsl/linear";
   image.sourceFormat = "glsl";
+  image.format = "GLSL";
+  image.bitDepth = "32F";
   image.glsl = {
     ...image.glsl,
     code,
@@ -1886,6 +2033,8 @@ function applyGlslResult(image, pixels, width, height, code) {
     height,
     type: image.type,
     sourceFormat: image.sourceFormat,
+    format: image.format,
+    bitDepth: image.bitDepth,
     range: image.range,
     statusKind: "ok",
     status: "Ready."
@@ -2182,6 +2331,8 @@ async function copySelection(image, rect, clipboardData = null) {
     name: `${image.name} crop`,
     type: `${image.type}/crop`,
     sourceFormat: image.sourceFormat,
+    format: image.format,
+    bitDepth: image.bitDepth,
     width: rect.width,
     height: rect.height,
     pixels: cropPixels(image, rect)
@@ -2300,7 +2451,8 @@ function pasteClipboardPixels(copied, sourceLabel = "values") {
     copied.height,
     copied.type || "clipboard-values/linear",
     new Float32Array(copied.pixels),
-    copied.sourceFormat || "values"
+    copied.sourceFormat || "values",
+    { format: copied.format, bitDepth: copied.bitDepth }
   );
   image.source = { kind: "embedded" };
   if (image.range.rgbMin < 0 || image.range.rgbMax > 1) {
@@ -2682,6 +2834,8 @@ function imageSessionState(image) {
     height: image.height,
     type: image.type,
     sourceFormat: image.sourceFormat,
+    format: image.format,
+    bitDepth: image.bitDepth,
     source: imageSourceSessionState(image),
     settings: { ...image.settings },
     view: { ...image.view },
@@ -2713,6 +2867,8 @@ function imageSourceSessionState(image) {
       height: stored.height,
       type: stored.type,
       sourceFormat: stored.sourceFormat,
+      format: stored.format,
+      bitDepth: stored.bitDepth,
       pixels: stored.pixels.buffer.slice(stored.pixels.byteOffset, stored.pixels.byteOffset + stored.pixels.byteLength)
     };
   }
@@ -2812,7 +2968,8 @@ async function restoreImageFromSession(savedImage) {
       height,
       source.type || savedImage.type || "raster/srgb",
       pixels,
-      source.sourceFormat || savedImage.sourceFormat || "raster"
+      source.sourceFormat || savedImage.sourceFormat || "raster",
+      { format: source.format || savedImage.format, bitDepth: source.bitDepth || savedImage.bitDepth }
     );
     image.source = { kind: "embedded" };
     return image;

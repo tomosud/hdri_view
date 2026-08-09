@@ -19,7 +19,7 @@
     <header class="topbar">
       <div class="brand">HDRI Value Viewer</div>
       <label class="file-button">
-        <input id="fileInput" type="file" multiple accept="image/*,.hdr,.pic,.exr">
+        <input id="fileInput" type="file" multiple accept="image/*,.tif,.tiff,.hdr,.pic,.exr">
         Open
       </label>
       <button id="newImageButton" class="tool-button" type="button" title="Generate a new image from GLSL code only">New Image</button>
@@ -40,7 +40,7 @@
         <div id="windowLayer" class="window-layer"></div>
         <div id="dropPrompt" class="drop-prompt">
           <div>Drop images here</div>
-          <span>PNG / JPEG / WebP / AVIF / GIF / BMP / HDR / EXR</span>
+          <span>PNG / JPEG / WebP / AVIF / GIF / BMP / TIFF / HDR / EXR</span>
         </div>
 
         <aside id="inspector" class="inspector" aria-label="View settings">
@@ -205,6 +205,6 @@
     </footer>
   </div>
 
-  <script type="module" src="./app.js?v=20260808-10"></script>
+  <script type="module" src="./app.js?v=20260809-2"></script>
 </body>
 </html>
