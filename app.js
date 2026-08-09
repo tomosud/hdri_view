@@ -65,6 +65,7 @@ const metaType = document.querySelector("#metaType");
 const metaRange = document.querySelector("#metaRange");
 const pixelPosition = document.querySelector("#pixelPosition");
 const linearValue = document.querySelector("#linearValue");
+const hoveredPickerValue = document.querySelector("#hoveredPickerValue");
 const srgbValue = document.querySelector("#srgbValue");
 const viewState = document.querySelector("#viewState");
 const pickerValueMode = document.querySelector("#pickerValueMode");
@@ -112,6 +113,8 @@ let graphRafPending = false;
 let pickerMode = false;
 let selectedPickerId = null;
 let hoveredPickerId = null;
+let hoveredPickerUiPending = false;
+let hoveredPickerUiScroll = false;
 let internalClipboard = null;
 const portableClipboardMatrixPixels = 512 * 512;
 const maxInternalClipboardPixels = 4096 * 2048;
@@ -744,6 +747,7 @@ document.addEventListener("pointermove", (event) => {
         activeDrag.picker.x = x;
         activeDrag.picker.y = y;
         activeDrag.moved = true;
+        requestHoveredPickerUi();
         requestRender();
       }
     }
@@ -1739,6 +1743,7 @@ function createImageWindow(image, dropPoint, placementIndex) {
       canvas.classList.toggle("picker-hover", Boolean(hoveredPicker));
       if (nextHoveredPickerId !== hoveredPickerId) {
         hoveredPickerId = nextHoveredPickerId;
+        requestHoveredPickerUi({ scroll: true });
         requestRender();
       }
     }
@@ -1756,6 +1761,7 @@ function createImageWindow(image, dropPoint, placementIndex) {
     canvas.classList.remove("picker-hover");
     if (hoveredPickerId !== null) {
       hoveredPickerId = null;
+      requestHoveredPickerUi();
       requestRender();
     }
     if (!image.pan) {
@@ -3591,6 +3597,7 @@ function setPickerMode(enabled) {
 
 function updatePickerPanel() {
   const rows = allPickers();
+  const savedScrollTop = pickerRows.scrollTop;
   pickerRows.replaceChildren();
 
   if (rows.length === 0) {
@@ -3603,7 +3610,9 @@ function updatePickerPanel() {
       const values = pickerValues(image, picker);
       const row = document.createElement("div");
       row.className = "picker-row";
+      row.dataset.pickerId = String(picker.id);
       row.classList.toggle("selected", picker.id === selectedPickerId);
+      row.classList.toggle("hovered", picker.id === hoveredPickerId);
       row.addEventListener("click", () => {
         selectedPickerId = picker.id;
         selectImage(image);
@@ -3642,6 +3651,52 @@ function updatePickerPanel() {
   }
 
   pickerCopyText.value = pickerCopyTextValue(rows);
+  pickerRows.scrollTop = savedScrollTop;
+  updateHoveredPickerUi();
+}
+
+function requestHoveredPickerUi({ scroll = false } = {}) {
+  hoveredPickerUiScroll ||= scroll;
+  if (hoveredPickerUiPending) return;
+  hoveredPickerUiPending = true;
+  requestAnimationFrame(() => {
+    hoveredPickerUiPending = false;
+    const shouldScroll = hoveredPickerUiScroll;
+    hoveredPickerUiScroll = false;
+    updateHoveredPickerUi({ scroll: shouldScroll });
+  });
+}
+
+function updateHoveredPickerUi({ scroll = false } = {}) {
+  const hovered = allPickers().find(({ picker }) => picker.id === hoveredPickerId) || null;
+  for (const row of pickerRows.querySelectorAll(".picker-row.hovered")) {
+    row.classList.remove("hovered");
+  }
+  if (!hovered) {
+    hoveredPickerValue.textContent = "";
+    return;
+  }
+
+  const row = pickerRows.querySelector(`[data-picker-id="${hovered.picker.id}"]`);
+  row?.classList.add("hovered");
+  if (scroll && row && activePanelTab === "pickers") {
+    const listRect = pickerRows.getBoundingClientRect();
+    const rowRect = row.getBoundingClientRect();
+    if (rowRect.top < listRect.top) {
+      pickerRows.scrollTop -= listRect.top - rowRect.top;
+    } else if (rowRect.bottom > listRect.bottom) {
+      pickerRows.scrollTop += rowRect.bottom - listRect.bottom;
+    }
+  }
+
+  const currentHoverId = hovered.picker.id;
+  const linear = readDisplayedLinear(hovered.image, hovered.picker.x, hovered.picker.y, () => {
+    if (hoveredPickerId === currentHoverId) requestHoveredPickerUi();
+  });
+  const modeLabel = { linear: "Linear", srgb: "sRGB", srgb255: "sRGB 255" }[pickerValueMode.value] || pickerValueMode.value;
+  hoveredPickerValue.textContent = linear
+    ? `P${hovered.picker.id} ${modeLabel}: ${formatPickerValue(hovered.image, valuesFromLinear(linear))}`
+    : `P${hovered.picker.id} ${modeLabel}: Loading...`;
 }
 
 function pickerCopyTextValue(rows) {

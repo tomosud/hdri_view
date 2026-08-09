@@ -559,6 +559,12 @@ textarea {
   box-shadow: inset 2px 0 #35d0ff;
 }
 
+.picker-row.hovered {
+  background: rgba(255, 54, 94, 0.18);
+  box-shadow: inset 3px 0 #ff365e;
+  color: #fff;
+}
+
 .picker-marker-chip,
 .sample-chip {
   width: 14px;
@@ -791,13 +797,19 @@ button:hover {
 
 .statusbar {
   display: grid;
-  grid-template-columns: 120px minmax(0, 1fr) minmax(0, 1fr) 76px;
+  grid-template-columns: 120px minmax(0, 1fr) minmax(180px, 1.2fr) minmax(0, 1fr) 76px;
   gap: 12px;
   padding: 0 10px;
   border-top: 1px solid var(--line);
   color: var(--muted);
   font-family: Consolas, "Courier New", monospace;
   font-size: 12px;
+}
+
+#hoveredPickerValue {
+  color: #ff365e;
+  font-weight: 700;
+  text-align: center;
 }
 
 .statusbar div {
@@ -1037,6 +1049,7 @@ button:hover {
     grid-template-columns: 96px minmax(0, 1fr);
   }
 
+  #linearValue,
   #srgbValue,
   #viewState {
     display: none;
