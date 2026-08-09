@@ -18,7 +18,7 @@ https://tomosud.github.io/hdri_view/
 ## できること
 
 - PNG / JPEG / WebP / AVIF / GIF / BMP / **JPEG 2000 (JP2/J2K, 1/3ch, 1〜16bit)** / **TIFF / BigTIFF（LZW・Deflate・PackBits・JPEGなど）** に加え、**HDR (Radiance)** / **EXR (OpenEXR)** をブラウザ上でそのまま開ける
-- 16,777,216画素を超える巨大な非インターレース8/16bit Gray / Gray+Alpha / RGB(A) PNGは、メモリ枯渇を避けるため縮小プレビューとして読み込む
+- 16,777,216画素を超える非インターレース8/16bit Gray / Gray+Alpha / RGB(A) PNGは、Worker内で元ビット深度の512pxタイルへストリーム展開し、原寸のまま表示する
 - 通常表示は512pxタイルとズーム率に応じたMipレベルだけを生成・LRUキャッシュし、巨大な表示用Canvasを作らない
 - カーソル位置の **linear値 / sRGB値** をステータスバーにリアルタイム表示
 - 複数の画像をウィンドウとして並べて比較
@@ -206,12 +206,12 @@ GPU メモリと readPixels によるフリーズを避けるため、GLSL の�
 
 - ビルド不要の静的サイト（GitHub Pages でホスト可能）
 - [three.js](https://threejs.org/) の `EXRLoader` / `RGBELoader` を利用して HDR/EXR を読み込み
-- PNG は `png-decoder.js` で自前デコード（後述）
-- TIFF はMITライセンスの GeoTIFF.js 3.0.5をWorkerで実行し、LZW・Deflate・PackBits・JPEGなどの圧縮、strip/tile、整数・浮動小数点サンプルを読み込む
-- JPEG 2000 はMITライセンスの `@cornerstonejs/codec-openjpeg` 1.3.0（OpenJPEG純JS版）をWorkerで実行し、巨大画像はwaveletサブ解像度で読み込む
+- PNG は小～中画像を `png-decoder.js`、巨大画像を `png-tile-worker.js` で自前デコードし、巨大画像は圧縮ファイル全体やRGBA Float32全体を確保しない
+- TIFF はMITライセンスの GeoTIFF.js 3.0.5を常駐Workerで実行し、表示・ピッカー・選択範囲に必要な領域だけを読む。LZW・Deflate・PackBits・JPEGなどの圧縮、strip/tile、整数・浮動小数点サンプルに対応する
+- JPEG 2000 はMITライセンスの `@cornerstonejs/codec-openjpeg` 1.3.0（OpenJPEG純JS版）をWorkerで実行する。Codecの安全メモリ内に収まる画像は原寸タイル表示し、領域デコードAPIが未公開の巨大画像はwaveletサブ解像度へフォールバックする
 - HDRI Value Matrix は `clipboard-matrix.js` でシリアライズ／解析
 - GLSL 加工・生成は `glsl-runtime.js`（WebGL2 を直接使用、RGBA32F の FBO に描いて `readPixels`）
-- 通常画像の表示は `app.js` の512pxタイルコンポジタ（Mip選択、96タイルLRU）を使用
+- 通常画像の表示は `raster-source.js` の共通画素ソースと `app.js` の512pxタイルコンポジタ（Mip選択、raw/display二段LRU）を使用。メモリ・ImageBitmap・非同期Workerを同じプロトコルで扱い、表示・ピッカー・範囲選択は同じ画素ソースを参照する
 - 選択範囲の集計処理は Web Worker（`selection-worker.js`）にオフロード
 
 ### 値の正確性について

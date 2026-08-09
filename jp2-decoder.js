@@ -1,4 +1,7 @@
+import { createWorkerRasterSource } from "./raster-source.js?v=20260809-4";
+
 const DEFAULT_MAX_PIXELS = 4096 * 4096;
+const MAX_FULL_RESOLUTION_SAMPLE_BYTES = 256 * 1024 * 1024;
 
 export function inspectJpeg2000(source) {
   const bytes = source instanceof Uint8Array ? source : new Uint8Array(source);
@@ -85,5 +88,62 @@ export function decodeJpeg2000(source, { maxPixels = DEFAULT_MAX_PIXELS, onProgr
       reject(new Error(event.message || "JPEG 2000 worker failed."));
     });
     worker.postMessage({ type: "decode", buffer, level }, [buffer]);
+  });
+}
+
+export function openJpeg2000RasterSource(source, { onProgress = null, maxPreviewPixels = 4_194_304 } = {}) {
+  const buffer = source instanceof ArrayBuffer
+    ? source
+    : source.buffer.slice(source.byteOffset, source.byteOffset + source.byteLength);
+  const info = inspectJpeg2000(buffer);
+  const decodedSampleBytes = info.width * info.height * info.components * (info.bitDepth <= 8 ? 1 : 2);
+  if (decodedSampleBytes > MAX_FULL_RESOLUTION_SAMPLE_BYTES) {
+    return Promise.reject(new Error(
+      `Full-resolution JPEG 2000 needs about ${Math.ceil(decodedSampleBytes / 1048576)} MiB before codec working memory; using wavelet sub-resolution.`
+    ));
+  }
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL("./jp2-worker.js?v=20260809-3", import.meta.url));
+    const initId = 0;
+    const onMessage = (event) => {
+      const message = event.data || {};
+      if (message.id !== initId) return;
+      if (message.type === "progress") {
+        onProgress?.(message.progress, message.label);
+        return;
+      }
+      worker.removeEventListener("message", onMessage);
+      worker.removeEventListener("error", onError);
+      if (message.type === "error") {
+        worker.terminate();
+        reject(new Error(message.message || "JPEG 2000 tiled source initialization failed."));
+        return;
+      }
+      const result = message.result || {};
+      const preview = {
+        width: result.previewWidth,
+        height: result.previewHeight,
+        pixels: new Float32Array(result.previewPixels)
+      };
+      const rasterSource = createWorkerRasterSource(worker, {
+        width: result.width,
+        height: result.height,
+        format: info.container,
+        bitDepth: result.bitDepth,
+        components: result.components,
+        signed: result.signed,
+        initialPreview: preview
+      });
+      resolve({ ...info, ...result, preview, rasterSource });
+    };
+    const onError = (event) => {
+      worker.removeEventListener("message", onMessage);
+      worker.removeEventListener("error", onError);
+      worker.terminate();
+      reject(new Error(event.message || "JPEG 2000 tiled source worker failed."));
+    };
+    worker.addEventListener("message", onMessage);
+    worker.addEventListener("error", onError);
+    worker.postMessage({ id: initId, type: "raster-init", buffer, maxPreviewPixels }, [buffer]);
   });
 }

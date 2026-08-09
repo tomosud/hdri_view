@@ -1,9 +1,11 @@
 import * as THREE from "three";
 import { EXRLoader } from "three/addons/loaders/EXRLoader.js";
 import { HDRLoader } from "three/addons/loaders/HDRLoader.js";
-import { decodePng, isPngFile, pngTypeLabel } from "./png-decoder.js?v=20260809-6";
-import { decodeTiff } from "./tiff-decoder.js?v=20260809-3";
-import { decodeJpeg2000 } from "./jp2-decoder.js?v=20260809-2";
+import { decodePng, isPngFile, pngTypeLabel } from "./png-decoder.js?v=20260809-7";
+import { canOpenPngAsTiles, openPngRasterSource } from "./png-raster-source.js?v=20260809-1";
+import { decodeTiff, openTiffRasterSource } from "./tiff-decoder.js?v=20260809-5";
+import { decodeJpeg2000, openJpeg2000RasterSource } from "./jp2-decoder.js?v=20260809-5";
+import { createBitmapRasterSource, createMemoryRasterSource, RASTER_TILE_SIZE } from "./raster-source.js?v=20260809-4";
 import {
   MAX_VALUE_MATRIX_PIXELS,
   isValueMatrixText,
@@ -180,11 +182,14 @@ copySelectionMatrixButton.addEventListener("click", () => {
 });
 
 logDisplayButton.addEventListener("click", () => {
-  logDisplayMode = !logDisplayMode;
-  updateLogDisplayButton();
-  for (const image of images) {
+  const image = currentImage();
+  if (image) {
+    image.settings.logDisplay = !image.settings.logDisplay;
     image.displayDirty = true;
+  } else {
+    logDisplayMode = !logDisplayMode;
   }
+  updateLogDisplayButton();
   requestRender();
   requestSelectionGraphDraw();
   scheduleSessionSave();
@@ -193,12 +198,12 @@ logDisplayButton.addEventListener("click", () => {
 selectionSummary.addEventListener("pointerdown", (event) => event.stopPropagation());
 selectionSummary.addEventListener("copy", (event) => event.stopPropagation());
 
-downloadSelectionCsvButton.addEventListener("click", () => {
+downloadSelectionCsvButton.addEventListener("click", async () => {
   const image = currentImage();
   if (!image?.selection) {
     return;
   }
-  const csv = selectionCsvText(image, image.selection);
+  const csv = await selectionCsvText(image, image.selection);
   downloadBytes(new TextEncoder().encode(csv), `${stripExtension(image.name)}_selection.csv`, "text/csv;charset=utf-8");
 });
 
@@ -222,7 +227,10 @@ clearPickersButton.addEventListener("click", () => {
 saveImageButton.addEventListener("click", () => {
   const image = currentImage();
   if (image) {
-    saveImage(image, saveFormatSelect.value);
+    void saveImage(image, saveFormatSelect.value).catch((error) => {
+      console.error("Save failed.", error);
+      fileHint.textContent = `Save failed: ${error?.message || error}`;
+    });
   }
 });
 
@@ -927,6 +935,30 @@ async function loadImageFile(file) {
 }
 
 async function loadJpeg2000Image(file) {
+  try {
+    const opened = await openJpeg2000RasterSource(await file.arrayBuffer(), {
+      onProgress: (progress, label) => {
+        fileHint.textContent = `${file.name}: ${label || `${progress}%`}`;
+      }
+    });
+    const channels = opened.components === 1 ? "gray" : "rgb";
+    return createImageRecord(
+      file,
+      opened.width,
+      opened.height,
+      `jpeg2000/${channels}${opened.bitDepth}`,
+      null,
+      "raster",
+      {
+        format: opened.container,
+        bitDepth: `${opened.bitDepth}-bit`,
+        rasterSource: opened.rasterSource,
+        range: computeRange(opened.preview.pixels)
+      }
+    );
+  } catch (error) {
+    console.warn("Full-resolution JPEG 2000 tiled source unavailable; using sub-resolution compatibility decode.", error);
+  }
   const decoded = await decodeJpeg2000(await file.arrayBuffer(), {
     maxPixels: maxLoadedPngPixels,
     onProgress: (progress, label) => {
@@ -952,6 +984,26 @@ async function loadJpeg2000Image(file) {
 }
 
 async function loadTiffImage(file) {
+  try {
+    const opened = await openTiffRasterSource(file);
+    return createImageRecord(
+      file,
+      opened.width,
+      opened.height,
+      `tiff/${opened.channels}${opened.bitDepth}`,
+      null,
+      "raster",
+      {
+        format: "TIFF",
+        bitDepth: opened.bitDepthLabel || `${opened.bitDepth}-bit`,
+        rasterSource: opened.rasterSource,
+        range: computeRange(opened.preview.pixels),
+        hdr: opened.sampleFormat === 3
+      }
+    );
+  } catch (error) {
+    console.warn("TIFF tiled source unavailable; using compatibility decode.", error);
+  }
   const decoded = await decodeTiff(await file.arrayBuffer(), {
     onProgress: (progress, label) => {
       fileHint.textContent = `${file.name}: ${label || `${progress}%`}`;
@@ -982,10 +1034,34 @@ async function loadRasterImage(file) {
 async function loadPngExact(file) {
   let bytes;
   try {
-    // まず先頭 8 バイトだけ見てシグネチャを判定し、PNG のときだけ全体を読む
-    const head = new Uint8Array(await file.slice(0, 8).arrayBuffer());
+    // IHDRまでを先に見て、巨大な非インタレースPNGは全ファイルArrayBuffer化せずWorkerタイル経路へ送る
+    const head = new Uint8Array(await file.slice(0, 29).arrayBuffer());
     if (!isPngFile(head)) {
       return null;
+    }
+    if (canOpenPngAsTiles(head, maxLoadedPngPixels)) {
+      const opened = await openPngRasterSource(file, {
+        onProgress: (progress, label) => {
+          fileHint.textContent = `${file.name}: ${label || `${progress}%`}`;
+        }
+      });
+      const record = createImageRecord(
+        file,
+        opened.width,
+        opened.height,
+        pngTypeLabel(opened),
+        null,
+        "raster",
+        {
+          format: "PNG",
+          bitDepth: `${opened.bitDepth}-bit`,
+          rasterSource: opened.rasterSource,
+          range: computeRange(opened.preview.pixels)
+        }
+      );
+      const note = pngTransferNote(opened);
+      if (note) record.type = `${record.type} ${note}`;
+      return record;
     }
     bytes = new Uint8Array(await file.arrayBuffer());
   } catch (error) {
@@ -1019,15 +1095,36 @@ async function loadPngExact(file) {
     pixels[i + 2] = toLinear[Math.round(pixels[i + 2] * sampleMax)];
   }
 
-  const record = createImageRecord(file, decoded.width, decoded.height, pngTypeLabel(decoded), pixels, "raster");
+  let record;
+  const canUseFullBitmapTiles = decoded.downsample > 1 && decoded.sourceWidth * decoded.sourceHeight <= 100_000_000;
+  if (canUseFullBitmapTiles) {
+    try {
+      const bitmap = await createImageBitmap(file, { colorSpaceConversion: "none" }).catch(() => createImageBitmap(file));
+      const rasterSource = createBitmapRasterSource(bitmap);
+      record = createImageRecord(file, decoded.sourceWidth, decoded.sourceHeight, pngTypeLabel(decoded), null, "raster", {
+        rasterSource,
+        range: computeRange(pixels)
+      });
+      record.type = `${record.type} (full-resolution Canvas tiles; measured values 8-bit)`;
+    } catch (error) {
+      console.warn("Full-resolution PNG bitmap failed; using decoded preview.", error);
+      record = createImageRecord(file, decoded.width, decoded.height, pngTypeLabel(decoded), pixels, "raster");
+      record.type = `${record.type}/preview`;
+      record.sourceWidth = decoded.sourceWidth;
+      record.sourceHeight = decoded.sourceHeight;
+      record.downsample = decoded.downsample;
+    }
+  } else if (decoded.downsample > 1) {
+    record = createImageRecord(file, decoded.width, decoded.height, pngTypeLabel(decoded), pixels, "raster");
+    record.type = `${record.type}/preview (full-resolution bitmap exceeds browser memory limit)`;
+    record.sourceWidth = decoded.sourceWidth;
+    record.sourceHeight = decoded.sourceHeight;
+    record.downsample = decoded.downsample;
+  } else {
+    record = createImageRecord(file, decoded.width, decoded.height, pngTypeLabel(decoded), pixels, "raster");
+  }
   record.format = "PNG";
   record.bitDepth = `${decoded.bitDepth}-bit`;
-  record.sourceWidth = decoded.sourceWidth;
-  record.sourceHeight = decoded.sourceHeight;
-  record.downsample = decoded.downsample;
-  if (decoded.downsample > 1) {
-    record.type = `${record.type}/preview`;
-  }
   const note = pngTransferNote(decoded);
   if (note) {
     record.type = `${record.type} ${note}`;
@@ -1050,28 +1147,13 @@ function pngTransferNote(decoded) {
 async function loadCanvasRasterImage(file) {
   const metadata = await rasterFileMetadata(file);
   const bitmap = await createImageBitmap(file, { colorSpaceConversion: "none" }).catch(() => createImageBitmap(file));
-  const sourceCanvas = document.createElement("canvas");
-  sourceCanvas.width = bitmap.width;
-  sourceCanvas.height = bitmap.height;
-  const sourceCtx = sourceCanvas.getContext("2d", { willReadFrequently: true });
-  sourceCtx.drawImage(bitmap, 0, 0);
-  bitmap.close?.();
-
-  const imageData = sourceCtx.getImageData(0, 0, sourceCanvas.width, sourceCanvas.height);
-  const toLinear = new Float32Array(256);
-  for (let sample = 0; sample < 256; sample += 1) {
-    toLinear[sample] = srgbToLinear(sample / 255);
-  }
-
-  const pixels = new Float32Array(sourceCanvas.width * sourceCanvas.height * 4);
-  for (let i = 0, j = 0; i < imageData.data.length; i += 4, j += 4) {
-    pixels[j] = toLinear[imageData.data[i]];
-    pixels[j + 1] = toLinear[imageData.data[i + 1]];
-    pixels[j + 2] = toLinear[imageData.data[i + 2]];
-    pixels[j + 3] = imageData.data[i + 3] / 255;
-  }
-
-  const record = createImageRecord(file, sourceCanvas.width, sourceCanvas.height, "raster/srgb", pixels, "raster", metadata);
+  const rasterSource = createBitmapRasterSource(bitmap);
+  const preview = rasterSource.readPreview(1024);
+  const record = createImageRecord(file, bitmap.width, bitmap.height, "raster/srgb", null, "raster", {
+    ...metadata,
+    rasterSource,
+    range: computeRange(preview.pixels)
+  });
   if (record.range.min[3] < 1) {
     // Canvas 経路は premultiplied alpha の往復を通るため、半透明画素の RGB は
     // ファイルの値と一致しない（alpha が小さいほど誤差が大きい）。計測前に気付けるよう明示する。
@@ -1262,7 +1344,8 @@ function extractTextureData(parsed) {
 function createImageRecord(file, width, height, type, pixels, sourceFormat = "raster", metadata = {}) {
   const id = nextId;
   nextId += 1;
-  const range = computeRange(pixels);
+  const rasterSource = metadata.rasterSource || createMemoryRasterSource(pixels, width, height);
+  const range = metadata.range || computeRange(pixels);
   return {
     id,
     name: file.name,
@@ -1277,9 +1360,11 @@ function createImageRecord(file, width, height, type, pixels, sourceFormat = "ra
     bitDepth: metadata.bitDepth || (sourceFormat === "glsl" || sourceFormat === "values" ? "32F" : ""),
     source: { kind: "external", name: file.name },
     pixels,
+    rasterSource,
     range,
     settings: {
-      autoLevel: sourceFormat === "hdr" || sourceFormat === "exr",
+      autoLevel: false,
+      logDisplay: metadata.hdr ?? (sourceFormat === "hdr" || sourceFormat === "exr"),
       brightness: 1,
       // UE 書き出しの EXR などアルファが全面 0 の画像は RGBA 表示だと真っ黒になるため RGB を既定にする
       channel: range.max[3] > 0 ? "rgba" : "rgb",
@@ -1644,6 +1729,13 @@ function closeImage(image) {
     return;
   }
   image.elements?.frame.remove();
+  const rasterSources = new Set([
+    image.rasterSource,
+    image.original?.rasterSource,
+    image.glsl?.rasterSource
+  ]);
+  rasterSources.forEach((source) => source?.dispose?.());
+  image.displayTileCache?.clear();
   images.splice(index, 1);
   if (glslTargetId === image.id) {
     closeGlslEditor();
@@ -1690,6 +1782,7 @@ function imageVariant(image) {
     bitDepth: image.bitDepth,
     name: image.name,
     pixels: image.pixels,
+    rasterSource: image.rasterSource,
     range: image.range
   };
 }
@@ -1708,6 +1801,7 @@ function glslVariant(code, pixels, width, height) {
     format: "GLSL",
     bitDepth: "32F",
     pixels,
+    rasterSource: createMemoryRasterSource(pixels, width, height),
     range: computeRange(pixels)
   };
 }
@@ -1718,25 +1812,39 @@ function glslInputPayload(image) {
     return null;
   }
   const dimensions = fitLongEdge(input.width, input.height, 4096);
-  if (dimensions.width === input.width && dimensions.height === input.height) {
+  if (input.pixels && dimensions.width === input.width && dimensions.height === input.height) {
     return { pixels: input.pixels, width: input.width, height: input.height, key: `${image.id}:original` };
   }
   const cached = image.glslInputPreview;
   if (
-    cached?.sourcePixels === input.pixels
+    cached?.sourceIdentity === input.rasterSource
     && cached.width === dimensions.width
     && cached.height === dimensions.height
   ) {
     return cached.payload;
   }
-  const pixels = resampleLinearPixels(input.pixels, input.width, input.height, dimensions.width, dimensions.height);
+  let pixels;
+  if (input.pixels) {
+    pixels = resampleLinearPixels(input.pixels, input.width, input.height, dimensions.width, dimensions.height);
+  } else if (typeof input.rasterSource?.readPreview === "function") {
+    const preview = input.rasterSource.readPreview(4096);
+    pixels = preview.width === dimensions.width && preview.height === dimensions.height
+      ? preview.pixels
+      : resampleLinearPixels(preview.pixels, preview.width, preview.height, dimensions.width, dimensions.height);
+  } else {
+    const materialized = input.rasterSource?.materialize?.();
+    if (!(materialized instanceof Float32Array)) {
+      throw new Error("This image source cannot provide GLSL input pixels.");
+    }
+    pixels = resampleLinearPixels(materialized, input.width, input.height, dimensions.width, dimensions.height);
+  }
   const payload = {
     pixels,
     width: dimensions.width,
     height: dimensions.height,
     key: `${image.id}:original-preview-${dimensions.width}x${dimensions.height}`
   };
-  image.glslInputPreview = { sourcePixels: input.pixels, width: dimensions.width, height: dimensions.height, payload };
+  image.glslInputPreview = { sourceIdentity: input.rasterSource, width: dimensions.width, height: dimensions.height, payload };
   return payload;
 }
 
@@ -1794,6 +1902,7 @@ function applyImageVariant(image, mode) {
   image.format = variant.format;
   image.bitDepth = variant.bitDepth;
   image.pixels = variant.pixels;
+  image.rasterSource = variant.rasterSource;
   image.range = variant.range;
   image.displayCanvas = null;
   image.displayDirty = true;
@@ -2137,9 +2246,12 @@ function runGlslNow() {
 
 function applyGlslResult(image, pixels, width, height, code) {
   const sizeChanged = image.width !== width || image.height !== height;
+  const rasterSource = createMemoryRasterSource(pixels, width, height);
+  image.glsl?.rasterSource?.dispose?.();
   image.width = width;
   image.height = height;
   image.pixels = pixels;
+  image.rasterSource = rasterSource;
   image.range = computeRange(pixels);
   image.type = "glsl/linear";
   image.sourceFormat = "glsl";
@@ -2162,6 +2274,7 @@ function applyGlslResult(image, pixels, width, height, code) {
     sourceFormat: image.sourceFormat,
     format: image.format,
     bitDepth: image.bitDepth,
+    rasterSource,
     range: image.range,
     statusKind: "ok",
     status: "Ready."
@@ -2463,7 +2576,7 @@ async function copySelection(image, rect, clipboardData = null) {
     bitDepth: image.bitDepth,
     width: rect.width,
     height: rect.height,
-    pixels: cropPixels(image, rect)
+    pixels: await cropPixels(image, rect)
   };
 
   const portable = rect.width * rect.height <= portableClipboardMatrixPixels;
@@ -2493,7 +2606,7 @@ async function copySelection(image, rect, clipboardData = null) {
     return;
   }
 
-  const canvas = makeRawCanvas(image, rect);
+  const canvas = await makeRawCanvas(image, rect);
   try {
     await writeCanvasToClipboard(canvas, matrixText);
     fileHint.textContent = `Copied ${rect.width} x ${rect.height}`;
@@ -2512,32 +2625,27 @@ function isHdrImage(image) {
     image.sourceFormat === "values";
 }
 
-function cropPixels(image, rect) {
-  const pixels = new Float32Array(rect.width * rect.height * 4);
-  for (let y = 0; y < rect.height; y += 1) {
-    const sourceStart = ((rect.y + y) * image.width + rect.x) * 4;
-    const targetStart = y * rect.width * 4;
-    pixels.set(image.pixels.subarray(sourceStart, sourceStart + rect.width * 4), targetStart);
-  }
-  return pixels;
+async function cropPixels(image, rect) {
+  return await image.rasterSource.copyRegion(rect);
 }
 
-function makeRawCanvas(image, rect = null) {
+async function makeRawCanvas(image, rect = null) {
   const sourceRect = rect || { x: 0, y: 0, width: image.width, height: image.height };
   const canvas = document.createElement("canvas");
   canvas.width = sourceRect.width;
   canvas.height = sourceRect.height;
   const ctx = canvas.getContext("2d");
   const imageData = ctx.createImageData(sourceRect.width, sourceRect.height);
+  const pixels = await image.rasterSource.copyRegion(sourceRect);
 
   for (let y = 0; y < sourceRect.height; y += 1) {
     for (let x = 0; x < sourceRect.width; x += 1) {
-      const sourceIndex = ((sourceRect.y + y) * image.width + sourceRect.x + x) * 4;
+      const sourceIndex = (y * sourceRect.width + x) * 4;
       const targetIndex = (y * sourceRect.width + x) * 4;
-      imageData.data[targetIndex] = linearToSrgbByte(image.pixels[sourceIndex]);
-      imageData.data[targetIndex + 1] = linearToSrgbByte(image.pixels[sourceIndex + 1]);
-      imageData.data[targetIndex + 2] = linearToSrgbByte(image.pixels[sourceIndex + 2]);
-      imageData.data[targetIndex + 3] = Math.round(clamp01(image.pixels[sourceIndex + 3]) * 255);
+      imageData.data[targetIndex] = linearToSrgbByte(pixels[sourceIndex]);
+      imageData.data[targetIndex + 1] = linearToSrgbByte(pixels[sourceIndex + 1]);
+      imageData.data[targetIndex + 2] = linearToSrgbByte(pixels[sourceIndex + 2]);
+      imageData.data[targetIndex + 3] = Math.round(clamp01(pixels[sourceIndex + 3]) * 255);
     }
   }
 
@@ -2583,9 +2691,6 @@ function pasteClipboardPixels(copied, sourceLabel = "values") {
     { format: copied.format, bitDepth: copied.bitDepth }
   );
   image.source = { kind: "embedded" };
-  if (image.range.rgbMin < 0 || image.range.rgbMax > 1) {
-    image.settings.autoLevel = true;
-  }
   images.push(image);
   createImageWindow(image, null, 0);
   selectImage(image);
@@ -2596,7 +2701,7 @@ function pasteClipboardPixels(copied, sourceLabel = "values") {
   scheduleSessionSave();
 }
 
-function saveImage(image, format) {
+async function saveImage(image, format) {
   if (!allowedSaveFormats(image).includes(format)) {
     fileHint.textContent = "Save format is locked to the source format.";
     return;
@@ -2605,17 +2710,19 @@ function saveImage(image, format) {
     if (!confirmHdrSave(image)) {
       return;
     }
-    downloadBytes(encodeHdr(image), `${stripExtension(image.name)}.hdr`, "image/vnd.radiance");
+    const pixels = image.pixels || await materializeImagePixels(image);
+    downloadBytes(encodeHdr(image, pixels), `${stripExtension(image.name)}.hdr`, "image/vnd.radiance");
     return;
   }
   if (format === "exr") {
-    downloadBytes(encodeExr(image), `${stripExtension(image.name)}.exr`, "image/aces");
+    const pixels = image.pixels || await materializeImagePixels(image);
+    downloadBytes(encodeExr(image, pixels), `${stripExtension(image.name)}.exr`, "image/aces");
     return;
   }
 
   const mime = format === "jpeg" ? "image/jpeg" : format === "webp" ? "image/webp" : "image/png";
   const extension = format === "jpeg" ? "jpg" : format;
-  const canvas = makeRawCanvas(image);
+  const canvas = await makeRawCanvas(image);
   canvas.toBlob((blob) => {
     if (!blob) {
       fileHint.textContent = "Save failed.";
@@ -2630,22 +2737,31 @@ function saveImage(image, format) {
   }, mime, 0.95);
 }
 
-function encodeHdr(image) {
+async function materializeImagePixels(image) {
+  fileHint.textContent = `${image.name}: preparing full-resolution pixels...`;
+  const pixels = await image.rasterSource?.materialize?.();
+  if (!(pixels instanceof Float32Array) || pixels.length !== image.width * image.height * 4) {
+    throw new Error("Full-resolution pixels are unavailable for this image.");
+  }
+  return pixels;
+}
+
+function encodeHdr(image, sourcePixels = image.pixels) {
   const header = `#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y ${image.height} +X ${image.width}\n`;
   const headerBytes = new TextEncoder().encode(header);
-  const pixels = new Uint8Array(image.width * image.height * 4);
+  const encodedPixels = new Uint8Array(image.width * image.height * 4);
 
-  for (let i = 0, j = 0; i < image.pixels.length; i += 4, j += 4) {
-    const rgbe = linearRgbToRgbe(image.pixels[i], image.pixels[i + 1], image.pixels[i + 2]);
-    pixels[j] = rgbe[0];
-    pixels[j + 1] = rgbe[1];
-    pixels[j + 2] = rgbe[2];
-    pixels[j + 3] = rgbe[3];
+  for (let i = 0, j = 0; i < sourcePixels.length; i += 4, j += 4) {
+    const rgbe = linearRgbToRgbe(sourcePixels[i], sourcePixels[i + 1], sourcePixels[i + 2]);
+    encodedPixels[j] = rgbe[0];
+    encodedPixels[j + 1] = rgbe[1];
+    encodedPixels[j + 2] = rgbe[2];
+    encodedPixels[j + 3] = rgbe[3];
   }
 
-  const out = new Uint8Array(headerBytes.length + pixels.length);
+  const out = new Uint8Array(headerBytes.length + encodedPixels.length);
   out.set(headerBytes, 0);
-  out.set(pixels, headerBytes.length);
+  out.set(encodedPixels, headerBytes.length);
   return out;
 }
 
@@ -2675,7 +2791,7 @@ function linearRgbToRgbe(r, g, b) {
   ];
 }
 
-function encodeExr(image) {
+function encodeExr(image, pixels = image.pixels) {
   const header = new ByteWriter();
   header.u32(20000630);
   header.u32(2);
@@ -2734,7 +2850,7 @@ function encodeExr(image) {
     for (const channelIndex of [3, 2, 1, 0]) {
       for (let x = 0; x < image.width; x += 1) {
         const sourceIndex = (y * image.width + x) * 4 + channelIndex;
-        out.f32(image.pixels[sourceIndex]);
+        out.f32(pixels[sourceIndex]);
       }
     }
   }
@@ -3444,6 +3560,17 @@ function selectionJobIsCurrent(image, rectKey, matrixKey, jobId) {
 }
 
 function copySelectionPixelsInChunks(image, rect, rectKey, matrixKey, valueMode, channels, jobId) {
+  if (image.rasterSource.asynchronous) {
+    image.rasterSource.copyRegion(rect).then((pixels) => {
+      if (selectionJobIsCurrent(image, rectKey, matrixKey, jobId)) {
+        runSelectionWorker(image, rect, rectKey, matrixKey, valueMode, channels, pixels, jobId);
+      }
+    }).catch((error) => {
+      if (jobId === selectionJobId) selectionDetailsInFlight = null;
+      console.error("Selection tile read failed.", error);
+    });
+    return;
+  }
   const pixels = new Float32Array(rect.width * rect.height * 4);
   let row = 0;
   const copyRows = () => {
@@ -3453,9 +3580,12 @@ function copySelectionPixelsInChunks(image, rect, rectKey, matrixKey, valueMode,
     }
     const deadline = performance.now() + 2;
     do {
-      const sourceStart = ((rect.y + row) * image.width + rect.x) * 4;
       const targetStart = row * rect.width * 4;
-      pixels.set(image.pixels.subarray(sourceStart, sourceStart + rect.width * 4), targetStart);
+      image.rasterSource.copyRegionInto(
+        { x: rect.x, y: rect.y + row, width: rect.width, height: 1 },
+        pixels,
+        targetStart
+      );
       row += 1;
     } while (row < rect.height && performance.now() < deadline);
 
@@ -3549,12 +3679,26 @@ function copyFullSelectionMatrix() {
   const valueMode = pickerValueMode.value;
   const channels = valueChannels(image).map((channel) => channel.index);
   const jobId = selectionMatrixCopyJobId;
-  const pixels = new Float32Array(savedRect.width * savedRect.height * 4);
-  let row = 0;
 
   selectionMatrixCopyInFlight = { image, rectKey, matrixKey, jobId };
   copySelectionMatrixButton.disabled = true;
   copySelectionMatrixButton.textContent = "Preparing...";
+
+  if (image.rasterSource.asynchronous) {
+    image.rasterSource.copyRegion(savedRect).then((resolvedPixels) => {
+      if (selectionMatrixCopyJobIsCurrent(image, matrixKey, jobId)) {
+        runFullSelectionMatrixWorker(image, savedRect, matrixKey, valueMode, channels, resolvedPixels, jobId);
+      }
+    }).catch((error) => {
+      console.error("Selection matrix tile read failed.", error);
+      cancelSelectionMatrixCopy();
+      updateSelectionPanel();
+    });
+    return;
+  }
+
+  const pixels = new Float32Array(savedRect.width * savedRect.height * 4);
+  let row = 0;
 
   const copyRows = () => {
     selectionMatrixCopyFrame = null;
@@ -3565,9 +3709,12 @@ function copyFullSelectionMatrix() {
     }
     const deadline = performance.now() + 2;
     do {
-      const sourceStart = ((savedRect.y + row) * image.width + savedRect.x) * 4;
       const targetStart = row * savedRect.width * 4;
-      pixels.set(image.pixels.subarray(sourceStart, sourceStart + savedRect.width * 4), targetStart);
+      image.rasterSource.copyRegionInto(
+        { x: savedRect.x, y: savedRect.y + row, width: savedRect.width, height: 1 },
+        pixels,
+        targetStart
+      );
       row += 1;
     } while (row < savedRect.height && performance.now() < deadline);
 
@@ -3680,9 +3827,10 @@ function formatRgbStats(values) {
   return `R ${formatNumber(values[0])}, G ${formatNumber(values[1])}, B ${formatNumber(values[2])}`;
 }
 
-function selectionCsvText(image, rect) {
+async function selectionCsvText(image, rect) {
   const mode = pickerValueMode.value;
   const channels = valueChannels(image);
+  const pixels = await image.rasterSource.copyRegion(rect);
   const lines = [["x", "y", "mode", "display", ...channels.map((channel) => channel.key)].join(",")];
   for (let y = 0; y < rect.height; y += 1) {
     for (let x = 0; x < rect.width; x += 1) {
@@ -3691,7 +3839,11 @@ function selectionCsvText(image, rect) {
         rect.y + y,
         mode,
         displayChannelLabel(image),
-        ...pixelTupleForMode(image, rect.x + x, rect.y + y, mode, channels)
+        ...valueTupleForMode(
+          valuesFromLinear(displayedLinearFromRgba(image, pixels.subarray((y * rect.width + x) * 4, (y * rect.width + x) * 4 + 4))),
+          mode,
+          channels
+        )
       ].join(","));
     }
   }
@@ -3710,8 +3862,9 @@ function requestSelectionGraphDraw() {
 }
 
 function updateLogDisplayButton() {
-  logDisplayButton.classList.toggle("active", logDisplayMode);
-  logDisplayButton.title = logDisplayMode
+  const enabled = currentImage()?.settings?.logDisplay ?? logDisplayMode;
+  logDisplayButton.classList.toggle("active", enabled);
+  logDisplayButton.title = enabled
     ? "Log color scale (click for Linear)"
     : "Linear color scale (click for Log)";
 }
@@ -3759,7 +3912,7 @@ function drawSelectionGraph() {
   const statistics = activeDrag?.kind === "selectRect" ? null : selectionGraphStatistics(image, rect);
   const min = statistics?.min ?? samples.min;
   const max = statistics?.max ?? samples.max;
-  const normalize = graphValueNormalizer(min, max, logDisplayMode ? "log" : "linear");
+  const normalize = graphValueNormalizer(min, max, image.settings.logDisplay ? "log" : "linear");
   const projector = makeGraphProjector(samples, rect, width, height, normalize);
 
   graphCtx.save();
@@ -3922,7 +4075,10 @@ function selectionGraphStatistics(image, rect) {
   };
 }
 function graphPixelValue(image, x, y) {
-  const linear = readDisplayedLinear(image, x, y);
+  const linear = readDisplayedLinear(image, x, y, requestSelectionGraphDraw);
+  if (!linear) {
+    return Number.NaN;
+  }
   return channelValueFromRgba(image.settings.channel, linear[0], linear[1], linear[2], linear[3]);
 }
 
@@ -4282,15 +4438,16 @@ function graphColor(value) {
 
 function forEachPixelInRect(image, rect, callback) {
   const alphaWeighted = usesAlphaWeightedValues(image);
+  const rgba = new Float32Array(4);
   for (let y = 0; y < rect.height; y += 1) {
     for (let x = 0; x < rect.width; x += 1) {
-      const index = ((rect.y + y) * image.width + rect.x + x) * 4;
-      const alpha = image.pixels[index + 3];
+      image.rasterSource.getPixel(rect.x + x, rect.y + y, rgba);
+      const alpha = rgba[3];
       const scale = alphaWeighted ? alpha : 1;
       callback([
-        image.pixels[index] * scale,
-        image.pixels[index + 1] * scale,
-        image.pixels[index + 2] * scale,
+        rgba[0] * scale,
+        rgba[1] * scale,
+        rgba[2] * scale,
         alpha
       ], rect.x + x, rect.y + y);
     }
@@ -4298,7 +4455,8 @@ function forEachPixelInRect(image, rect, callback) {
 }
 
 function pixelTupleForMode(image, x, y, mode, channels = valueChannels(image)) {
-  return valueTupleForMode(valuesFromLinear(readDisplayedLinear(image, x, y)), mode, channels);
+  const linear = readDisplayedLinear(image, x, y);
+  return linear ? valueTupleForMode(valuesFromLinear(linear), mode, channels) : channels.map(() => Number.NaN);
 }
 
 // RGBA 表示ではキャンバス上で色に alpha が乗った状態（黒背景との合成結果）が見えているため、
@@ -4307,14 +4465,24 @@ function usesAlphaWeightedValues(image) {
   return image.settings.channel === "rgba";
 }
 
-function readDisplayedLinear(image, x, y) {
-  const index = (y * image.width + x) * 4;
-  const alpha = image.pixels[index + 3];
+function readDisplayedLinear(image, x, y, onResolved = null) {
+  const rgba = image.rasterSource.getPixel(x, y);
+  if (rgba && typeof rgba.then === "function") {
+    rgba.then((resolved) => onResolved?.(displayedLinearFromRgba(image, resolved))).catch((error) => {
+      console.error("Pixel read failed.", error);
+    });
+    return null;
+  }
+  return displayedLinearFromRgba(image, rgba);
+}
+
+function displayedLinearFromRgba(image, rgba) {
+  const alpha = rgba[3];
   const scale = usesAlphaWeightedValues(image) ? alpha : 1;
   return [
-    image.pixels[index] * scale,
-    image.pixels[index + 1] * scale,
-    image.pixels[index + 2] * scale,
+    rgba[0] * scale,
+    rgba[1] * scale,
+    rgba[2] * scale,
     alpha
   ];
 }
@@ -4344,10 +4512,17 @@ function csvCell(value) {
 }
 
 function pickerValues(image, picker) {
-  return valuesFromLinear(readDisplayedLinear(image, picker.x, picker.y));
+  const linear = readDisplayedLinear(image, picker.x, picker.y, () => {
+    updatePickerPanel();
+    requestSelectionGraphDraw();
+  });
+  return linear ? valuesFromLinear(linear) : { ...valuesFromLinear([0, 0, 0, 0]), pending: true };
 }
 
 function formatPickerValue(image, values) {
+  if (values.pending) {
+    return "Loading...";
+  }
   const tuple = valueTupleForMode(values, pickerValueMode.value, valueChannels(image));
   return tuple.join(", ");
 }
@@ -4514,6 +4689,7 @@ function getDisplayNormalizationRange(image) {
 
 function updateSettingsPanel() {
   const image = currentImage();
+  updateLogDisplayButton();
   emptySettings.classList.toggle("hidden", Boolean(image));
   settingsForm.classList.toggle("hidden", !image);
   if (!image) {
@@ -4617,12 +4793,12 @@ function renderImage(image) {
   drawSelection(image, ctx);
 }
 
-const displayTileSize = 512;
+const displayTileSize = RASTER_TILE_SIZE;
 const displayTileGutter = 1;
 const maxCachedDisplayTiles = 96;
 
 function drawImageTiles(image, ctx, canvasWidth, canvasHeight, dpr) {
-  if (!image.pixels || image.width < 1 || image.height < 1 || image.view.scale <= 0) {
+  if (!image.rasterSource || image.width < 1 || image.height < 1 || image.view.scale <= 0) {
     return;
   }
   const cache = displayTileCache(image);
@@ -4650,6 +4826,9 @@ function drawImageTiles(image, ctx, canvasWidth, canvasHeight, dpr) {
   for (let tileY = firstTileY; tileY <= lastTileY; tileY += 1) {
     for (let tileX = firstTileX; tileX <= lastTileX; tileX += 1) {
       const tile = getDisplayTile(image, cache, level, tileX, tileY);
+      if (!tile) {
+        continue;
+      }
       const sourceX = tileX * displayTileSize * factor;
       const sourceY = tileY * displayTileSize * factor;
       const sourceWidth = Math.min(tile.width * factor, image.width - sourceX);
@@ -4686,67 +4865,53 @@ function getDisplayTile(image, cache, level, tileX, tileY) {
     cache.set(key, cached);
     return cached;
   }
-  const tile = createDisplayTile(image, level, tileX, tileY);
-  cache.set(key, tile);
-  while (cache.size > maxCachedDisplayTiles) {
-    cache.delete(cache.keys().next().value);
+  const sourceTile = image.rasterSource.getTile(level, tileX, tileY, displayTileGutter);
+  if (sourceTile && typeof sourceTile.then === "function") {
+    image.pendingDisplayTiles ||= new Map();
+    if (!image.pendingDisplayTiles.has(key)) {
+      const pending = sourceTile.then((resolved) => {
+        image.pendingDisplayTiles.delete(key);
+        const tile = createDisplayTile(image, resolved);
+        cache.set(key, tile);
+        trimDisplayTileCache(cache);
+        requestRender();
+      }).catch((error) => {
+        image.pendingDisplayTiles.delete(key);
+        console.error("Raster tile failed.", error);
+        fileHint.textContent = `Tile failed: ${error?.message || error}`;
+      });
+      image.pendingDisplayTiles.set(key, pending);
+    }
+    return null;
   }
+  const tile = createDisplayTile(image, sourceTile);
+  cache.set(key, tile);
+  trimDisplayTileCache(cache);
   return tile;
 }
 
-function createDisplayTile(image, level, tileX, tileY) {
-  const factor = 2 ** level;
-  const levelWidth = Math.ceil(image.width / factor);
-  const levelHeight = Math.ceil(image.height / factor);
-  const levelX = tileX * displayTileSize;
-  const levelY = tileY * displayTileSize;
-  const width = Math.min(displayTileSize, levelWidth - levelX);
-  const height = Math.min(displayTileSize, levelHeight - levelY);
+function trimDisplayTileCache(cache) {
+  while (cache.size > maxCachedDisplayTiles) cache.delete(cache.keys().next().value);
+}
+
+function createDisplayTile(image, sourceTile) {
+  const { width, height, gutter, stride, pixels } = sourceTile;
   const canvas = document.createElement("canvas");
-  canvas.width = width + displayTileGutter * 2;
-  canvas.height = height + displayTileGutter * 2;
+  canvas.width = width + gutter * 2;
+  canvas.height = height + gutter * 2;
   const context = canvas.getContext("2d", { alpha: false });
   const imageData = context.createImageData(canvas.width, canvas.height);
   const target = imageData.data;
   const display = displayConversion(image);
 
-  for (let tileYWithGutter = -displayTileGutter; tileYWithGutter < height + displayTileGutter; tileYWithGutter += 1) {
-    const sampleLevelY = clamp(levelY + tileYWithGutter, 0, levelHeight - 1);
-    const sourceTop = sampleLevelY * factor;
-    const sourceBottom = Math.min(image.height, sourceTop + factor);
-    for (let tileXWithGutter = -displayTileGutter; tileXWithGutter < width + displayTileGutter; tileXWithGutter += 1) {
-      const sampleLevelX = clamp(levelX + tileXWithGutter, 0, levelWidth - 1);
-      const sourceLeft = sampleLevelX * factor;
-      const sourceRight = Math.min(image.width, sourceLeft + factor);
-      const rgba = averageSourcePixel(image, sourceLeft, sourceTop, sourceRight, sourceBottom);
-      const targetX = tileXWithGutter + displayTileGutter;
-      const targetY = tileYWithGutter + displayTileGutter;
-      writeDisplayPixel(target, (targetY * canvas.width + targetX) * 4, rgba, display);
+  for (let y = 0; y < canvas.height; y += 1) {
+    for (let x = 0; x < canvas.width; x += 1) {
+      const offset = (y * canvas.width + x) * 4;
+      writeDisplayPixel(target, offset, pixels, (y * stride + x) * 4, display);
     }
   }
   context.putImageData(imageData, 0, 0);
   return { canvas, width, height };
-}
-
-function averageSourcePixel(image, left, top, right, bottom) {
-  let red = 0;
-  let green = 0;
-  let blue = 0;
-  let alpha = 0;
-  let count = 0;
-  for (let y = top; y < bottom; y += 1) {
-    let source = (y * image.width + left) * 4;
-    for (let x = left; x < right; x += 1) {
-      red += image.pixels[source];
-      green += image.pixels[source + 1];
-      blue += image.pixels[source + 2];
-      alpha += image.pixels[source + 3];
-      count += 1;
-      source += 4;
-    }
-  }
-  const scale = count > 0 ? 1 / count : 0;
-  return [red * scale, green * scale, blue * scale, alpha * scale];
 }
 
 function displayConversion(image) {
@@ -4758,13 +4923,13 @@ function displayConversion(image) {
     autoLevel: image.settings.autoLevel && width > 0,
     levelOffset: range.min,
     levelScale: width > 0 ? 1 / width : 1,
-    logNormalize: logDisplayMode ? graphValueNormalizer(range.min, range.max, "log") : null
+    logNormalize: image.settings.logDisplay ? graphValueNormalizer(range.min, range.max, "log") : null
   };
 }
 
-function writeDisplayPixel(target, offset, rgba, display) {
+function writeDisplayPixel(target, offset, source, sourceOffset, display) {
   if (display.mode === "a") {
-    let alpha = rgba[3];
+    let alpha = source[sourceOffset + 3];
     if (display.logNormalize) {
       alpha = display.logNormalize(alpha * display.brightness);
     } else if (display.autoLevel) {
@@ -4788,15 +4953,16 @@ function writeDisplayPixel(target, offset, rgba, display) {
     sourceG = sourceR;
     sourceB = sourceR;
   }
-  const values = [rgba[sourceR], rgba[sourceG], rgba[sourceB]];
   for (let channel = 0; channel < 3; channel += 1) {
+    const channelOffset = channel === 0 ? sourceR : channel === 1 ? sourceG : sourceB;
+    const value = source[sourceOffset + channelOffset];
     target[offset + channel] = display.logNormalize
-      ? Math.round(display.logNormalize(values[channel] * display.brightness) * 255)
+      ? Math.round(display.logNormalize(value * display.brightness) * 255)
       : display.autoLevel
-        ? linearToSrgbByte((values[channel] - display.levelOffset) * display.levelScale * display.brightness)
-        : linearToSrgbByte(values[channel] * display.brightness);
+        ? linearToSrgbByte((value - display.levelOffset) * display.levelScale * display.brightness)
+        : linearToSrgbByte(value * display.brightness);
   }
-  target[offset + 3] = display.mode === "rgba" ? Math.round(clamp01(rgba[3]) * 255) : 255;
+  target[offset + 3] = display.mode === "rgba" ? Math.round(clamp01(source[sourceOffset + 3]) * 255) : 255;
 }
 
 function drawPixelGrid(image, ctx, canvasWidth, canvasHeight) {
@@ -4842,83 +5008,6 @@ function drawPixelGrid(image, ctx, canvasWidth, canvasHeight) {
   ctx.setLineDash([2, 3]);
   ctx.stroke();
   ctx.restore();
-}
-
-function ensureDisplayCanvas(image) {
-  if (image.displayCanvas && !image.displayDirty) {
-    return;
-  }
-
-  const output = image.displayCanvas || document.createElement("canvas");
-  output.width = image.width;
-  output.height = image.height;
-  const outputCtx = output.getContext("2d");
-  const imageData = outputCtx.createImageData(image.width, image.height);
-  const normalizationRange = getDisplayNormalizationRange(image);
-  const normalizationWidth = normalizationRange.max - normalizationRange.min;
-  const brightness = image.settings.brightness;
-  const logNormalize = logDisplayMode
-    ? graphValueNormalizer(normalizationRange.min, normalizationRange.max, "log")
-    : null;
-
-  // チャンネル切り替えのたびに全画素を処理するので、分岐と配列確保はループの外に出す
-  const target = imageData.data;
-  const pixels = image.pixels;
-  const mode = image.settings.channel;
-  const autoLevel = image.settings.autoLevel && normalizationWidth > 0;
-  const levelOffset = normalizationRange.min;
-  const levelScale = normalizationWidth > 0 ? 1 / normalizationWidth : 1;
-
-  if (mode === "a") {
-    // アルファ単独表示は sRGB 変換せずリニアのまま濃淡にする
-    for (let i = 0, j = 0; i < pixels.length; i += 4, j += 4) {
-      let alpha = pixels[i + 3];
-      if (logNormalize) {
-        alpha = logNormalize(alpha * brightness);
-      } else if (autoLevel) {
-        alpha = clamp01((alpha - levelOffset) * levelScale * brightness);
-      } else {
-        alpha = clamp01(alpha * brightness);
-      }
-      const alphaByte = Math.round(alpha * 255);
-      target[j] = alphaByte;
-      target[j + 1] = alphaByte;
-      target[j + 2] = alphaByte;
-      target[j + 3] = 255;
-    }
-  } else {
-    // どのソースチャンネルを R/G/B に流すかを先に決めておく（単チャンネル表示はグレースケール）
-    let sourceR = 0;
-    let sourceG = 1;
-    let sourceB = 2;
-    if (mode === "r" || mode === "g" || mode === "b") {
-      sourceR = mode === "r" ? 0 : mode === "g" ? 1 : 2;
-      sourceG = sourceR;
-      sourceB = sourceR;
-    }
-    const useSourceAlpha = mode === "rgba";
-
-    for (let i = 0, j = 0; i < pixels.length; i += 4, j += 4) {
-      if (logNormalize) {
-        target[j] = Math.round(logNormalize(pixels[i + sourceR] * brightness) * 255);
-        target[j + 1] = Math.round(logNormalize(pixels[i + sourceG] * brightness) * 255);
-        target[j + 2] = Math.round(logNormalize(pixels[i + sourceB] * brightness) * 255);
-      } else if (autoLevel) {
-        target[j] = linearToSrgbByte((pixels[i + sourceR] - levelOffset) * levelScale * brightness);
-        target[j + 1] = linearToSrgbByte((pixels[i + sourceG] - levelOffset) * levelScale * brightness);
-        target[j + 2] = linearToSrgbByte((pixels[i + sourceB] - levelOffset) * levelScale * brightness);
-      } else {
-        target[j] = linearToSrgbByte(pixels[i + sourceR] * brightness);
-        target[j + 1] = linearToSrgbByte(pixels[i + sourceG] * brightness);
-        target[j + 2] = linearToSrgbByte(pixels[i + sourceB] * brightness);
-      }
-      target[j + 3] = useSourceAlpha ? Math.round(clamp01(pixels[i + 3]) * 255) : 255;
-    }
-  }
-
-  outputCtx.putImageData(imageData, 0, 0);
-  image.displayCanvas = output;
-  image.displayDirty = false;
 }
 
 function displayChannels(source, mode) {
@@ -4990,6 +5079,8 @@ function endImagePan(image, event) {
   scheduleSessionSave();
 }
 
+let pixelReadoutRequestId = 0;
+
 function updatePixelReadout(image, event) {
   const pixel = pixelFromEvent(image, event);
   if (!pixel) {
@@ -4997,17 +5088,22 @@ function updatePixelReadout(image, event) {
     return;
   }
 
-  const linear = readDisplayedLinear(image, pixel.x, pixel.y);
-  const srgb = [
-    linearToSrgb(linear[0]),
-    linearToSrgb(linear[1]),
-    linearToSrgb(linear[2]),
-    linear[3]
-  ];
-
-  pixelPosition.textContent = `x: ${pixel.x}, y: ${pixel.y}`;
-  linearValue.textContent = `Linear: ${formatTuple(linear)}`;
-  srgbValue.textContent = `sRGB: ${formatTuple(srgb)}`;
+  const requestId = ++pixelReadoutRequestId;
+  const apply = (linear) => {
+    if (requestId !== pixelReadoutRequestId || !linear) return;
+    const srgb = [linearToSrgb(linear[0]), linearToSrgb(linear[1]), linearToSrgb(linear[2]), linear[3]];
+    pixelPosition.textContent = `x: ${pixel.x}, y: ${pixel.y}`;
+    linearValue.textContent = `Linear: ${formatTuple(linear)}`;
+    srgbValue.textContent = `sRGB: ${formatTuple(srgb)}`;
+  };
+  const linear = readDisplayedLinear(image, pixel.x, pixel.y, apply);
+  if (!linear) {
+    pixelPosition.textContent = `x: ${pixel.x}, y: ${pixel.y}`;
+    linearValue.textContent = "Linear: Loading...";
+    srgbValue.textContent = "sRGB: Loading...";
+    return;
+  }
+  apply(linear);
 }
 
 function pixelFromEvent(image, event, clampToImage = false) {

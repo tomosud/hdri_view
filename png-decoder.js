@@ -154,11 +154,6 @@ async function decodeLargePngPreview(chunks, header, maxPixels) {
   const bytesPerLine = sourceWidth * filterStride;
   const sampleMax = bitDepth === 16 ? 65535 : 255;
   const output = new Float32Array(width * height * 4);
-  const accumulator = new Float64Array(width * 4);
-  const columnCounts = new Uint16Array(width);
-  for (let column = 0; column < width; column += 1) {
-    columnCounts[column] = Math.min(downsample, sourceWidth - column * downsample);
-  }
 
   const stream = new Blob(chunks.idat).stream().pipeThrough(new DecompressionStream("deflate"));
   const reader = stream.getReader();
@@ -167,7 +162,6 @@ async function decodeLargePngPreview(chunks, header, maxPixels) {
   let current = new Uint8Array(bytesPerLine);
   let streamChunk = new Uint8Array(0);
   let streamOffset = 0;
-  let rowsInBlock = 0;
 
   async function fillPacket() {
     let targetOffset = 0;
@@ -193,33 +187,22 @@ async function decodeLargePngPreview(chunks, header, maxPixels) {
       throw new Error(`Unsupported PNG filter type ${packet[0]} on row ${sourceY}.`);
     }
     unfilterRow(packet[0], packet.subarray(1), current, previous, filterStride);
-    accumulatePreviewRow(
-      current,
-      accumulator,
-      columnCounts,
-      downsample,
-      samplesPerPixel,
-      bytesPerSample,
-      sampleMax,
-      colorType,
-      chunks.transparent
-    );
-    rowsInBlock += 1;
-
-    if (rowsInBlock === downsample || sourceY === sourceHeight - 1) {
-      const outputY = Math.floor(sourceY / downsample);
-      let target = outputY * width * 4;
-      for (let column = 0; column < width; column += 1) {
-        const count = columnCounts[column] * rowsInBlock;
-        const source = column * 4;
-        output[target] = accumulator[source] / count;
-        output[target + 1] = accumulator[source + 1] / count;
-        output[target + 2] = accumulator[source + 2] / count;
-        output[target + 3] = accumulator[source + 3] / count;
-        target += 4;
-      }
-      accumulator.fill(0);
-      rowsInBlock = 0;
+    const outputY = Math.floor(sourceY / downsample);
+    const representativeY = Math.min(sourceHeight - 1, outputY * downsample + Math.floor(downsample / 2));
+    if (sourceY === representativeY) {
+      writePreviewSampleRow(
+        current,
+        output,
+        outputY,
+        width,
+        sourceWidth,
+        downsample,
+        samplesPerPixel,
+        bytesPerSample,
+        sampleMax,
+        colorType,
+        chunks.transparent
+      );
     }
 
     const swap = previous;
@@ -244,6 +227,55 @@ async function decodeLargePngPreview(chunks, header, maxPixels) {
     srgbIntent: chunks.srgbIntent,
     hasIccProfile: chunks.hasIccProfile
   };
+}
+
+function writePreviewSampleRow(
+  row,
+  output,
+  outputY,
+  outputWidth,
+  sourceWidth,
+  downsample,
+  samplesPerPixel,
+  bytesPerSample,
+  sampleMax,
+  colorType,
+  transparent
+) {
+  const inverseMax = 1 / sampleMax;
+  const pixelStride = samplesPerPixel * bytesPerSample;
+  const grayKey = transparent?.length >= 2 ? (transparent[0] << 8) | transparent[1] : -1;
+  const redKey = colorType === 2 && transparent?.length >= 6 ? (transparent[0] << 8) | transparent[1] : -1;
+  const greenKey = colorType === 2 && transparent?.length >= 6 ? (transparent[2] << 8) | transparent[3] : -1;
+  const blueKey = colorType === 2 && transparent?.length >= 6 ? (transparent[4] << 8) | transparent[5] : -1;
+  let target = outputY * outputWidth * 4;
+  for (let outputX = 0; outputX < outputWidth; outputX += 1) {
+    const sourceX = Math.min(sourceWidth - 1, outputX * downsample + Math.floor(downsample / 2));
+    const source = sourceX * pixelStride;
+    const first = bytesPerSample === 1 ? row[source] : (row[source] << 8) | row[source + 1];
+    if (colorType === 0 || colorType === 4) {
+      const value = first * inverseMax;
+      output[target] = value;
+      output[target + 1] = value;
+      output[target + 2] = value;
+      output[target + 3] = colorType === 4
+        ? (bytesPerSample === 1 ? row[source + 1] : (row[source + 2] << 8) | row[source + 3]) * inverseMax
+        : first === grayKey ? 0 : 1;
+    } else {
+      const greenOffset = source + bytesPerSample;
+      const blueOffset = source + bytesPerSample * 2;
+      const green = bytesPerSample === 1 ? row[greenOffset] : (row[greenOffset] << 8) | row[greenOffset + 1];
+      const blue = bytesPerSample === 1 ? row[blueOffset] : (row[blueOffset] << 8) | row[blueOffset + 1];
+      output[target] = first * inverseMax;
+      output[target + 1] = green * inverseMax;
+      output[target + 2] = blue * inverseMax;
+      const alphaOffset = source + bytesPerSample * 3;
+      output[target + 3] = colorType === 6
+        ? (bytesPerSample === 1 ? row[alphaOffset] : (row[alphaOffset] << 8) | row[alphaOffset + 1]) * inverseMax
+        : first === redKey && green === greenKey && blue === blueKey ? 0 : 1;
+    }
+    target += 4;
+  }
 }
 
 function unfilterRow(filterType, filtered, current, previous, filterStride) {
