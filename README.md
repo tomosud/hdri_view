@@ -17,7 +17,9 @@ https://tomosud.github.io/hdri_view/
 
 ## できること
 
-- PNG / JPEG / WebP / AVIF / GIF / BMP / **TIFF (非圧縮8/16bit)** に加え、**HDR (Radiance)** / **EXR (OpenEXR)** をブラウザ上でそのまま開ける
+- PNG / JPEG / WebP / AVIF / GIF / BMP / **JPEG 2000 (JP2/J2K, 1/3ch, 1〜16bit)** / **TIFF / BigTIFF（LZW・Deflate・PackBits・JPEGなど）** に加え、**HDR (Radiance)** / **EXR (OpenEXR)** をブラウザ上でそのまま開ける
+- 16,777,216画素を超える巨大な非インターレース8/16bit Gray / Gray+Alpha / RGB(A) PNGは、メモリ枯渇を避けるため縮小プレビューとして読み込む
+- 通常表示は512pxタイルとズーム率に応じたMipレベルだけを生成・LRUキャッシュし、巨大な表示用Canvasを作らない
 - カーソル位置の **linear値 / sRGB値** をステータスバーにリアルタイム表示
 - 複数の画像をウィンドウとして並べて比較
 - 任意の点をピックしてリストに記録、CSV としてコピー
@@ -188,15 +190,16 @@ Cosine Stripes などがあります。Box Blur はコード先頭の `radius`�
 コンパイルエラーは、自分が書いた行番号でパネル下部に表示されます。
 
 WebGL2 と `EXT_color_buffer_float` が必要です。使えない環境では理由がステータスに表示されます。
-GPU メモリと readPixels によるフリーズを避けるため、GLSL の入力と出力は最大 16,777,216 ピクセル
-（例: 4096 x 4096）です。通常の画像閲覧にはこの制限はありません。GLSL 出力画素は
+GPU メモリと readPixels によるフリーズを避けるため、GLSL の入力と出力は幅・高さとも最大4096px
+（最大 4096 x 4096）です。長辺が4096pxを超える入力はLinear空間の4Kプレビューを使用します。
+通常の画像閲覧にはこの制限はありません。GLSL 出力画素は
 セッションへ複製保存せず、コードと解像度から復元します。
 
 ## 対応フォーマット
 
 | 用途 | 形式 |
 | --- | --- |
-| 読み込み | PNG, JPEG, WebP, AVIF, GIF, BMP, TIFF (非圧縮8/16bit), HDR (Radiance), EXR (OpenEXR) |
+| 読み込み | PNG, JPEG, WebP, AVIF, GIF, BMP, JPEG 2000 (JP2/J2K), TIFF / BigTIFF, HDR (Radiance), EXR (OpenEXR) |
 | 保存 | PNG, JPEG, WebP, HDR RGBE（HDRI画像）, EXR Float（HDRI画像） |
 
 ## 技術構成
@@ -204,9 +207,11 @@ GPU メモリと readPixels によるフリーズを避けるため、GLSL の�
 - ビルド不要の静的サイト（GitHub Pages でホスト可能）
 - [three.js](https://threejs.org/) の `EXRLoader` / `RGBELoader` を利用して HDR/EXR を読み込み
 - PNG は `png-decoder.js` で自前デコード（後述）
-- TIFF は `tiff-decoder.js` で非圧縮8/16bit整数のストリップ画像を直接デコード
+- TIFF はMITライセンスの GeoTIFF.js 3.0.5をWorkerで実行し、LZW・Deflate・PackBits・JPEGなどの圧縮、strip/tile、整数・浮動小数点サンプルを読み込む
+- JPEG 2000 はMITライセンスの `@cornerstonejs/codec-openjpeg` 1.3.0（OpenJPEG純JS版）をWorkerで実行し、巨大画像はwaveletサブ解像度で読み込む
 - HDRI Value Matrix は `clipboard-matrix.js` でシリアライズ／解析
 - GLSL 加工・生成は `glsl-runtime.js`（WebGL2 を直接使用、RGBA32F の FBO に描いて `readPixels`）
+- 通常画像の表示は `app.js` の512pxタイルコンポジタ（Mip選択、96タイルLRU）を使用
 - 選択範囲の集計処理は Web Worker（`selection-worker.js`）にオフロード
 
 ### 値の正確性について

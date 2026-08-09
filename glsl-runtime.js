@@ -180,6 +180,7 @@ export const DEFAULT_GENERATOR_CODE = GLSL_PRESETS.find((preset) => preset.gener
 // MAX_TEXTURE_SIZE だけを上限にすると、環境によっては数 GB の CPU/GPU メモリを
 // 確保できてしまう。16 MP 級のスキャンを扱いつつ、無制限な確保は防ぐ。
 export const MAX_GLSL_PIXELS = 4096 * 4096;
+export const MAX_GLSL_EDGE = 4096;
 
 /** ラッパを被せた完全なフラグメントシェーダを返す（テストから使えるように export する）。 */
 export function assembleFragmentSource(userCode) {
@@ -424,6 +425,9 @@ export function runGlslShader({ code, input, width, height, time = 0 }) {
   if (outputWidth > info.maxTextureSize || outputHeight > info.maxTextureSize) {
     throw new GlslError(`Output size exceeds this GPU's texture limit (${info.maxTextureSize}).`);
   }
+  if (outputWidth > MAX_GLSL_EDGE || outputHeight > MAX_GLSL_EDGE) {
+    throw new GlslError(`Output width and height are limited to ${MAX_GLSL_EDGE}px.`);
+  }
   if (outputWidth * outputHeight > MAX_GLSL_PIXELS) {
     throw new GlslError(
       `Output is limited to ${MAX_GLSL_PIXELS.toLocaleString("en-US")} pixels (for example 4096 x 4096).`
@@ -431,6 +435,9 @@ export function runGlslShader({ code, input, width, height, time = 0 }) {
   }
   if (input && (input.width > info.maxTextureSize || input.height > info.maxTextureSize)) {
     throw new GlslError(`Input image exceeds this GPU's texture limit (${info.maxTextureSize}).`);
+  }
+  if (input && (input.width > MAX_GLSL_EDGE || input.height > MAX_GLSL_EDGE)) {
+    throw new GlslError(`Input width and height are limited to ${MAX_GLSL_EDGE}px for GLSL processing.`);
   }
   if (input && input.width * input.height > MAX_GLSL_PIXELS) {
     throw new GlslError(

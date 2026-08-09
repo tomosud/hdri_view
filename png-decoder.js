@@ -16,6 +16,15 @@ const ADAM7_Y_ORIGIN = [0, 0, 4, 0, 2, 0, 1];
 const ADAM7_X_STEP = [8, 8, 4, 4, 2, 2, 1];
 const ADAM7_Y_STEP = [8, 8, 8, 4, 4, 2, 2];
 
+const CRC_TABLE = new Uint32Array(256);
+for (let index = 0; index < CRC_TABLE.length; index += 1) {
+  let value = index;
+  for (let bit = 0; bit < 8; bit += 1) {
+    value = (value & 1) ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+  }
+  CRC_TABLE[index] = value >>> 0;
+}
+
 export function isPngFile(bytes) {
   if (!bytes || bytes.length < SIGNATURE.length) {
     return false;
@@ -28,13 +37,14 @@ export function isPngFile(bytes) {
  * 値はファイルに書かれたまま（＝符号化されたまま）で、線形化はしていない。
  *
  * @param {ArrayBuffer|Uint8Array} source
+ * @param {{maxPixels?: number}} options
  * @returns {Promise<{
  *   width: number, height: number, data: Float32Array,
  *   bitDepth: number, colorType: number, interlace: number,
  *   hasAlpha: boolean, gamma: number|null, srgbIntent: number|null, hasIccProfile: boolean
  * }>}
  */
-export async function decodePng(source) {
+export async function decodePng(source, { maxPixels = Number.POSITIVE_INFINITY } = {}) {
   const bytes = source instanceof Uint8Array ? source : new Uint8Array(source);
   if (!isPngFile(bytes)) {
     throw new Error("Not a PNG file.");
@@ -43,6 +53,15 @@ export async function decodePng(source) {
   const chunks = readChunks(bytes);
   const header = parseHeader(chunks.header);
   const { width, height, bitDepth, colorType, interlace } = header;
+
+  if (width * height > maxPixels) {
+    if (interlace !== 0 || ![8, 16].includes(bitDepth) || ![0, 2, 4, 6].includes(colorType)) {
+      const error = new Error("Huge PNG preview supports non-interlaced 8/16-bit Gray, Gray+Alpha, RGB, and RGBA data.");
+      error.code = "PNG_HUGE_UNSUPPORTED";
+      throw error;
+    }
+    return decodeLargePngPreview(chunks, header, maxPixels);
+  }
 
   const samplesPerPixel = samplesForColorType(colorType);
   const bitsPerPixel = samplesPerPixel * bitDepth;
@@ -106,6 +125,9 @@ export async function decodePng(source) {
   return {
     width,
     height,
+    sourceWidth: width,
+    sourceHeight: height,
+    downsample: 1,
     data: output,
     bitDepth,
     colorType,
@@ -119,6 +141,181 @@ export async function decodePng(source) {
     srgbIntent: chunks.srgbIntent,
     hasIccProfile: chunks.hasIccProfile
   };
+}
+
+async function decodeLargePngPreview(chunks, header, maxPixels) {
+  const { width: sourceWidth, height: sourceHeight, bitDepth, colorType } = header;
+  const downsample = Math.max(2, Math.ceil(Math.sqrt((sourceWidth * sourceHeight) / maxPixels)));
+  const width = Math.ceil(sourceWidth / downsample);
+  const height = Math.ceil(sourceHeight / downsample);
+  const samplesPerPixel = samplesForColorType(colorType);
+  const bytesPerSample = bitDepth / 8;
+  const filterStride = samplesPerPixel * bytesPerSample;
+  const bytesPerLine = sourceWidth * filterStride;
+  const sampleMax = bitDepth === 16 ? 65535 : 255;
+  const output = new Float32Array(width * height * 4);
+  const accumulator = new Float64Array(width * 4);
+  const columnCounts = new Uint16Array(width);
+  for (let column = 0; column < width; column += 1) {
+    columnCounts[column] = Math.min(downsample, sourceWidth - column * downsample);
+  }
+
+  const stream = new Blob(chunks.idat).stream().pipeThrough(new DecompressionStream("deflate"));
+  const reader = stream.getReader();
+  const packet = new Uint8Array(bytesPerLine + 1);
+  let previous = new Uint8Array(bytesPerLine);
+  let current = new Uint8Array(bytesPerLine);
+  let streamChunk = new Uint8Array(0);
+  let streamOffset = 0;
+  let rowsInBlock = 0;
+
+  async function fillPacket() {
+    let targetOffset = 0;
+    while (targetOffset < packet.length) {
+      if (streamOffset >= streamChunk.length) {
+        const next = await reader.read();
+        if (next.done) {
+          throw new Error("PNG data is truncated.");
+        }
+        streamChunk = next.value;
+        streamOffset = 0;
+      }
+      const count = Math.min(packet.length - targetOffset, streamChunk.length - streamOffset);
+      packet.set(streamChunk.subarray(streamOffset, streamOffset + count), targetOffset);
+      targetOffset += count;
+      streamOffset += count;
+    }
+  }
+
+  for (let sourceY = 0; sourceY < sourceHeight; sourceY += 1) {
+    await fillPacket();
+    if (packet[0] > 4) {
+      throw new Error(`Unsupported PNG filter type ${packet[0]} on row ${sourceY}.`);
+    }
+    unfilterRow(packet[0], packet.subarray(1), current, previous, filterStride);
+    accumulatePreviewRow(
+      current,
+      accumulator,
+      columnCounts,
+      downsample,
+      samplesPerPixel,
+      bytesPerSample,
+      sampleMax,
+      colorType,
+      chunks.transparent
+    );
+    rowsInBlock += 1;
+
+    if (rowsInBlock === downsample || sourceY === sourceHeight - 1) {
+      const outputY = Math.floor(sourceY / downsample);
+      let target = outputY * width * 4;
+      for (let column = 0; column < width; column += 1) {
+        const count = columnCounts[column] * rowsInBlock;
+        const source = column * 4;
+        output[target] = accumulator[source] / count;
+        output[target + 1] = accumulator[source + 1] / count;
+        output[target + 2] = accumulator[source + 2] / count;
+        output[target + 3] = accumulator[source + 3] / count;
+        target += 4;
+      }
+      accumulator.fill(0);
+      rowsInBlock = 0;
+    }
+
+    const swap = previous;
+    previous = current;
+    current = swap;
+  }
+  await reader.cancel();
+
+  return {
+    width,
+    height,
+    sourceWidth,
+    sourceHeight,
+    downsample,
+    data: output,
+    bitDepth,
+    colorType,
+    sampleMax,
+    interlace: 0,
+    hasAlpha: colorType === 6,
+    gamma: chunks.gamma,
+    srgbIntent: chunks.srgbIntent,
+    hasIccProfile: chunks.hasIccProfile
+  };
+}
+
+function unfilterRow(filterType, filtered, current, previous, filterStride) {
+  for (let index = 0; index < filtered.length; index += 1) {
+    const rawValue = filtered[index];
+    const left = index >= filterStride ? current[index - filterStride] : 0;
+    const up = previous[index];
+    const upLeft = index >= filterStride ? previous[index - filterStride] : 0;
+    let value;
+    switch (filterType) {
+      case 0: value = rawValue; break;
+      case 1: value = rawValue + left; break;
+      case 2: value = rawValue + up; break;
+      case 3: value = rawValue + ((left + up) >> 1); break;
+      case 4: value = rawValue + paeth(left, up, upLeft); break;
+      default: throw new Error(`Unsupported PNG filter type: ${filterType}`);
+    }
+    current[index] = value & 0xff;
+  }
+}
+
+function accumulatePreviewRow(
+  row,
+  accumulator,
+  columnCounts,
+  downsample,
+  samplesPerPixel,
+  bytesPerSample,
+  sampleMax,
+  colorType,
+  transparent
+) {
+  const inverseMax = 1 / sampleMax;
+  const pixelStride = samplesPerPixel * bytesPerSample;
+  const grayKey = transparent && transparent.length >= 2 ? (transparent[0] << 8) | transparent[1] : -1;
+  const redKey = colorType === 2 && transparent?.length >= 6 ? (transparent[0] << 8) | transparent[1] : -1;
+  const greenKey = colorType === 2 && transparent?.length >= 6 ? (transparent[2] << 8) | transparent[3] : -1;
+  const blueKey = colorType === 2 && transparent?.length >= 6 ? (transparent[4] << 8) | transparent[5] : -1;
+
+  for (let column = 0; column < columnCounts.length; column += 1) {
+    const firstX = column * downsample;
+    const pixelCount = columnCounts[column];
+    let source = firstX * pixelStride;
+    const target = column * 4;
+    for (let pixel = 0; pixel < pixelCount; pixel += 1) {
+      const first = bytesPerSample === 1 ? row[source] : (row[source] << 8) | row[source + 1];
+      if (colorType === 0 || colorType === 4) {
+        const value = first * inverseMax;
+        accumulator[target] += value;
+        accumulator[target + 1] += value;
+        accumulator[target + 2] += value;
+        const alpha = colorType === 4
+          ? (bytesPerSample === 1 ? row[source + 1] : (row[source + 2] << 8) | row[source + 3]) * inverseMax
+          : first === grayKey ? 0 : 1;
+        accumulator[target + 3] += alpha;
+      } else {
+        const greenOffset = source + bytesPerSample;
+        const blueOffset = source + bytesPerSample * 2;
+        const green = bytesPerSample === 1 ? row[greenOffset] : (row[greenOffset] << 8) | row[greenOffset + 1];
+        const blue = bytesPerSample === 1 ? row[blueOffset] : (row[blueOffset] << 8) | row[blueOffset + 1];
+        accumulator[target] += first * inverseMax;
+        accumulator[target + 1] += green * inverseMax;
+        accumulator[target + 2] += blue * inverseMax;
+        const alphaOffset = source + bytesPerSample * 3;
+        const alpha = colorType === 6
+          ? (bytesPerSample === 1 ? row[alphaOffset] : (row[alphaOffset] << 8) | row[alphaOffset + 1]) * inverseMax
+          : first === redKey && green === greenKey && blue === blueKey ? 0 : 1;
+        accumulator[target + 3] += alpha;
+      }
+      source += pixelStride;
+    }
+  }
 }
 
 function readChunks(bytes) {
@@ -135,6 +332,7 @@ function readChunks(bytes) {
   };
 
   let offset = SIGNATURE.length;
+  let chunkIndex = 0;
   while (offset + 8 <= bytes.length) {
     const length = view.getUint32(offset);
     const type = String.fromCharCode(bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7]);
@@ -142,6 +340,13 @@ function readChunks(bytes) {
     const dataEnd = dataStart + length;
     if (dataEnd + 4 > bytes.length) {
       throw new Error(`PNG chunk "${type}" extends past the end of the file.`);
+    }
+    const expectedCrc = view.getUint32(dataEnd);
+    const actualCrc = pngCrc32(bytes, offset + 4, length + 4);
+    if (actualCrc !== expectedCrc) {
+      const error = new Error(`PNG ${type} chunk ${chunkIndex} has a CRC mismatch. The file is corrupted; download it again.`);
+      error.code = "PNG_CRC";
+      throw error;
     }
 
     if (type === "IHDR") {
@@ -164,6 +369,7 @@ function readChunks(bytes) {
     }
 
     offset = dataEnd + 4; // CRC 4 バイトを読み飛ばす
+    chunkIndex += 1;
   }
 
   if (!result.header) {
@@ -180,6 +386,15 @@ function readChunks(bytes) {
   }
 
   return result;
+}
+
+function pngCrc32(bytes, offset, length) {
+  let crc = 0xffffffff;
+  const end = offset + length;
+  for (let index = offset; index < end; index += 1) {
+    crc = CRC_TABLE[(crc ^ bytes[index]) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
 }
 
 function parseHeader(header) {

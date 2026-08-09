@@ -1,8 +1,9 @@
 import * as THREE from "three";
 import { EXRLoader } from "three/addons/loaders/EXRLoader.js";
 import { HDRLoader } from "three/addons/loaders/HDRLoader.js";
-import { decodePng, isPngFile, pngTypeLabel } from "./png-decoder.js?v=20260808-3";
-import { decodeTiff } from "./tiff-decoder.js?v=20260809-1";
+import { decodePng, isPngFile, pngTypeLabel } from "./png-decoder.js?v=20260809-6";
+import { decodeTiff } from "./tiff-decoder.js?v=20260809-3";
+import { decodeJpeg2000 } from "./jp2-decoder.js?v=20260809-2";
 import {
   MAX_VALUE_MATRIX_PIXELS,
   isValueMatrixText,
@@ -17,8 +18,8 @@ import {
   GLSL_PRESETS,
   getGlslSupport,
   runGlslShader
-} from "./glsl-runtime.js?v=20260809-6";
-import { decodeGlslShareHash, encodeGlslShareHash } from "./glsl-share.js?v=20260809-2";
+} from "./glsl-runtime.js?v=20260809-7";
+import { decodeGlslShareHash, encodeGlslShareHash } from "./glsl-share.js?v=20260809-3";
 
 const fileInput = document.querySelector("#fileInput");
 const fileHint = document.querySelector("#fileHint");
@@ -110,6 +111,7 @@ let pickerMode = false;
 let internalClipboard = null;
 const portableClipboardMatrixPixels = 512 * 512;
 const maxInternalClipboardPixels = 4096 * 2048;
+const maxLoadedPngPixels = 4096 * 4096;
 let clipboardReadJobId = 0;
 let topUiZ = 100000;
 let activePanelTab = "pickers";
@@ -918,11 +920,43 @@ async function loadImageFile(file) {
   if (extension === "tif" || extension === "tiff") {
     return loadTiffImage(file);
   }
+  if (extension === "jp2" || extension === "j2k" || extension === "j2c") {
+    return loadJpeg2000Image(file);
+  }
   return loadRasterImage(file);
 }
 
+async function loadJpeg2000Image(file) {
+  const decoded = await decodeJpeg2000(await file.arrayBuffer(), {
+    maxPixels: maxLoadedPngPixels,
+    onProgress: (progress, label) => {
+      fileHint.textContent = `${file.name}: ${label || `${progress}%`}`;
+    }
+  });
+  const channels = decoded.components === 1 ? "gray" : "rgb";
+  return createImageRecord(
+    file,
+    decoded.width,
+    decoded.height,
+    `jpeg2000/${channels}${decoded.bitDepth}`,
+    decoded.pixels,
+    "raster",
+    {
+      format: decoded.container,
+      bitDepth: `${decoded.bitDepth}-bit`,
+      sourceWidth: decoded.sourceWidth,
+      sourceHeight: decoded.sourceHeight,
+      downsample: decoded.downsample
+    }
+  );
+}
+
 async function loadTiffImage(file) {
-  const decoded = decodeTiff(await file.arrayBuffer());
+  const decoded = await decodeTiff(await file.arrayBuffer(), {
+    onProgress: (progress, label) => {
+      fileHint.textContent = `${file.name}: ${label || `${progress}%`}`;
+    }
+  });
   return createImageRecord(
     file,
     decoded.width,
@@ -930,7 +964,7 @@ async function loadTiffImage(file) {
     `tiff/${decoded.channels}${decoded.bitDepth}`,
     decoded.pixels,
     "raster",
-    { format: "TIFF", bitDepth: `${decoded.bitDepth}-bit` }
+    { format: "TIFF", bitDepth: decoded.bitDepthLabel || `${decoded.bitDepth}-bit` }
   );
 }
 
@@ -960,8 +994,11 @@ async function loadPngExact(file) {
 
   let decoded;
   try {
-    decoded = await decodePng(bytes);
+    decoded = await decodePng(bytes, { maxPixels: maxLoadedPngPixels });
   } catch (error) {
+    if (error?.code === "PNG_CRC" || error?.code === "PNG_HUGE_UNSUPPORTED") {
+      throw error;
+    }
     // 未対応の派生仕様などは Canvas 経路に落として読み込み自体は成功させる
     console.warn(`Exact PNG decode failed, falling back to canvas: ${error.message}`);
     return null;
@@ -975,18 +1012,22 @@ async function loadPngExact(file) {
     toLinear[sample] = srgbToLinear(sample / sampleMax);
   }
 
-  const pixels = new Float32Array(decoded.width * decoded.height * 4);
-  const data = decoded.data;
-  for (let i = 0; i < data.length; i += 4) {
-    pixels[i] = toLinear[Math.round(data[i] * sampleMax)];
-    pixels[i + 1] = toLinear[Math.round(data[i + 1] * sampleMax)];
-    pixels[i + 2] = toLinear[Math.round(data[i + 2] * sampleMax)];
-    pixels[i + 3] = data[i + 3];
+  const pixels = decoded.data;
+  for (let i = 0; i < pixels.length; i += 4) {
+    pixels[i] = toLinear[Math.round(pixels[i] * sampleMax)];
+    pixels[i + 1] = toLinear[Math.round(pixels[i + 1] * sampleMax)];
+    pixels[i + 2] = toLinear[Math.round(pixels[i + 2] * sampleMax)];
   }
 
   const record = createImageRecord(file, decoded.width, decoded.height, pngTypeLabel(decoded), pixels, "raster");
   record.format = "PNG";
   record.bitDepth = `${decoded.bitDepth}-bit`;
+  record.sourceWidth = decoded.sourceWidth;
+  record.sourceHeight = decoded.sourceHeight;
+  record.downsample = decoded.downsample;
+  if (decoded.downsample > 1) {
+    record.type = `${record.type}/preview`;
+  }
   const note = pngTransferNote(decoded);
   if (note) {
     record.type = `${record.type} ${note}`;
@@ -1227,6 +1268,9 @@ function createImageRecord(file, width, height, type, pixels, sourceFormat = "ra
     name: file.name,
     width,
     height,
+    sourceWidth: metadata.sourceWidth || width,
+    sourceHeight: metadata.sourceHeight || height,
+    downsample: metadata.downsample || 1,
     type,
     sourceFormat,
     format: metadata.format || (sourceFormat === "glsl" ? "GLSL" : sourceFormat === "values" ? "VALUES" : rasterFormat(file)),
@@ -1637,6 +1681,9 @@ function imageVariant(image) {
   return {
     width: image.width,
     height: image.height,
+    sourceWidth: image.sourceWidth,
+    sourceHeight: image.sourceHeight,
+    downsample: image.downsample,
     type: image.type,
     sourceFormat: image.sourceFormat,
     format: image.format,
@@ -1653,6 +1700,9 @@ function glslVariant(code, pixels, width, height) {
     renderedCode: code,
     width,
     height,
+    sourceWidth: width,
+    sourceHeight: height,
+    downsample: 1,
     type: "glsl/linear",
     sourceFormat: "glsl",
     format: "GLSL",
@@ -1664,9 +1714,67 @@ function glslVariant(code, pixels, width, height) {
 
 function glslInputPayload(image) {
   const input = image?.original;
-  return input
-    ? { pixels: input.pixels, width: input.width, height: input.height, key: `${image.id}:original` }
-    : null;
+  if (!input) {
+    return null;
+  }
+  const dimensions = fitLongEdge(input.width, input.height, 4096);
+  if (dimensions.width === input.width && dimensions.height === input.height) {
+    return { pixels: input.pixels, width: input.width, height: input.height, key: `${image.id}:original` };
+  }
+  const cached = image.glslInputPreview;
+  if (
+    cached?.sourcePixels === input.pixels
+    && cached.width === dimensions.width
+    && cached.height === dimensions.height
+  ) {
+    return cached.payload;
+  }
+  const pixels = resampleLinearPixels(input.pixels, input.width, input.height, dimensions.width, dimensions.height);
+  const payload = {
+    pixels,
+    width: dimensions.width,
+    height: dimensions.height,
+    key: `${image.id}:original-preview-${dimensions.width}x${dimensions.height}`
+  };
+  image.glslInputPreview = { sourcePixels: input.pixels, width: dimensions.width, height: dimensions.height, payload };
+  return payload;
+}
+
+function fitLongEdge(width, height, maximumEdge) {
+  const scale = Math.min(1, maximumEdge / Math.max(width, height));
+  return {
+    width: Math.max(1, Math.round(width * scale)),
+    height: Math.max(1, Math.round(height * scale))
+  };
+}
+
+function resampleLinearPixels(source, sourceWidth, sourceHeight, width, height) {
+  const output = new Float32Array(width * height * 4);
+  const scaleX = sourceWidth / width;
+  const scaleY = sourceHeight / height;
+  for (let y = 0; y < height; y += 1) {
+    const sourceY = clamp((y + 0.5) * scaleY - 0.5, 0, sourceHeight - 1);
+    const y0 = Math.floor(sourceY);
+    const y1 = Math.min(sourceHeight - 1, y0 + 1);
+    const fy = sourceY - y0;
+    for (let x = 0; x < width; x += 1) {
+      const sourceX = clamp((x + 0.5) * scaleX - 0.5, 0, sourceWidth - 1);
+      const x0 = Math.floor(sourceX);
+      const x1 = Math.min(sourceWidth - 1, x0 + 1);
+      const fx = sourceX - x0;
+      const topLeft = (y0 * sourceWidth + x0) * 4;
+      const topRight = (y0 * sourceWidth + x1) * 4;
+      const bottomLeft = (y1 * sourceWidth + x0) * 4;
+      const bottomRight = (y1 * sourceWidth + x1) * 4;
+      const target = (y * width + x) * 4;
+      for (let channel = 0; channel < 4; channel += 1) {
+        const top = source[topLeft + channel] + (source[topRight + channel] - source[topLeft + channel]) * fx;
+        const bottom = source[bottomLeft + channel] + (source[bottomRight + channel] - source[bottomLeft + channel]) * fx;
+        output[target + channel] = top + (bottom - top) * fy;
+      }
+    }
+  }
+  return output;
 }
 
 function applyImageVariant(image, mode) {
@@ -1678,6 +1786,9 @@ function applyImageVariant(image, mode) {
   image.mode = mode;
   image.width = variant.width;
   image.height = variant.height;
+  image.sourceWidth = variant.sourceWidth;
+  image.sourceHeight = variant.sourceHeight;
+  image.downsample = variant.downsample;
   image.type = variant.type;
   image.sourceFormat = variant.sourceFormat;
   image.format = variant.format;
@@ -1741,7 +1852,10 @@ function updateImageWindowSize(image) {
 }
 
 function imageInfoLabel(image) {
-  return [`${image.width}x${image.height}`, image.format, image.bitDepth].filter(Boolean).join(" · ");
+  const preview = image.downsample > 1 ? `↓${image.downsample}` : "";
+  const width = image.sourceWidth || image.width;
+  const height = image.sourceHeight || image.height;
+  return [`${width}x${height}`, image.format, image.bitDepth, preview].filter(Boolean).join(" · ");
 }
 
 function openGlslEditor(sourceImage) {
@@ -1757,12 +1871,15 @@ function openGlslEditor(sourceImage) {
   }
 
   const code = sourceImage ? DEFAULT_FILTER_CODE : DEFAULT_GENERATOR_CODE;
-  const width = sourceImage ? sourceImage.width : 1024;
-  const height = sourceImage ? sourceImage.height : 1024;
+  let width = 1024;
+  let height = 1024;
 
   // 元画像は参照だけを保持するため、タブを増やしても画素配列は複製しない。
   if (sourceImage) {
     sourceImage.original = imageVariant(sourceImage);
+    const preview = glslInputPayload(sourceImage);
+    width = preview.width;
+    height = preview.height;
   }
 
   let pixels;
@@ -1924,7 +2041,11 @@ function closeGlslEditor() {
 function updateGlslInputLabel(image) {
   const input = image.original;
   if (input) {
-    glslInputLabel.textContent = `${input.name} (${input.width}x${input.height})`;
+    const preview = glslInputPayload(image);
+    const label = preview.width === input.width && preview.height === input.height
+      ? `${preview.width}x${preview.height}`
+      : `${preview.width}x${preview.height} preview`;
+    glslInputLabel.textContent = `${input.name} (${label})`;
     glslMatchInputButton.disabled = false;
     return;
   }
@@ -1974,7 +2095,7 @@ function scheduleGlslRun() {
 
 function glslSizeValue(input, fallback) {
   const value = Math.floor(Number(input.value));
-  return Number.isFinite(value) && value >= 1 ? value : fallback;
+  return Number.isFinite(value) && value >= 1 ? Math.min(4096, value) : Math.min(4096, fallback);
 }
 
 function runGlslNow() {
@@ -2024,6 +2145,9 @@ function applyGlslResult(image, pixels, width, height, code) {
   image.sourceFormat = "glsl";
   image.format = "GLSL";
   image.bitDepth = "32F";
+  image.sourceWidth = width;
+  image.sourceHeight = height;
+  image.downsample = 1;
   image.glsl = {
     ...image.glsl,
     code,
@@ -2031,6 +2155,9 @@ function applyGlslResult(image, pixels, width, height, code) {
     pixels,
     width,
     height,
+    sourceWidth: width,
+    sourceHeight: height,
+    downsample: 1,
     type: image.type,
     sourceFormat: image.sourceFormat,
     format: image.format,
@@ -2144,8 +2271,9 @@ function initGlslEditor() {
     if (!input) {
       return;
     }
-    glslWidthInput.value = String(input.width);
-    glslHeightInput.value = String(input.height);
+    const preview = glslInputPayload(target);
+    glslWidthInput.value = String(preview.width);
+    glslHeightInput.value = String(preview.height);
     scheduleGlslRun();
   });
 
@@ -4398,7 +4526,9 @@ function updateSettingsPanel() {
   brightnessInput.value = String(image.settings.brightness);
   updateSaveFormatOptions(image);
   metaName.textContent = image.name;
-  metaSize.textContent = `${image.width} x ${image.height}`;
+  metaSize.textContent = image.downsample > 1
+    ? `${image.sourceWidth} x ${image.sourceHeight} → ${image.width} x ${image.height} (1/${image.downsample} preview)`
+    : `${image.width} x ${image.height}`;
   metaType.textContent = `${image.type} / ${image.sourceFormat}`;
   const normalizationRange = getDisplayNormalizationRange(image);
   metaRange.textContent = `${formatNumber(normalizationRange.min)} - ${formatNumber(normalizationRange.max)}`;
@@ -4481,18 +4611,192 @@ function renderImage(image) {
   ctx.fillStyle = "#000";
   ctx.fillRect(0, 0, width, height);
 
-  ensureDisplayCanvas(image);
-  ctx.imageSmoothingEnabled = shouldSmooth(image);
-  ctx.drawImage(
-    image.displayCanvas,
-    image.view.offsetX,
-    image.view.offsetY,
-    image.width * image.view.scale,
-    image.height * image.view.scale
-  );
+  drawImageTiles(image, ctx, width, height, dpr);
   drawPixelGrid(image, ctx, width, height);
   drawPickers(image, ctx);
   drawSelection(image, ctx);
+}
+
+const displayTileSize = 512;
+const displayTileGutter = 1;
+const maxCachedDisplayTiles = 96;
+
+function drawImageTiles(image, ctx, canvasWidth, canvasHeight, dpr) {
+  if (!image.pixels || image.width < 1 || image.height < 1 || image.view.scale <= 0) {
+    return;
+  }
+  const cache = displayTileCache(image);
+  const sourcePixelsPerDevicePixel = 1 / Math.max(0.000001, image.view.scale * dpr);
+  const maximumLevel = Math.max(0, Math.ceil(Math.log2(Math.max(image.width, image.height))));
+  const level = clamp(Math.floor(Math.log2(Math.max(1, sourcePixelsPerDevicePixel))), 0, maximumLevel);
+  const factor = 2 ** level;
+  const levelWidth = Math.ceil(image.width / factor);
+  const levelHeight = Math.ceil(image.height / factor);
+
+  const sourceLeft = Math.max(0, (-image.view.offsetX) / image.view.scale);
+  const sourceTop = Math.max(0, (-image.view.offsetY) / image.view.scale);
+  const sourceRight = Math.min(image.width, (canvasWidth - image.view.offsetX) / image.view.scale);
+  const sourceBottom = Math.min(image.height, (canvasHeight - image.view.offsetY) / image.view.scale);
+  if (sourceRight <= sourceLeft || sourceBottom <= sourceTop) {
+    return;
+  }
+
+  const firstTileX = clamp(Math.floor(sourceLeft / factor / displayTileSize), 0, Math.ceil(levelWidth / displayTileSize) - 1);
+  const lastTileX = clamp(Math.floor((sourceRight - 1) / factor / displayTileSize), 0, Math.ceil(levelWidth / displayTileSize) - 1);
+  const firstTileY = clamp(Math.floor(sourceTop / factor / displayTileSize), 0, Math.ceil(levelHeight / displayTileSize) - 1);
+  const lastTileY = clamp(Math.floor((sourceBottom - 1) / factor / displayTileSize), 0, Math.ceil(levelHeight / displayTileSize) - 1);
+
+  ctx.imageSmoothingEnabled = shouldSmooth(image);
+  for (let tileY = firstTileY; tileY <= lastTileY; tileY += 1) {
+    for (let tileX = firstTileX; tileX <= lastTileX; tileX += 1) {
+      const tile = getDisplayTile(image, cache, level, tileX, tileY);
+      const sourceX = tileX * displayTileSize * factor;
+      const sourceY = tileY * displayTileSize * factor;
+      const sourceWidth = Math.min(tile.width * factor, image.width - sourceX);
+      const sourceHeight = Math.min(tile.height * factor, image.height - sourceY);
+      ctx.drawImage(
+        tile.canvas,
+        displayTileGutter,
+        displayTileGutter,
+        tile.width,
+        tile.height,
+        image.view.offsetX + sourceX * image.view.scale,
+        image.view.offsetY + sourceY * image.view.scale,
+        sourceWidth * image.view.scale,
+        sourceHeight * image.view.scale
+      );
+    }
+  }
+}
+
+function displayTileCache(image) {
+  image.displayTileCache ||= new Map();
+  if (image.displayDirty) {
+    image.displayTileCache.clear();
+    image.displayDirty = false;
+  }
+  return image.displayTileCache;
+}
+
+function getDisplayTile(image, cache, level, tileX, tileY) {
+  const key = `${level}:${tileX}:${tileY}`;
+  const cached = cache.get(key);
+  if (cached) {
+    cache.delete(key);
+    cache.set(key, cached);
+    return cached;
+  }
+  const tile = createDisplayTile(image, level, tileX, tileY);
+  cache.set(key, tile);
+  while (cache.size > maxCachedDisplayTiles) {
+    cache.delete(cache.keys().next().value);
+  }
+  return tile;
+}
+
+function createDisplayTile(image, level, tileX, tileY) {
+  const factor = 2 ** level;
+  const levelWidth = Math.ceil(image.width / factor);
+  const levelHeight = Math.ceil(image.height / factor);
+  const levelX = tileX * displayTileSize;
+  const levelY = tileY * displayTileSize;
+  const width = Math.min(displayTileSize, levelWidth - levelX);
+  const height = Math.min(displayTileSize, levelHeight - levelY);
+  const canvas = document.createElement("canvas");
+  canvas.width = width + displayTileGutter * 2;
+  canvas.height = height + displayTileGutter * 2;
+  const context = canvas.getContext("2d", { alpha: false });
+  const imageData = context.createImageData(canvas.width, canvas.height);
+  const target = imageData.data;
+  const display = displayConversion(image);
+
+  for (let tileYWithGutter = -displayTileGutter; tileYWithGutter < height + displayTileGutter; tileYWithGutter += 1) {
+    const sampleLevelY = clamp(levelY + tileYWithGutter, 0, levelHeight - 1);
+    const sourceTop = sampleLevelY * factor;
+    const sourceBottom = Math.min(image.height, sourceTop + factor);
+    for (let tileXWithGutter = -displayTileGutter; tileXWithGutter < width + displayTileGutter; tileXWithGutter += 1) {
+      const sampleLevelX = clamp(levelX + tileXWithGutter, 0, levelWidth - 1);
+      const sourceLeft = sampleLevelX * factor;
+      const sourceRight = Math.min(image.width, sourceLeft + factor);
+      const rgba = averageSourcePixel(image, sourceLeft, sourceTop, sourceRight, sourceBottom);
+      const targetX = tileXWithGutter + displayTileGutter;
+      const targetY = tileYWithGutter + displayTileGutter;
+      writeDisplayPixel(target, (targetY * canvas.width + targetX) * 4, rgba, display);
+    }
+  }
+  context.putImageData(imageData, 0, 0);
+  return { canvas, width, height };
+}
+
+function averageSourcePixel(image, left, top, right, bottom) {
+  let red = 0;
+  let green = 0;
+  let blue = 0;
+  let alpha = 0;
+  let count = 0;
+  for (let y = top; y < bottom; y += 1) {
+    let source = (y * image.width + left) * 4;
+    for (let x = left; x < right; x += 1) {
+      red += image.pixels[source];
+      green += image.pixels[source + 1];
+      blue += image.pixels[source + 2];
+      alpha += image.pixels[source + 3];
+      count += 1;
+      source += 4;
+    }
+  }
+  const scale = count > 0 ? 1 / count : 0;
+  return [red * scale, green * scale, blue * scale, alpha * scale];
+}
+
+function displayConversion(image) {
+  const range = getDisplayNormalizationRange(image);
+  const width = range.max - range.min;
+  return {
+    mode: image.settings.channel,
+    brightness: image.settings.brightness,
+    autoLevel: image.settings.autoLevel && width > 0,
+    levelOffset: range.min,
+    levelScale: width > 0 ? 1 / width : 1,
+    logNormalize: logDisplayMode ? graphValueNormalizer(range.min, range.max, "log") : null
+  };
+}
+
+function writeDisplayPixel(target, offset, rgba, display) {
+  if (display.mode === "a") {
+    let alpha = rgba[3];
+    if (display.logNormalize) {
+      alpha = display.logNormalize(alpha * display.brightness);
+    } else if (display.autoLevel) {
+      alpha = clamp01((alpha - display.levelOffset) * display.levelScale * display.brightness);
+    } else {
+      alpha = clamp01(alpha * display.brightness);
+    }
+    const byte = Math.round(alpha * 255);
+    target[offset] = byte;
+    target[offset + 1] = byte;
+    target[offset + 2] = byte;
+    target[offset + 3] = 255;
+    return;
+  }
+
+  let sourceR = 0;
+  let sourceG = 1;
+  let sourceB = 2;
+  if (display.mode === "r" || display.mode === "g" || display.mode === "b") {
+    sourceR = display.mode === "r" ? 0 : display.mode === "g" ? 1 : 2;
+    sourceG = sourceR;
+    sourceB = sourceR;
+  }
+  const values = [rgba[sourceR], rgba[sourceG], rgba[sourceB]];
+  for (let channel = 0; channel < 3; channel += 1) {
+    target[offset + channel] = display.logNormalize
+      ? Math.round(display.logNormalize(values[channel] * display.brightness) * 255)
+      : display.autoLevel
+        ? linearToSrgbByte((values[channel] - display.levelOffset) * display.levelScale * display.brightness)
+        : linearToSrgbByte(values[channel] * display.brightness);
+  }
+  target[offset + 3] = display.mode === "rgba" ? Math.round(clamp01(rgba[3]) * 255) : 255;
 }
 
 function drawPixelGrid(image, ctx, canvasWidth, canvasHeight) {

@@ -3,13 +3,15 @@ const SHARE_VERSION = 1;
 const MAX_ENCODED_LENGTH = 256 * 1024;
 const MAX_CODE_LENGTH = 128 * 1024;
 const MAX_PIXELS = 16_777_216;
+const MAX_EDGE = 4096;
 
 function validateShareState(value) {
   const width = Number(value?.w);
   const height = Number(value?.h);
   const code = value?.c;
   if (value?.v !== SHARE_VERSION || !Number.isInteger(width) || !Number.isInteger(height)
-      || width < 1 || height < 1 || width * height > MAX_PIXELS || typeof code !== "string") {
+      || width < 1 || height < 1 || width > MAX_EDGE || height > MAX_EDGE
+      || width * height > MAX_PIXELS || typeof code !== "string") {
     throw new Error("Invalid shared GLSL settings.");
   }
   if (code.length > MAX_CODE_LENGTH) {

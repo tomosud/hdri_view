@@ -19,7 +19,7 @@
     <header class="topbar">
       <div class="brand">HDRI Value Viewer</div>
       <label class="file-button">
-        <input id="fileInput" type="file" multiple accept="image/*,.tif,.tiff,.hdr,.pic,.exr">
+        <input id="fileInput" type="file" multiple accept="image/*,.jp2,.j2k,.j2c,.tif,.tiff,.hdr,.pic,.exr">
         Open
       </label>
       <button id="newImageButton" class="tool-button" type="button" title="Generate a new image from GLSL code only">New Image</button>
@@ -40,7 +40,7 @@
         <div id="windowLayer" class="window-layer"></div>
         <div id="dropPrompt" class="drop-prompt">
           <div>Drop images here</div>
-          <span>PNG / JPEG / WebP / AVIF / GIF / BMP / TIFF / HDR / EXR</span>
+          <span>PNG / JPEG / WebP / AVIF / GIF / BMP / JP2 / TIFF / HDR / EXR</span>
         </div>
 
         <aside id="inspector" class="inspector" aria-label="View settings">
@@ -142,9 +142,9 @@
             <div class="glsl-field">
               <span>Output</span>
               <div class="glsl-size">
-                <input id="glslWidth" type="number" min="1" step="1" value="1024" aria-label="Output width">
+                <input id="glslWidth" type="number" min="1" max="4096" step="1" value="1024" aria-label="Output width">
                 <span>x</span>
-                <input id="glslHeight" type="number" min="1" step="1" value="1024" aria-label="Output height">
+                <input id="glslHeight" type="number" min="1" max="4096" step="1" value="1024" aria-label="Output height">
                 <button id="glslMatchInput" class="tool-button" type="button">Match input</button>
               </div>
             </div>
@@ -205,6 +205,6 @@
     </footer>
   </div>
 
-  <script type="module" src="./app.js?v=20260809-3"></script>
+  <script type="module" src="./app.js?v=20260809-10"></script>
 </body>
 </html>
