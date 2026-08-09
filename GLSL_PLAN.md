@@ -106,8 +106,8 @@ outputColor = (left + inputColor + right) / 3.0;
 ## 5. 負荷とクラッシュを避けるルール
 
 - WebGL2 と `EXT_color_buffer_float` を必須とする。使えない場合は理由を表示して実行しない。
-- GPU の `MAX_TEXTURE_SIZE` に加え、GLSL の入力と出力を最大 8,388,608 ピクセルに制限する
-  （例: 4096 x 2048、3840 x 2160）。巨大な RGBA32F、readPixels、表示用 ImageData の同時確保を
+- GPU の `MAX_TEXTURE_SIZE` に加え、GLSL の入力と出力を最大 16,777,216 ピクセルに制限する
+  （例: 4096 x 4096）。巨大な RGBA32F、readPixels、表示用 ImageData の同時確保を
   避けるための仕様上限で、通常の画像閲覧には適用しない。
 - 同じ元画像の編集中は GPU 入力テクスチャを再利用し、打鍵ごとの再アップロードを避ける。
 - GLSL 出力の巨大な Float32Array は IndexedDB へ毎回保存しない。コードと解像度を保存し、復元時に再実行する。

@@ -17,8 +17,8 @@ import {
   GLSL_PRESETS,
   getGlslSupport,
   runGlslShader
-} from "./glsl-runtime.js?v=20260808-5";
-import { decodeGlslShareHash, encodeGlslShareHash } from "./glsl-share.js?v=20260808-1";
+} from "./glsl-runtime.js?v=20260809-6";
+import { decodeGlslShareHash, encodeGlslShareHash } from "./glsl-share.js?v=20260809-2";
 
 const fileInput = document.querySelector("#fileInput");
 const fileHint = document.querySelector("#fileHint");

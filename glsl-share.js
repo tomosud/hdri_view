@@ -2,7 +2,7 @@ const SHARE_PREFIX = "#glsl=";
 const SHARE_VERSION = 1;
 const MAX_ENCODED_LENGTH = 256 * 1024;
 const MAX_CODE_LENGTH = 128 * 1024;
-const MAX_PIXELS = 8_388_608;
+const MAX_PIXELS = 16_777_216;
 
 function validateShareState(value) {
   const width = Number(value?.w);

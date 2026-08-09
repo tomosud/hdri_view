@@ -178,8 +178,8 @@ export const DEFAULT_FILTER_CODE = GLSL_PRESETS[0].code;
 export const DEFAULT_GENERATOR_CODE = GLSL_PRESETS.find((preset) => preset.generator).code;
 
 // MAX_TEXTURE_SIZE だけを上限にすると、環境によっては数 GB の CPU/GPU メモリを
-// 確保できてしまう。UI を止めないため、GLSL の入出力は 8 MP までという契約にする。
-export const MAX_GLSL_PIXELS = 4096 * 2048;
+// 確保できてしまう。16 MP 級のスキャンを扱いつつ、無制限な確保は防ぐ。
+export const MAX_GLSL_PIXELS = 4096 * 4096;
 
 /** ラッパを被せた完全なフラグメントシェーダを返す（テストから使えるように export する）。 */
 export function assembleFragmentSource(userCode) {
@@ -426,7 +426,7 @@ export function runGlslShader({ code, input, width, height, time = 0 }) {
   }
   if (outputWidth * outputHeight > MAX_GLSL_PIXELS) {
     throw new GlslError(
-      `Output is limited to ${MAX_GLSL_PIXELS.toLocaleString("en-US")} pixels (for example 4096 x 2048).`
+      `Output is limited to ${MAX_GLSL_PIXELS.toLocaleString("en-US")} pixels (for example 4096 x 4096).`
     );
   }
   if (input && (input.width > info.maxTextureSize || input.height > info.maxTextureSize)) {
