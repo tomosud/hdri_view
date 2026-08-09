@@ -2664,6 +2664,7 @@ function removePicker(pickerId) {
 }
 
 function drawPickers(image, ctx) {
+  if (activePanelTab !== "pickers") return;
   const { width, height } = canvasCssSize(image);
   for (const picker of image.pickers) {
     const x = image.view.offsetX + (picker.x + 0.5) * image.view.scale;
@@ -2840,7 +2841,7 @@ async function cropPixels(image, rect) {
 }
 
 function pickerAtEvent(image, event, radius = 14) {
-  if (!image.pickers.length || !image.elements?.canvas) return null;
+  if (activePanelTab !== "pickers" || !image.pickers.length || !image.elements?.canvas) return null;
   const rect = image.elements.canvas.getBoundingClientRect();
   const viewX = event.clientX - rect.left;
   const viewY = event.clientY - rect.top;
@@ -3575,6 +3576,11 @@ function setPanelTab(tab) {
   const showPickers = tab === "pickers";
   if (!showPickers) {
     setPickerMode(false);
+    hoveredPickerId = null;
+    for (const image of images) {
+      image.elements?.canvas.classList.remove("picker-hover");
+    }
+    updateHoveredPickerUi();
   }
   pickersTabButton.classList.toggle("active", showPickers);
   selectionTabButton.classList.toggle("active", !showPickers);
@@ -3585,6 +3591,7 @@ function setPanelTab(tab) {
   } else {
     updateSelectionPanel();
   }
+  requestRender();
   scheduleSessionSave();
 }
 
@@ -3668,7 +3675,9 @@ function requestHoveredPickerUi({ scroll = false } = {}) {
 }
 
 function updateHoveredPickerUi({ scroll = false } = {}) {
-  const hovered = allPickers().find(({ picker }) => picker.id === hoveredPickerId) || null;
+  const hovered = activePanelTab === "pickers"
+    ? allPickers().find(({ picker }) => picker.id === hoveredPickerId) || null
+    : null;
   for (const row of pickerRows.querySelectorAll(".picker-row.hovered")) {
     row.classList.remove("hovered");
   }
