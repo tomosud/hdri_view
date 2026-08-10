@@ -692,7 +692,7 @@ channelButtons.addEventListener("click", (event) => {
   updateSettingsPanel();
   updatePickerPanel();
   updateSelectionPanel();
-  drawSelectionGraph();
+  requestSelectionGraphDraw();
   requestRender();
   scheduleSessionSave();
 });
@@ -704,6 +704,7 @@ new ResizeObserver(() => {
     }
   }
   requestRender();
+  requestSelectionGraphDraw();
 }).observe(viewport);
 
 document.addEventListener("pointermove", (event) => {
@@ -781,7 +782,7 @@ document.addEventListener("pointerup", (event) => {
     } else {
       image.selection = null;
       updateSelectionPanel();
-      drawSelectionGraph();
+      requestSelectionGraphDraw();
       requestRender();
     }
   } else if (activeDrag?.kind === "movePicker") {
@@ -803,7 +804,7 @@ document.addEventListener("pointerup", (event) => {
     updateSelectionPanel();
   }
   if (["selectRect", "graphResize", "graphRotate"].includes(completedDragKind)) {
-    drawSelectionGraph();
+    requestSelectionGraphDraw();
   }
   if (completedDragKind) {
     scheduleSessionSave();
@@ -817,7 +818,7 @@ initGlslEditor();
 updatePickerPanel();
 updateLogDisplayButton();
 requestRender();
-drawSelectionGraph();
+requestSelectionGraphDraw();
 queueMicrotask(initializeApp);
 
 async function openFilesWithPicker() {
@@ -1708,7 +1709,7 @@ function createImageWindow(image, dropPoint, placementIndex) {
       event.preventDefault();
       image.selection = normalizePixelRect(pixel, pixel);
       updateSelectionPanel();
-      drawSelectionGraph();
+      requestSelectionGraphDraw();
       activeDrag = {
         kind: "selectRect",
         image,
@@ -1783,19 +1784,23 @@ function createImageWindow(image, dropPoint, placementIndex) {
   applyWindowGeometry(image);
 }
 
-function selectImage(image) {
+function selectImage(image, forceRefresh = false) {
+  const selectionChanged = selectedId !== image.id;
   selectedId = image.id;
-  image.window.z = ++topZ;
+  if (image.window.z !== topZ) {
+    image.window.z = ++topZ;
+    image.elements?.frame.style.setProperty("z-index", String(image.window.z));
+  }
+  if (!selectionChanged && !forceRefresh) {
+    return;
+  }
   for (const item of images) {
     item.elements?.frame.classList.toggle("active", item.id === image.id);
-    if (item.id === image.id) {
-      item.elements.frame.style.zIndex = String(image.window.z);
-    }
   }
   updateSettingsPanel();
   ensureFloatingPanelAccessible(inspector);
   updateSelectionPanel();
-  drawSelectionGraph();
+  requestSelectionGraphDraw();
   updateViewState();
   syncGlslEditorForSelection();
   syncGlslShareUrl(image);
@@ -1811,7 +1816,7 @@ function clearActiveSelection() {
   }
   updateSettingsPanel();
   updateSelectionPanel();
-  drawSelectionGraph();
+  requestSelectionGraphDraw();
   updateViewState();
   scheduleSessionSave();
 }
@@ -1843,7 +1848,7 @@ function makeFloatingPanelDraggable(panel) {
       return;
     }
     panel.classList.toggle("collapsed");
-    drawSelectionGraph();
+    requestSelectionGraphDraw();
     scheduleSessionSave();
   });
 
@@ -1937,7 +1942,7 @@ function closeImage(image) {
   updatePickerCursor();
   updatePickerPanel();
   updateSelectionPanel();
-  drawSelectionGraph();
+  requestSelectionGraphDraw();
   syncGlslEditorForSelection();
   requestRender();
   scheduleSessionSave();
@@ -2111,7 +2116,7 @@ function applyImageVariant(image, mode) {
   updateSettingsPanel();
   updatePickerPanel();
   updateSelectionPanel();
-  drawSelectionGraph();
+  requestSelectionGraphDraw();
   requestRender();
   scheduleSessionSave();
   return true;
@@ -2486,7 +2491,7 @@ function applyGlslResult(image, pixels, width, height, code) {
   cancelSelectionMatrixCopy();
   updatePickerPanel();
   updateSelectionPanel();
-  drawSelectionGraph();
+  requestSelectionGraphDraw();
   requestRender();
   syncGlslShareUrl(image);
   scheduleSessionSave();
@@ -3253,12 +3258,12 @@ async function restoreSavedSession() {
     if (selectedId !== null) {
       const image = currentImage();
       if (image) {
-        selectImage(image);
+        selectImage(image, true);
       }
     } else {
       updateSettingsPanel();
       updateSelectionPanel();
-      drawSelectionGraph();
+      requestSelectionGraphDraw();
       updateViewState();
     }
     updatePickerPanel();
@@ -3922,7 +3927,7 @@ function runSelectionWorker(image, rect, rectKey, matrixKey, valueMode, channels
         matrix: ""
       });
       updateSelectionPanel();
-      drawSelectionGraph();
+      requestSelectionGraphDraw();
       return;
     }
     if (event.data.kind === "preview") {
@@ -4720,28 +4725,52 @@ function makeGraphProjector(samples, rect, width, height, normalize) {
   const baseWorldHeight = 0.78;
   const pointCols = samples.stepped ? samples.cols + 1 : samples.cols;
   const pointRows = samples.stepped ? samples.rows + 1 : samples.rows;
+  const xDivisor = Math.max(1, pointCols - 1);
+  const yDivisor = Math.max(1, pointRows - 1);
+  const yawCos = Math.cos(graphView.yaw);
+  const yawSin = Math.sin(graphView.yaw);
+  const pitchCos = Math.cos(graphView.pitch);
+  const pitchSin = Math.sin(graphView.pitch);
   const availableWidth = Math.max(20, plot.right - plot.left);
   const availableHeight = Math.max(20, plot.bottom - plot.top);
+  const worldPoint = (col, row) => {
+    const x = (col / xDivisor - 0.5) * worldWidth;
+    const y = (row / yDivisor - 0.5) * worldDepth;
+    return {
+      viewX: x * yawCos - y * yawSin,
+      viewY: x * yawSin + y * yawCos
+    };
+  };
+  const projectPoint = (col, row, zRatio, worldHeight) => {
+    const point = worldPoint(col, row);
+    return {
+      x: point.viewX,
+      y: point.viewY * pitchCos - zRatio * worldHeight * pitchSin
+    };
+  };
+  const extentCorners = [
+    worldPoint(0, 0),
+    worldPoint(pointCols - 1, 0),
+    worldPoint(pointCols - 1, pointRows - 1),
+    worldPoint(0, pointRows - 1)
+  ];
 
   const graphExtent = (worldHeight) => {
-    const rawPoints = [];
-    for (let row = 0; row < pointRows; row += 1) {
-      for (let col = 0; col < pointCols; col += 1) {
-        rawPoints.push(projectGraphPoint(col, row, 0, samples, worldWidth, worldDepth, worldHeight));
-        rawPoints.push(projectGraphPoint(col, row, 1, samples, worldWidth, worldDepth, worldHeight));
-      }
-    }
-    return rawPoints.reduce((result, point) => ({
-      minX: Math.min(result.minX, point.x),
-      maxX: Math.max(result.maxX, point.x),
-      minY: Math.min(result.minY, point.y),
-      maxY: Math.max(result.maxY, point.y)
-    }), {
+    const result = {
       minX: Infinity,
       maxX: -Infinity,
       minY: Infinity,
       maxY: -Infinity
-    });
+    };
+    for (const point of extentCorners) {
+      const baseY = point.viewY * pitchCos;
+      const valueY = baseY - worldHeight * pitchSin;
+      result.minX = Math.min(result.minX, point.viewX);
+      result.maxX = Math.max(result.maxX, point.viewX);
+      result.minY = Math.min(result.minY, baseY, valueY);
+      result.maxY = Math.max(result.maxY, baseY, valueY);
+    }
+    return result;
   };
 
   let worldHeight = baseWorldHeight;
@@ -4785,34 +4814,9 @@ function makeGraphProjector(samples, rect, width, height, normalize) {
   });
 
   return {
-    base: (col, row) => toCanvas(projectGraphPoint(col, row, 0, samples, worldWidth, worldDepth, worldHeight)),
-    surface: (col, row, value) => toCanvas(projectGraphPoint(col, row, normalize(value), samples, worldWidth, worldDepth, worldHeight)),
-    depth: (col, row) => graphWorldPoint(col, row, samples, worldWidth, worldDepth).viewDepth
-  };
-}
-
-function projectGraphPoint(col, row, zRatio, samples, worldWidth, worldDepth, worldHeight) {
-  const point = graphWorldPoint(col, row, samples, worldWidth, worldDepth);
-  const z = zRatio * worldHeight;
-  return {
-    x: point.viewX,
-    y: point.viewY * Math.cos(graphView.pitch) - z * Math.sin(graphView.pitch)
-  };
-}
-
-function graphWorldPoint(col, row, samples, worldWidth, worldDepth) {
-  const xDivisor = samples.stepped ? samples.cols : samples.cols - 1;
-  const yDivisor = samples.stepped ? samples.rows : samples.rows - 1;
-  const xRatio = xDivisor <= 0 ? 0 : col / xDivisor;
-  const yRatio = yDivisor <= 0 ? 0 : row / yDivisor;
-  const x = (xRatio - 0.5) * worldWidth;
-  const y = (yRatio - 0.5) * worldDepth;
-  const cos = Math.cos(graphView.yaw);
-  const sin = Math.sin(graphView.yaw);
-  return {
-    viewX: x * cos - y * sin,
-    viewY: x * sin + y * cos,
-    viewDepth: x * sin + y * cos
+    base: (col, row) => toCanvas(projectPoint(col, row, 0, worldHeight)),
+    surface: (col, row, value) => toCanvas(projectPoint(col, row, normalize(value), worldHeight)),
+    depth: (col, row) => worldPoint(col, row).viewY
   };
 }
 
@@ -5040,7 +5044,6 @@ function csvCell(value) {
 function pickerValues(image, picker) {
   const linear = readDisplayedLinear(image, picker.x, picker.y, () => {
     updatePickerPanel();
-    requestSelectionGraphDraw();
   });
   return linear ? valuesFromLinear(linear) : { ...valuesFromLinear([0, 0, 0, 0]), pending: true };
 }
@@ -5286,7 +5289,6 @@ function requestRender() {
       renderImage(image);
     }
     updateViewState();
-    drawSelectionGraph();
   });
 }
 
