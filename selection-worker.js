@@ -42,7 +42,11 @@ self.addEventListener("message", (event) => {
 
   const stats = selectionStats(pixels, width, height);
   const pooled = selectionPooledGrid(pixels, width, height);
-  self.postMessage({ kind: "stats", jobId, stats, pooled }, [pooled.values.buffer]);
+  const texture = selectionPeakTexture(pixels, width, height);
+  self.postMessage(
+    { kind: "stats", jobId, stats, pooled, texture },
+    [pooled.values.buffer, texture.values.buffer]
+  );
   const matrix = selectionMatrixValue(
     pixels,
     width,
@@ -110,7 +114,7 @@ function selectionStats(pixels, width, height) {
 
 // Box-averaged linear RGBA grid (up to maxCols x maxRows cells) used to render the
 // selection graph without missing small bright/dark spots that point sampling would skip.
-function selectionPooledGrid(pixels, width, height, maxCols = 64, maxRows = 64) {
+function selectionPooledGrid(pixels, width, height, maxCols = 160, maxRows = 160) {
   const cols = Math.max(1, Math.min(maxCols, width));
   const rows = Math.max(1, Math.min(maxRows, height));
   const sums = new Float64Array(cols * rows * 4);
@@ -138,6 +142,44 @@ function selectionPooledGrid(pixels, width, height, maxCols = 64, maxRows = 64) 
   }
 
   return { cols, rows, values };
+}
+
+// Higher-resolution color data for the selection graph. When the source is
+// reduced, keep channel/luminance peaks instead of averaging them away.
+// 256 samples along each axis is above the graph's height mesh resolution while
+// staying close to the panel's actual on-screen resolution.
+function selectionPeakTexture(pixels, width, height, maxCols = 256, maxRows = 256) {
+  const cols = Math.max(1, Math.min(maxCols, width));
+  const rows = Math.max(1, Math.min(maxRows, height));
+  const componentCount = 5; // R, G, B, A, luminance
+  const values = new Float32Array(cols * rows * componentCount);
+  values.fill(-Infinity);
+
+  for (let y = 0; y < height; y += 1) {
+    const rowIndex = Math.min(rows - 1, Math.floor((y * rows) / height));
+    for (let x = 0; x < width; x += 1) {
+      const colIndex = Math.min(cols - 1, Math.floor((x * cols) / width));
+      const sourceIndex = (y * width + x) * 4;
+      const targetIndex = (rowIndex * cols + colIndex) * componentCount;
+      for (let channel = 0; channel < 4; channel += 1) {
+        const value = pixels[sourceIndex + channel];
+        if (Number.isFinite(value)) {
+          values[targetIndex + channel] = Math.max(values[targetIndex + channel], value);
+        }
+      }
+      const luminance = pixelLuminance(pixels, sourceIndex);
+      if (Number.isFinite(luminance)) {
+        values[targetIndex + 4] = Math.max(values[targetIndex + 4], luminance);
+      }
+    }
+  }
+
+  for (let index = 0; index < values.length; index += 1) {
+    if (!Number.isFinite(values[index])) {
+      values[index] = 0;
+    }
+  }
+  return { cols, rows, componentCount, values, peakPooled: cols < width || rows < height };
 }
 
 function selectionMatrixValue(

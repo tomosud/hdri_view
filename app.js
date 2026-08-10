@@ -3901,7 +3901,7 @@ function runSelectionWorker(image, rect, rectKey, matrixKey, valueMode, channels
     return;
   }
   try {
-    selectionWorker = new Worker(new URL("./selection-worker.js?v=20260808-2", import.meta.url), { type: "module" });
+    selectionWorker = new Worker(new URL("./selection-worker.js?v=20260810-2", import.meta.url), { type: "module" });
   } catch (error) {
     selectionDetailsInFlight = null;
     console.error("Selection worker could not start.", error);
@@ -3917,6 +3917,7 @@ function runSelectionWorker(image, rect, rectKey, matrixKey, valueMode, channels
         rectKey,
         stats: event.data.stats,
         pooled: event.data.pooled,
+        texture: event.data.texture,
         matrixKey: null,
         matrix: ""
       });
@@ -3930,6 +3931,7 @@ function runSelectionWorker(image, rect, rectKey, matrixKey, valueMode, channels
         rectKey,
         stats: cached?.rectKey === rectKey ? cached.stats : event.data.stats,
         pooled: cached?.rectKey === rectKey ? cached.pooled : event.data.pooled,
+        texture: cached?.rectKey === rectKey ? cached.texture : event.data.texture,
         matrixKey,
         matrix: event.data.matrix ?? ""
       });
@@ -4040,7 +4042,7 @@ function runFullSelectionMatrixWorker(image, rect, matrixKey, valueMode, channel
     return;
   }
   try {
-    selectionMatrixCopyWorker = new Worker(new URL("./selection-worker.js?v=20260808-2", import.meta.url), { type: "module" });
+    selectionMatrixCopyWorker = new Worker(new URL("./selection-worker.js?v=20260810-2", import.meta.url), { type: "module" });
   } catch (error) {
     console.error("Matrix copy worker could not start.", error);
     fileHint.textContent = "Matrix copy failed.";
@@ -4176,7 +4178,8 @@ function drawSelectionGraph() {
   }
 
   selectionGraphPanel.classList.remove("hidden");
-  const sampling = selectionGraphSampling(rect);
+  const bounds = selectionGraphCanvas.getBoundingClientRect();
+  const sampling = selectionGraphSampling(rect, bounds.width, bounds.height);
   const samplingLabel = sampling.stepped ? "" : sampling.downsampled ? " · Downsampled" : " · Interpolated";
   const graphLabel = `${rect.width} x ${rect.height} px ${graphModeLabel(image)}${samplingLabel}`;
   selectionGraphLabel.textContent = graphLabel;
@@ -4185,7 +4188,6 @@ function drawSelectionGraph() {
     return;
   }
 
-  const bounds = selectionGraphCanvas.getBoundingClientRect();
   const width = Math.max(1, bounds.width);
   const height = Math.max(1, bounds.height);
   const dpr = Math.max(1, window.devicePixelRatio || 1);
@@ -4212,6 +4214,10 @@ function drawSelectionGraph() {
   const max = statistics?.max ?? samples.max;
   const normalize = graphValueNormalizer(min, max, image.settings.logDisplay ? "log" : "linear");
   const projector = makeGraphProjector(samples, rect, width, height, normalize);
+  const colorTexture = sampling.downsampled
+    ? selectionGraphColorTexture(image, rect, normalize, min, max)
+    : null;
+  const interactiveGraphDrag = activeDrag?.kind === "graphRotate" || activeDrag?.kind === "graphResize";
 
   graphCtx.save();
   drawGraphBase(samples, projector);
@@ -4219,11 +4225,11 @@ function drawSelectionGraph() {
   if (samples.stepped) {
     drawSteppedGraph(samples, projector, normalize, min);
   } else {
-    drawInterpolatedGraph(samples, projector, normalize);
+    drawInterpolatedGraph(samples, projector, normalize, interactiveGraphDrag ? null : colorTexture);
   }
 
   drawGraphLegend(width, height, min, max, statistics, normalize);
-  drawGraphSamplingNotice(sampling);
+  drawGraphSamplingNotice({ ...sampling, cols: samples.cols, rows: samples.rows }, colorTexture);
   graphCtx.restore();
 }
 
@@ -4243,11 +4249,26 @@ function graphValueNormalizer(min, max, mode) {
   return (value) => clamp01(((Number.isFinite(value) ? value : min) - min) / range);
 }
 
-function selectionGraphSampling(rect) {
-  const stepped = !activeDrag && rect.width <= 64 && rect.height <= 64;
-  const sampleLimit = activeDrag ? 20 : 64;
-  const cols = stepped ? rect.width : Math.max(2, Math.min(sampleLimit, rect.width));
-  const rows = stepped ? rect.height : Math.max(2, Math.min(sampleLimit, rect.height));
+function selectionGraphSampling(
+  rect,
+  displayWidth = selectionGraphCanvas.clientWidth,
+  displayHeight = selectionGraphCanvas.clientHeight
+) {
+  const selectionChanging = activeDrag?.kind === "selectRect";
+  const graphInteraction = activeDrag?.kind === "graphRotate" || activeDrag?.kind === "graphResize";
+  const stepped = !selectionChanging && rect.width <= 64 && rect.height <= 64;
+  const colsLimit = selectionChanging
+    ? 20
+    : graphInteraction
+      ? 64
+      : adaptiveGraphMeshLimit(Math.max(1, displayWidth - 66));
+  const rowsLimit = selectionChanging
+    ? 20
+    : graphInteraction
+      ? 64
+      : adaptiveGraphMeshLimit(Math.max(1, displayHeight - 30));
+  const cols = stepped ? rect.width : Math.max(2, Math.min(colsLimit, rect.width));
+  const rows = stepped ? rect.height : Math.max(2, Math.min(rowsLimit, rect.height));
   return {
     stepped,
     cols,
@@ -4256,18 +4277,27 @@ function selectionGraphSampling(rect) {
   };
 }
 
+function adaptiveGraphMeshLimit(displayPixels) {
+  const target = Math.max(64, Math.ceil(displayPixels / 7));
+  return [64, 96, 128, 160].find((limit) => target <= limit) ?? 160;
+}
+
 function selectionGraphSamples(image, rect, sampling = selectionGraphSampling(rect)) {
-  if (!activeDrag) {
+  if (activeDrag?.kind !== "selectRect") {
     const cached = selectionDetailsCache.get(image);
     if (cached?.rectKey === selectionRectKey(image, rect) && cached.pooled) {
-      const pooled = pooledGraphSamples(image, cached.pooled);
+      const pooled = pooledGraphSamples(image, cached.pooled, sampling.cols, sampling.rows);
       if (pooled) {
         return { ...pooled, stepped: sampling.stepped };
       }
     }
   }
 
-  const { stepped, cols, rows } = sampling;
+  // Until the worker's high-resolution average grid is ready, avoid issuing a
+  // large number of direct reads (especially asynchronous tile reads).
+  const stepped = sampling.stepped;
+  const cols = stepped ? sampling.cols : Math.min(64, sampling.cols);
+  const rows = stepped ? sampling.rows : Math.min(64, sampling.rows);
   const values = [];
   let min = Infinity;
   let max = -Infinity;
@@ -4298,42 +4328,95 @@ function selectionGraphSamples(image, rect, sampling = selectionGraphSampling(re
   return { cols, rows, values, min, max, stepped };
 }
 
-// Averages each pooled cell's linear RGBA into the current channel/luminance value.
-function pooledGraphSamples(image, pooled) {
+// Converts the worker's highest-resolution average grid to the mesh resolution
+// selected for the current panel size.
+function pooledGraphSamples(image, pooled, targetCols = pooled.cols, targetRows = pooled.rows) {
   const { cols, rows, values } = pooled;
   if (!cols || !rows || !values?.length) {
     return null;
   }
   const mode = image.settings.channel;
-  const grid = [];
-  let min = Infinity;
-  let max = -Infinity;
+  const sourceGrid = [];
   for (let row = 0; row < rows; row += 1) {
     const line = [];
     for (let col = 0; col < cols; col += 1) {
       const index = (row * cols + col) * 4;
-      const value = channelValueFromRgba(mode, values[index], values[index + 1], values[index + 2], values[index + 3]);
-      line.push(value);
+      line.push(channelValueFromRgba(
+        mode,
+        values[index],
+        values[index + 1],
+        values[index + 2],
+        values[index + 3]
+      ));
+    }
+    sourceGrid.push(line);
+  }
+
+  const outputCols = Math.max(1, Math.min(targetCols, cols));
+  const outputRows = Math.max(1, Math.min(targetRows, rows));
+  const grid = resampleGraphGrid(sourceGrid, cols, rows, outputCols, outputRows);
+  let min = Infinity;
+  let max = -Infinity;
+  for (const line of grid) {
+    for (const value of line) {
       if (Number.isFinite(value)) {
         min = Math.min(min, value);
         max = Math.max(max, value);
       }
     }
-    grid.push(line);
   }
   if (!Number.isFinite(min) || !Number.isFinite(max)) {
     min = 0;
     max = 0;
   }
-  return { cols, rows, values: grid, min, max };
+  return { cols: outputCols, rows: outputRows, values: grid, min, max };
 }
 
-function drawGraphSamplingNotice(sampling) {
+function resampleGraphGrid(source, sourceCols, sourceRows, targetCols, targetRows) {
+  if (sourceCols === targetCols && sourceRows === targetRows) {
+    return source;
+  }
+  const result = [];
+  for (let targetRow = 0; targetRow < targetRows; targetRow += 1) {
+    const sourceTop = targetRow * sourceRows / targetRows;
+    const sourceBottom = (targetRow + 1) * sourceRows / targetRows;
+    const firstSourceRow = Math.floor(sourceTop);
+    const lastSourceRow = Math.min(sourceRows - 1, Math.ceil(sourceBottom) - 1);
+    const line = [];
+    for (let targetCol = 0; targetCol < targetCols; targetCol += 1) {
+      const sourceLeft = targetCol * sourceCols / targetCols;
+      const sourceRight = (targetCol + 1) * sourceCols / targetCols;
+      const firstSourceCol = Math.floor(sourceLeft);
+      const lastSourceCol = Math.min(sourceCols - 1, Math.ceil(sourceRight) - 1);
+      let weightedSum = 0;
+      let totalWeight = 0;
+      for (let sourceRow = firstSourceRow; sourceRow <= lastSourceRow; sourceRow += 1) {
+        const rowWeight = Math.min(sourceBottom, sourceRow + 1) - Math.max(sourceTop, sourceRow);
+        for (let sourceCol = firstSourceCol; sourceCol <= lastSourceCol; sourceCol += 1) {
+          const colWeight = Math.min(sourceRight, sourceCol + 1) - Math.max(sourceLeft, sourceCol);
+          const weight = rowWeight * colWeight;
+          const value = source[sourceRow][sourceCol];
+          if (Number.isFinite(value) && weight > 0) {
+            weightedSum += value * weight;
+            totalWeight += weight;
+          }
+        }
+      }
+      line.push(totalWeight ? weightedSum / totalWeight : 0);
+    }
+    result.push(line);
+  }
+  return result;
+}
+
+function drawGraphSamplingNotice(sampling, texture = null) {
   if (sampling.stepped) {
     return;
   }
-  const label = sampling.downsampled
-    ? `Downsampled: ${sampling.cols} x ${sampling.rows}`
+  const label = sampling.downsampled && texture
+    ? `Mesh: ${sampling.cols} x ${sampling.rows} · Texture: ${texture.cols} x ${texture.rows}${texture.peakPooled ? " peak" : ""}`
+    : sampling.downsampled
+      ? `Downsampled: ${sampling.cols} x ${sampling.rows}`
     : "Interpolated";
   graphCtx.font = "10px Consolas, monospace";
   graphCtx.textAlign = "left";
@@ -4404,7 +4487,7 @@ function graphModeLabel(image) {
   return "Luminance";
 }
 
-function drawInterpolatedGraph(samples, projector, normalize) {
+function drawInterpolatedGraph(samples, projector, normalize, texture = null) {
   const quads = [];
   for (let row = 0; row < samples.rows - 1; row += 1) {
     for (let col = 0; col < samples.cols - 1; col += 1) {
@@ -4413,9 +4496,22 @@ function drawInterpolatedGraph(samples, projector, normalize) {
       const v11 = samples.values[row + 1][col + 1];
       const v01 = samples.values[row + 1][col];
       const avg = (v00 + v10 + v11 + v01) / 4;
+      const u0 = texture ? col * texture.cols / (samples.cols - 1) : 0;
+      const u1 = texture ? (col + 1) * texture.cols / (samples.cols - 1) : 0;
+      const textureV0 = texture ? row * texture.rows / (samples.rows - 1) : 0;
+      const textureV1 = texture ? (row + 1) * texture.rows / (samples.rows - 1) : 0;
       quads.push({
         depth: graphFaceDepth(projector, col, row, col + 1, row + 1),
         color: graphColor(normalize(avg)),
+        texture: texture ? {
+          canvas: texture.canvas,
+          uvs: [
+            { x: u0, y: textureV0 },
+            { x: u1, y: textureV0 },
+            { x: u1, y: textureV1 },
+            { x: u0, y: textureV1 }
+          ]
+        } : null,
         alpha: 1,
         stroke: "rgba(8, 12, 18, 0.36)",
         points: [
@@ -4505,20 +4601,110 @@ function graphFaceDepth(projector, x0, y0, x1, y1) {
 function drawGraphFaces(faces, lineWidth) {
   faces.sort((a, b) => a.depth - b.depth);
   for (const face of faces) {
-    graphCtx.beginPath();
-    graphCtx.moveTo(face.points[0].x, face.points[0].y);
-    for (const point of face.points.slice(1)) {
-      graphCtx.lineTo(point.x, point.y);
-    }
-    graphCtx.closePath();
+    traceGraphFace(face);
     graphCtx.globalAlpha = face.alpha;
-    graphCtx.fillStyle = face.color;
-    graphCtx.fill();
+    if (face.texture) {
+      drawTexturedGraphFace(face);
+    } else {
+      graphCtx.fillStyle = face.color;
+      graphCtx.fill();
+    }
     graphCtx.globalAlpha = 1;
     graphCtx.strokeStyle = face.stroke;
     graphCtx.lineWidth = lineWidth;
+    traceGraphFace(face);
     graphCtx.stroke();
   }
+}
+
+function traceGraphFace(face) {
+  graphCtx.beginPath();
+  graphCtx.moveTo(face.points[0].x, face.points[0].y);
+  for (const point of face.points.slice(1)) {
+    graphCtx.lineTo(point.x, point.y);
+  }
+  graphCtx.closePath();
+}
+
+function drawTexturedGraphFace(face) {
+  drawTexturedGraphTriangle(face.texture.canvas, [
+    { point: face.points[0], uv: face.texture.uvs[0] },
+    { point: face.points[1], uv: face.texture.uvs[1] },
+    { point: face.points[2], uv: face.texture.uvs[2] }
+  ]);
+  drawTexturedGraphTriangle(face.texture.canvas, [
+    { point: face.points[0], uv: face.texture.uvs[0] },
+    { point: face.points[2], uv: face.texture.uvs[2] },
+    { point: face.points[3], uv: face.texture.uvs[3] }
+  ]);
+}
+
+function drawTexturedGraphTriangle(canvas, vertices) {
+  const [a, b, c] = vertices;
+  const determinant =
+    a.uv.x * (b.uv.y - c.uv.y) +
+    b.uv.x * (c.uv.y - a.uv.y) +
+    c.uv.x * (a.uv.y - b.uv.y);
+  if (Math.abs(determinant) < 1e-8) {
+    return;
+  }
+
+  const scaleX = (
+    a.point.x * (b.uv.y - c.uv.y) +
+    b.point.x * (c.uv.y - a.uv.y) +
+    c.point.x * (a.uv.y - b.uv.y)
+  ) / determinant;
+  const skewX = (
+    a.point.x * (c.uv.x - b.uv.x) +
+    b.point.x * (a.uv.x - c.uv.x) +
+    c.point.x * (b.uv.x - a.uv.x)
+  ) / determinant;
+  const offsetX = (
+    a.point.x * (b.uv.x * c.uv.y - c.uv.x * b.uv.y) +
+    b.point.x * (c.uv.x * a.uv.y - a.uv.x * c.uv.y) +
+    c.point.x * (a.uv.x * b.uv.y - b.uv.x * a.uv.y)
+  ) / determinant;
+  const skewY = (
+    a.point.y * (b.uv.y - c.uv.y) +
+    b.point.y * (c.uv.y - a.uv.y) +
+    c.point.y * (a.uv.y - b.uv.y)
+  ) / determinant;
+  const scaleY = (
+    a.point.y * (c.uv.x - b.uv.x) +
+    b.point.y * (a.uv.x - c.uv.x) +
+    c.point.y * (b.uv.x - a.uv.x)
+  ) / determinant;
+  const offsetY = (
+    a.point.y * (b.uv.x * c.uv.y - c.uv.x * b.uv.y) +
+    b.point.y * (c.uv.x * a.uv.y - a.uv.x * c.uv.y) +
+    c.point.y * (a.uv.x * b.uv.y - b.uv.x * a.uv.y)
+  ) / determinant;
+  const sourceX = Math.min(a.uv.x, b.uv.x, c.uv.x);
+  const sourceY = Math.min(a.uv.y, b.uv.y, c.uv.y);
+  const sourceWidth = Math.max(a.uv.x, b.uv.x, c.uv.x) - sourceX;
+  const sourceHeight = Math.max(a.uv.y, b.uv.y, c.uv.y) - sourceY;
+
+  graphCtx.save();
+  graphCtx.beginPath();
+  graphCtx.moveTo(a.point.x, a.point.y);
+  graphCtx.lineTo(b.point.x, b.point.y);
+  graphCtx.lineTo(c.point.x, c.point.y);
+  graphCtx.closePath();
+  graphCtx.clip();
+  graphCtx.imageSmoothingEnabled = false;
+  graphCtx.transform(scaleX, skewY, skewX, scaleY, offsetX, offsetY);
+  graphCtx.drawImage(
+    canvas,
+    sourceX,
+    sourceY,
+    sourceWidth,
+    sourceHeight,
+    sourceX,
+    sourceY,
+    sourceWidth,
+    sourceHeight
+  );
+  graphCtx.restore();
 }
 
 function makeGraphProjector(samples, rect, width, height, normalize) {
@@ -4713,25 +4899,67 @@ function drawGraphLegend(width, height, min, max, statistics = null, normalize =
     graphCtx.fillText(`${marker.label} ${formatNumber(marker.value)}`, barX - 7, marker.labelY);
   }
 }
-function graphColor(value) {
+const graphColorStops = [
+  [0, 0, 70],
+  [0, 74, 255],
+  [0, 220, 255],
+  [0, 210, 72],
+  [255, 238, 0],
+  [255, 0, 0]
+];
+
+function graphColorComponents(value) {
   const t = clamp01(value);
-  const stops = [
-    [0, 0, 70],
-    [0, 74, 255],
-    [0, 220, 255],
-    [0, 210, 72],
-    [255, 238, 0],
-    [255, 0, 0]
-  ];
-  const scaled = t * (stops.length - 1);
-  const index = Math.min(stops.length - 2, Math.floor(scaled));
+  const scaled = t * (graphColorStops.length - 1);
+  const index = Math.min(graphColorStops.length - 2, Math.floor(scaled));
   const local = scaled - index;
-  const a = stops[index];
-  const b = stops[index + 1];
+  const a = graphColorStops[index];
+  const b = graphColorStops[index + 1];
   const r = Math.round(a[0] + (b[0] - a[0]) * local);
   const g = Math.round(a[1] + (b[1] - a[1]) * local);
   const blue = Math.round(a[2] + (b[2] - a[2]) * local);
+  return [r, g, blue];
+}
+
+function graphColor(value) {
+  const [r, g, blue] = graphColorComponents(value);
   return `rgb(${r} ${g} ${blue})`;
+}
+
+function selectionGraphColorTexture(image, rect, normalize, min, max) {
+  const cached = selectionDetailsCache.get(image);
+  const rectKey = selectionRectKey(image, rect);
+  const texture = cached?.rectKey === rectKey ? cached.texture : null;
+  if (!texture?.values?.length || !texture.cols || !texture.rows) {
+    return null;
+  }
+
+  const mode = image.settings.channel;
+  const component = { r: 0, g: 1, b: 2, a: 3 }[mode] ?? 4;
+  const renderKey = `${mode}:${image.settings.logDisplay ? "log" : "linear"}:${min}:${max}`;
+  if (texture.canvas && texture.renderKey === renderKey) {
+    return texture;
+  }
+
+  const canvas = texture.canvas || document.createElement("canvas");
+  canvas.width = texture.cols;
+  canvas.height = texture.rows;
+  const context = canvas.getContext("2d");
+  const imageData = context.createImageData(texture.cols, texture.rows);
+  const componentCount = texture.componentCount || 5;
+  for (let pixelIndex = 0; pixelIndex < texture.cols * texture.rows; pixelIndex += 1) {
+    const value = texture.values[pixelIndex * componentCount + component];
+    const [r, g, b] = graphColorComponents(normalize(value));
+    const targetIndex = pixelIndex * 4;
+    imageData.data[targetIndex] = r;
+    imageData.data[targetIndex + 1] = g;
+    imageData.data[targetIndex + 2] = b;
+    imageData.data[targetIndex + 3] = 255;
+  }
+  context.putImageData(imageData, 0, 0);
+  texture.canvas = canvas;
+  texture.renderKey = renderKey;
+  return texture;
 }
 
 function forEachPixelInRect(image, rect, callback) {
