@@ -202,10 +202,20 @@ GPU メモリと readPixels によるフリーズを避けるため、GLSL の�
 | 読み込み | PNG, JPEG, WebP, AVIF, GIF, BMP, JPEG 2000 (JP2/J2K), TIFF / BigTIFF, HDR (Radiance), EXR (OpenEXR) |
 | 保存 | PNG, JPEG, WebP, HDR RGBE（HDRI画像）, EXR Float（HDRI画像） |
 
+AVIF はブラウザの WebCodecs `ImageDecoder` が返すネイティブYUVプレーンをWorkerで読みます。
+対応ブラウザでは 8/10/12-bit、4:2:0 / 4:2:2 / 4:4:4、full / limited range を保持し、
+CICP の色域（BT.709 / BT.2020 / Display P3）、伝達特性、行列係数を使ってlinear sRGBへ変換します。
+PQは規格どおり0〜10000 cd/m²へ復元するため、Picker・Selection・Selection Graphの
+`Linear [nit]` / `Luminance [nit]` は絶対輝度です。画面表示とsRGB値だけはSDRプレビュー用に
+トーンマップします。HLGは基準ディスプレイ輝度がファイル単独では決まらないため相対linearです。
+WebCodecsが使えない形式・ブラウザではCanvasの8-bit互換経路へフォールバックし、Type欄に表示します。
+AVIF gain mapの合成は未対応です。
+
 ## 技術構成
 
 - ビルド不要の静的サイト（GitHub Pages でホスト可能）
 - [three.js](https://threejs.org/) の `EXRLoader` / `RGBELoader` を利用して HDR/EXR を読み込み
+- AVIF は外部ライブラリを追加せず、ブラウザ内蔵WebCodecsでネイティブYUVを取り出し、CICP/PQ/HLG変換を専用Workerで行う
 - PNG は小～中画像を `png-decoder.js`、巨大画像を `png-tile-worker.js` で自前デコードする。巨大画像は圧縮ファイル全体やRGBA Float32全体を確保せず、待ち時間中だけ最大1024pxの仮画像を使う。ピクセル値は原寸タイルへの切替後に元ビット深度で取得する
 - TIFF はMITライセンスの GeoTIFF.js 3.0.5を常駐Workerで実行し、表示・ピッカー・選択範囲に必要な領域だけを読む。LZW・Deflate・PackBits・JPEGなどの圧縮、strip/tile、整数・浮動小数点サンプルに対応する
 - JPEG 2000 はMITライセンスの `@cornerstonejs/codec-openjpeg` 1.3.0（OpenJPEG純JS版）をWorkerで実行する。Codecの安全メモリ内に収まる画像は原寸タイル表示し、領域デコードAPIが未公開の巨大画像はwaveletサブ解像度へフォールバックする
@@ -229,7 +239,7 @@ Canvas 2D 経由（`drawImage` → `getImageData`）だと以下の非可逆変�
 自前デコードでは、ビット深度 1/2/4/8/16、カラータイプ gray / rgb / palette / gray+alpha / rgba、
 `tRNS`、Adam7 インタレースに対応し、ファイルに書かれた値をそのまま取り出します。
 
-PNG 以外（JPEG / WebP / AVIF / GIF / BMP）は従来どおり Canvas 経由です。alpha を持たない画像は
+PNG / AVIF 以外（JPEG / WebP / GIF / BMP）は従来どおり Canvas 経由です。alpha を持たない画像は
 この経路でも値は一致します。半透明を含む画像を Canvas 経由で読み込んだ場合は、View Settings の
 **Type** 欄に `(canvas: RGB approximate where alpha < 1)` と表示されます。
 

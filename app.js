@@ -6,6 +6,7 @@ import { canOpenPngAsTiles, openPngRasterSource } from "./png-raster-source.js?v
 import { decodeTiff, openTiffRasterSource } from "./tiff-decoder.js?v=20260809-6";
 import { decodeJpeg2000, openJpeg2000RasterSource } from "./jp2-decoder.js?v=20260809-6";
 import { createBitmapRasterSource, createMemoryRasterSource, createSwitchableRasterSource, RASTER_TILE_SIZE } from "./raster-source.js?v=20260809-6";
+import { openAvifRasterSource } from "./avif-raster-source.js?v=20260810-2";
 import {
   MAX_VALUE_MATRIX_PIXELS,
   isValueMatrixText,
@@ -965,7 +966,50 @@ async function loadImageFile(file) {
   if (extension === "jp2" || extension === "j2k" || extension === "j2c") {
     return loadJpeg2000Image(file);
   }
+  if (extension === "avif") {
+    return loadAvifImage(file);
+  }
   return loadRasterImage(file);
+}
+
+async function loadAvifImage(file) {
+  try {
+    const opened = await openAvifRasterSource(file, {
+      onProgress: (progress, label) => {
+        fileHint.textContent = `${file.name}: ${label || `${progress}%`}`;
+      }
+    });
+    const hdr = opened.transfer === "pq" || opened.transfer === "hlg";
+    const rangeLabel = opened.fullRange ? "full" : "limited";
+    const unitLabel = opened.valueUnit === "nit" ? " · absolute nit" : "";
+    return createImageRecord(
+      file,
+      opened.width,
+      opened.height,
+      `avif/${opened.frameFormat} · ${opened.primaries}/${opened.transfer}/${opened.matrix}/${rangeLabel}${unitLabel}`,
+      null,
+      "raster",
+      {
+        format: hdr ? "AVIF HDR" : "AVIF",
+        bitDepth: `${opened.bitDepth}-bit`,
+        rasterSource: opened.rasterSource,
+        range: computeRange(opened.preview.pixels),
+        overview: rasterOverview(opened.preview),
+        hdr,
+        logDisplay: false,
+        valueUnit: opened.valueUnit,
+        colorPrimaries: opened.primaries,
+        transfer: opened.transfer,
+        matrix: opened.matrix,
+        fullRange: opened.fullRange
+      }
+    );
+  } catch (error) {
+    console.warn("Exact AVIF decode unavailable; using 8-bit Canvas compatibility path.", error);
+    const record = await loadCanvasRasterImage(file);
+    record.type = `${record.type} (AVIF Canvas compatibility; HDR values unavailable)`;
+    return record;
+  }
 }
 
 async function loadJpeg2000Image(file) {
@@ -1502,6 +1546,12 @@ function createImageRecord(file, width, height, type, pixels, sourceFormat = "ra
     sourceFormat,
     format: metadata.format || (sourceFormat === "glsl" ? "GLSL" : sourceFormat === "values" ? "VALUES" : rasterFormat(file)),
     bitDepth: metadata.bitDepth || (sourceFormat === "glsl" || sourceFormat === "values" ? "32F" : ""),
+    hdr: Boolean(metadata.hdr),
+    valueUnit: metadata.valueUnit || "relative",
+    colorPrimaries: metadata.colorPrimaries || null,
+    transfer: metadata.transfer || null,
+    matrix: metadata.matrix || null,
+    fullRange: metadata.fullRange ?? null,
     source: { kind: "external", name: file.name },
     pixels,
     rasterSource,
@@ -1509,7 +1559,7 @@ function createImageRecord(file, width, height, type, pixels, sourceFormat = "ra
     overview: metadata.overview || null,
     settings: {
       autoLevel: false,
-      logDisplay: metadata.hdr ?? (sourceFormat === "hdr" || sourceFormat === "exr"),
+      logDisplay: metadata.logDisplay ?? metadata.hdr ?? (sourceFormat === "hdr" || sourceFormat === "exr"),
       brightness: 1,
       // UE 書き出しの EXR などアルファが全面 0 の画像は RGBA 表示だと真っ黒になるため RGB を既定にする
       channel: range.max[3] > 0 ? "rgba" : "rgb",
@@ -1974,6 +2024,12 @@ function imageVariant(image) {
     sourceFormat: image.sourceFormat,
     format: image.format,
     bitDepth: image.bitDepth,
+    hdr: image.hdr,
+    valueUnit: image.valueUnit,
+    colorPrimaries: image.colorPrimaries,
+    transfer: image.transfer,
+    matrix: image.matrix,
+    fullRange: image.fullRange,
     name: image.name,
     pixels: image.pixels,
     rasterSource: image.rasterSource,
@@ -1994,6 +2050,12 @@ function glslVariant(code, pixels, width, height) {
     sourceFormat: "glsl",
     format: "GLSL",
     bitDepth: "32F",
+    hdr: false,
+    valueUnit: "relative",
+    colorPrimaries: "bt709",
+    transfer: "linear",
+    matrix: "rgb",
+    fullRange: true,
     pixels,
     rasterSource: createMemoryRasterSource(pixels, width, height),
     range: computeRange(pixels)
@@ -2095,6 +2157,12 @@ function applyImageVariant(image, mode) {
   image.sourceFormat = variant.sourceFormat;
   image.format = variant.format;
   image.bitDepth = variant.bitDepth;
+  image.hdr = Boolean(variant.hdr);
+  image.valueUnit = variant.valueUnit || "relative";
+  image.colorPrimaries = variant.colorPrimaries || null;
+  image.transfer = variant.transfer || null;
+  image.matrix = variant.matrix || null;
+  image.fullRange = variant.fullRange ?? null;
   image.pixels = variant.pixels;
   image.rasterSource = variant.rasterSource;
   image.range = variant.range;
@@ -3316,6 +3384,12 @@ function imageSessionState(image) {
     sourceFormat: image.sourceFormat,
     format: image.format,
     bitDepth: image.bitDepth,
+    hdr: image.hdr,
+    valueUnit: image.valueUnit,
+    colorPrimaries: image.colorPrimaries,
+    transfer: image.transfer,
+    matrix: image.matrix,
+    fullRange: image.fullRange,
     source: imageSourceSessionState(image),
     settings: { ...image.settings },
     view: { ...image.view },
@@ -3349,6 +3423,12 @@ function imageSourceSessionState(image) {
       sourceFormat: stored.sourceFormat,
       format: stored.format,
       bitDepth: stored.bitDepth,
+      hdr: stored.hdr,
+      valueUnit: stored.valueUnit,
+      colorPrimaries: stored.colorPrimaries,
+      transfer: stored.transfer,
+      matrix: stored.matrix,
+      fullRange: stored.fullRange,
       pixels: stored.pixels.buffer.slice(stored.pixels.byteOffset, stored.pixels.byteOffset + stored.pixels.byteLength)
     };
   }
@@ -3449,7 +3529,16 @@ async function restoreImageFromSession(savedImage) {
       source.type || savedImage.type || "raster/srgb",
       pixels,
       source.sourceFormat || savedImage.sourceFormat || "raster",
-      { format: source.format || savedImage.format, bitDepth: source.bitDepth || savedImage.bitDepth }
+      {
+        format: source.format || savedImage.format,
+        bitDepth: source.bitDepth || savedImage.bitDepth,
+        hdr: source.hdr ?? savedImage.hdr,
+        valueUnit: source.valueUnit || savedImage.valueUnit,
+        colorPrimaries: source.colorPrimaries || savedImage.colorPrimaries,
+        transfer: source.transfer || savedImage.transfer,
+        matrix: source.matrix || savedImage.matrix,
+        fullRange: source.fullRange ?? savedImage.fullRange
+      }
     );
     image.source = { kind: "embedded" };
     return image;
@@ -3707,9 +3796,10 @@ function updateHoveredPickerUi({ scroll = false } = {}) {
   const linear = readDisplayedLinear(hovered.image, hovered.picker.x, hovered.picker.y, () => {
     if (hoveredPickerId === currentHoverId) requestHoveredPickerUi();
   });
-  const modeLabel = { linear: "Linear", srgb: "sRGB", srgb255: "sRGB 255" }[pickerValueMode.value] || pickerValueMode.value;
+  let modeLabel = { linear: "Linear", srgb: "sRGB", srgb255: "sRGB 255" }[pickerValueMode.value] || pickerValueMode.value;
+  if (pickerValueMode.value === "linear" && hovered.image.valueUnit === "nit") modeLabel += " [nit]";
   hoveredPickerValue.textContent = linear
-    ? `P${hovered.picker.id} ${modeLabel}: ${formatPickerValue(hovered.image, valuesFromLinear(linear))}`
+    ? `P${hovered.picker.id} ${modeLabel}: ${formatPickerValue(hovered.image, valuesFromLinear(linear, hovered.image))}`
     : `P${hovered.picker.id} ${modeLabel}: Loading...`;
 }
 
@@ -3782,10 +3872,11 @@ function updateSelectionPanel() {
   ];
 
   if (stats) {
+    const unit = image.valueUnit === "nit" ? " nit" : "";
     summaryLines.push(
-      `Min: ${formatChannelStats(stats.min, channels)}`,
-      `Max: ${formatChannelStats(stats.max, channels)}`,
-      `Average RGB: ${formatRgbStats(stats.average)}; Luminance ${formatNumber(stats.averageLuminance)}`
+      `Min: ${formatChannelStats(stats.min, channels, image.valueUnit)}`,
+      `Max: ${formatChannelStats(stats.max, channels, image.valueUnit)}`,
+      `Average RGB: ${formatRgbStats(stats.average)}${unit}; Luminance ${formatNumber(stats.averageLuminance)}${unit}`
     );
   } else {
     summaryLines.push("Statistics: pending...");
@@ -3906,7 +3997,7 @@ function runSelectionWorker(image, rect, rectKey, matrixKey, valueMode, channels
     return;
   }
   try {
-    selectionWorker = new Worker(new URL("./selection-worker.js?v=20260810-2", import.meta.url), { type: "module" });
+    selectionWorker = new Worker(new URL("./selection-worker.js?v=20260810-3", import.meta.url), { type: "module" });
   } catch (error) {
     selectionDetailsInFlight = null;
     console.error("Selection worker could not start.", error);
@@ -3962,6 +4053,7 @@ function runSelectionWorker(image, rect, rectKey, matrixKey, valueMode, channels
     valueMode,
     channels,
     alphaWeighted: usesAlphaWeightedValues(image),
+    absoluteNits: image.valueUnit === "nit",
     previewRows: selectionMatrixPreviewRows,
     previewColumns: selectionMatrixPreviewColumns
   }, [pixels.buffer]);
@@ -4047,7 +4139,7 @@ function runFullSelectionMatrixWorker(image, rect, matrixKey, valueMode, channel
     return;
   }
   try {
-    selectionMatrixCopyWorker = new Worker(new URL("./selection-worker.js?v=20260810-2", import.meta.url), { type: "module" });
+    selectionMatrixCopyWorker = new Worker(new URL("./selection-worker.js?v=20260810-3", import.meta.url), { type: "module" });
   } catch (error) {
     console.error("Matrix copy worker could not start.", error);
     fileHint.textContent = "Matrix copy failed.";
@@ -4081,7 +4173,8 @@ function runFullSelectionMatrixWorker(image, rect, matrixKey, valueMode, channel
     height: rect.height,
     valueMode,
     channels,
-    alphaWeighted: usesAlphaWeightedValues(image)
+    alphaWeighted: usesAlphaWeightedValues(image),
+    absoluteNits: image.valueUnit === "nit"
   }, [pixels.buffer]);
 }
 
@@ -4145,7 +4238,10 @@ async function selectionCsvText(image, rect) {
         mode,
         displayChannelLabel(image),
         ...valueTupleForMode(
-          valuesFromLinear(displayedLinearFromRgba(image, pixels.subarray((y * rect.width + x) * 4, (y * rect.width + x) * 4 + 4))),
+          valuesFromLinear(
+            displayedLinearFromRgba(image, pixels.subarray((y * rect.width + x) * 4, (y * rect.width + x) * 4 + 4)),
+            image
+          ),
           mode,
           channels
         )
@@ -4486,10 +4582,13 @@ function channelValueFromRgba(mode, r, g, b, a) {
 
 function graphModeLabel(image) {
   const mode = image.settings.channel;
+  let label;
   if (mode === "r" || mode === "g" || mode === "b" || mode === "a") {
-    return mode.toUpperCase();
+    label = mode.toUpperCase();
+  } else {
+    label = "Luminance";
   }
-  return "Luminance";
+  return image.valueUnit === "nit" && mode !== "a" ? `${label} [nit]` : label;
 }
 
 function drawInterpolatedGraph(samples, projector, normalize, texture = null) {
@@ -4986,7 +5085,7 @@ function forEachPixelInRect(image, rect, callback) {
 
 function pixelTupleForMode(image, x, y, mode, channels = valueChannels(image)) {
   const linear = readDisplayedLinear(image, x, y);
-  return linear ? valueTupleForMode(valuesFromLinear(linear), mode, channels) : channels.map(() => Number.NaN);
+  return linear ? valueTupleForMode(valuesFromLinear(linear, image), mode, channels) : channels.map(() => Number.NaN);
 }
 
 // RGBA 表示ではキャンバス上で色に alpha が乗った状態（黒背景との合成結果）が見えているため、
@@ -5017,11 +5116,12 @@ function displayedLinearFromRgba(image, rgba) {
   ];
 }
 
-function valuesFromLinear(linear) {
+function valuesFromLinear(linear, image = null) {
+  const displayLinear = image ? displayPreviewLinear(image, linear) : linear;
   const srgb = [
-    linearToSrgb(linear[0]),
-    linearToSrgb(linear[1]),
-    linearToSrgb(linear[2]),
+    linearToSrgb(displayLinear[0]),
+    linearToSrgb(displayLinear[1]),
+    linearToSrgb(displayLinear[2]),
     linear[3]
   ];
   const srgb255 = [
@@ -5045,7 +5145,7 @@ function pickerValues(image, picker) {
   const linear = readDisplayedLinear(image, picker.x, picker.y, () => {
     updatePickerPanel();
   });
-  return linear ? valuesFromLinear(linear) : { ...valuesFromLinear([0, 0, 0, 0]), pending: true };
+  return linear ? valuesFromLinear(linear, image) : { ...valuesFromLinear([0, 0, 0, 0], image), pending: true };
 }
 
 function formatPickerValue(image, values) {
@@ -5118,15 +5218,21 @@ function displayChannelLabel(image) {
   return mode.toUpperCase();
 }
 
-function formatChannelStats(values, channels) {
-  return channels.map((channel) => `${channel.label} ${formatNumber(values[channel.index])}`).join(", ");
+function formatChannelStats(values, channels, valueUnit = "relative") {
+  return channels.map((channel) => {
+    const unit = valueUnit === "nit" && channel.index < 3 ? " nit" : "";
+    return `${channel.label} ${formatNumber(values[channel.index])}${unit}`;
+  }).join(", ");
 }
 
 function sampleCssColor(image, linear) {
   const display = displayChannels(linear, image.settings.channel);
-  const r = Math.round(clamp01(linearToSrgb(display[0])) * 255);
-  const g = Math.round(clamp01(linearToSrgb(display[1])) * 255);
-  const b = Math.round(clamp01(linearToSrgb(display[2])) * 255);
+  const preview = image.valueUnit === "nit"
+    ? [...toneMapAbsoluteRgb(display[0], display[1], display[2], image.settings.brightness), display[3]]
+    : display;
+  const r = Math.round(clamp01(linearToSrgb(preview[0])) * 255);
+  const g = Math.round(clamp01(linearToSrgb(preview[1])) * 255);
+  const b = Math.round(clamp01(linearToSrgb(preview[2])) * 255);
   return `rgb(${r} ${g} ${b})`;
 }
 
@@ -5155,6 +5261,8 @@ function computeRange(pixels) {
   let maxG = -Infinity;
   let maxB = -Infinity;
   let maxA = -Infinity;
+  let luminanceMin = Infinity;
+  let luminanceMax = -Infinity;
 
   for (let i = 0; i < pixels.length; i += 4) {
     const r = pixels[i];
@@ -5178,6 +5286,11 @@ function computeRange(pixels) {
       if (a < minA) minA = a;
       if (a > maxA) maxA = a;
     }
+    const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    if (Number.isFinite(luminance)) {
+      if (luminance < luminanceMin) luminanceMin = luminance;
+      if (luminance > luminanceMax) luminanceMax = luminance;
+    }
   }
 
   const min = [minR, minG, minB, minA];
@@ -5194,7 +5307,9 @@ function computeRange(pixels) {
     min,
     max,
     rgbMin: Math.min(min[0], min[1], min[2]),
-    rgbMax: Math.max(max[0], max[1], max[2])
+    rgbMax: Math.max(max[0], max[1], max[2]),
+    luminanceMin: luminanceMin === Infinity ? 0 : luminanceMin,
+    luminanceMax: luminanceMax === -Infinity ? 0 : luminanceMax
   };
 }
 
@@ -5229,6 +5344,7 @@ function updateSettingsPanel() {
   filterSelect.value = image.settings.filter;
   autoLevelInput.checked = image.settings.autoLevel;
   brightnessInput.value = String(image.settings.brightness);
+  pickerValueMode.options[0].textContent = image.valueUnit === "nit" ? "Linear [nit]" : "Linear";
   updateSaveFormatOptions(image);
   metaName.textContent = image.name;
   metaSize.textContent = image.downsample > 1
@@ -5236,7 +5352,11 @@ function updateSettingsPanel() {
     : `${image.width} x ${image.height}`;
   metaType.textContent = `${image.type} / ${image.sourceFormat}`;
   const normalizationRange = getDisplayNormalizationRange(image);
-  metaRange.textContent = `${formatNumber(normalizationRange.min)} - ${formatNumber(normalizationRange.max)}`;
+  if (image.valueUnit === "nit" && image.settings.channel !== "a") {
+    metaRange.textContent = `${formatNumber(normalizationRange.min)} - ${formatNumber(normalizationRange.max)} nit; Y ${formatNumber(image.range.luminanceMin)} - ${formatNumber(image.range.luminanceMax)} nit`;
+  } else {
+    metaRange.textContent = `${formatNumber(normalizationRange.min)} - ${formatNumber(normalizationRange.max)}`;
+  }
 
   for (const button of channelButtons.querySelectorAll("button")) {
     button.classList.toggle("active", button.dataset.channel === image.settings.channel);
@@ -5478,6 +5598,7 @@ function displayConversion(image) {
     mode: image.settings.channel,
     brightness: image.settings.brightness,
     autoLevel: image.settings.autoLevel && width > 0,
+    absoluteNits: image.valueUnit === "nit",
     levelOffset: range.min,
     levelScale: width > 0 ? 1 / width : 1,
     logNormalize: image.settings.logDisplay ? graphValueNormalizer(range.min, range.max, "log") : null
@@ -5510,6 +5631,19 @@ function writeDisplayPixel(target, offset, source, sourceOffset, display) {
     sourceG = sourceR;
     sourceB = sourceR;
   }
+  if (display.absoluteNits && !display.logNormalize && !display.autoLevel) {
+    const preview = toneMapAbsoluteRgb(
+      source[sourceOffset + sourceR],
+      source[sourceOffset + sourceG],
+      source[sourceOffset + sourceB],
+      display.brightness
+    );
+    target[offset] = linearToSrgbByte(preview[0]);
+    target[offset + 1] = linearToSrgbByte(preview[1]);
+    target[offset + 2] = linearToSrgbByte(preview[2]);
+    target[offset + 3] = display.mode === "rgba" ? Math.round(clamp01(source[sourceOffset + 3]) * 255) : 255;
+    return;
+  }
   for (let channel = 0; channel < 3; channel += 1) {
     const channelOffset = channel === 0 ? sourceR : channel === 1 ? sourceG : sourceB;
     const value = source[sourceOffset + channelOffset];
@@ -5520,6 +5654,52 @@ function writeDisplayPixel(target, offset, source, sourceOffset, display) {
         : linearToSrgbByte(value * display.brightness);
   }
   target[offset + 3] = display.mode === "rgba" ? Math.round(clamp01(source[sourceOffset + 3]) * 255) : 255;
+}
+
+function displayPreviewLinear(image, linear) {
+  if (image?.valueUnit !== "nit") {
+    return linear;
+  }
+  // Numeric sRGB preview stays independent of the View Settings brightness,
+  // matching the existing picker/matrix contract for relative images.
+  const mapped = toneMapAbsoluteRgb(linear[0], linear[1], linear[2], 1);
+  return [mapped[0], mapped[1], mapped[2], linear[3]];
+}
+
+function toneMapAbsoluteRgb(redNits, greenNits, blueNits, brightness = 1) {
+  const red = Number.isFinite(redNits) ? redNits : 0;
+  const green = Number.isFinite(greenNits) ? greenNits : 0;
+  const blue = Number.isFinite(blueNits) ? blueNits : 0;
+  const luminance = Math.max(0, 0.2126 * red + 0.7152 * green + 0.0722 * blue);
+  if (luminance <= 1e-9) {
+    return [0, 0, 0];
+  }
+  // SDR preview only. Measurement pixels remain untouched in absolute cd/m².
+  const mappedLuminance = acesToneMap(luminance / 100 * Math.max(0, brightness));
+  const scale = mappedLuminance / luminance;
+  return fitLinearSrgbGamut(red * scale, green * scale, blue * scale, mappedLuminance);
+}
+
+function acesToneMap(value) {
+  const x = Math.max(0, value) * 0.6;
+  return clamp01((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14));
+}
+
+function fitLinearSrgbGamut(red, green, blue, luminance) {
+  let saturation = 1;
+  for (const channel of [red, green, blue]) {
+    if (channel < 0 && channel < luminance) {
+      saturation = Math.min(saturation, luminance / (luminance - channel));
+    } else if (channel > 1 && channel > luminance) {
+      saturation = Math.min(saturation, (1 - luminance) / (channel - luminance));
+    }
+  }
+  const safeSaturation = clamp01(saturation);
+  return [
+    clamp01(luminance + (red - luminance) * safeSaturation),
+    clamp01(luminance + (green - luminance) * safeSaturation),
+    clamp01(luminance + (blue - luminance) * safeSaturation)
+  ];
 }
 
 function drawPixelGrid(image, ctx, canvasWidth, canvasHeight) {
@@ -5648,10 +5828,11 @@ function updatePixelReadout(image, event) {
   const requestId = ++pixelReadoutRequestId;
   const apply = (linear) => {
     if (requestId !== pixelReadoutRequestId || !linear) return;
-    const srgb = [linearToSrgb(linear[0]), linearToSrgb(linear[1]), linearToSrgb(linear[2]), linear[3]];
+    const values = valuesFromLinear(linear, image);
+    const unit = image.valueUnit === "nit" ? " [nit]" : "";
     pixelPosition.textContent = `x: ${pixel.x}, y: ${pixel.y}`;
-    linearValue.textContent = `Linear: ${formatTuple(linear)}`;
-    srgbValue.textContent = `sRGB: ${formatTuple(srgb)}`;
+    linearValue.textContent = `Linear${unit}: ${formatTuple(linear)}`;
+    srgbValue.textContent = `${image.valueUnit === "nit" ? "sRGB preview" : "sRGB"}: ${formatTuple(values.srgb)}`;
   };
   const linear = readDisplayedLinear(image, pixel.x, pixel.y, apply);
   if (!linear) {

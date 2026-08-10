@@ -9,6 +9,7 @@ self.addEventListener("message", (event) => {
     valueMode,
     channels,
     alphaWeighted = false,
+    absoluteNits = false,
     previewRows,
     previewColumns
   } = event.data;
@@ -26,8 +27,9 @@ self.addEventListener("message", (event) => {
   }
 
   if (task === "matrix") {
+    const matrixPixels = pixelsForValueEncoding(pixels, valueMode, absoluteNits);
     const matrix = serializeValueMatrix({
-      pixels,
+      pixels: matrixPixels,
       width,
       height,
       channels,
@@ -47,8 +49,9 @@ self.addEventListener("message", (event) => {
     { kind: "stats", jobId, stats, pooled, texture },
     [pooled.values.buffer, texture.values.buffer]
   );
+  const matrixPixels = pixelsForValueEncoding(pixels, valueMode, absoluteNits);
   const matrix = selectionMatrixValue(
-    pixels,
+    matrixPixels,
     width,
     height,
     valueMode,
@@ -225,6 +228,53 @@ function formatPixelValue(value, channel, mode) {
     return formatNumber(linearToSrgb(value));
   }
   return formatNumber(value);
+}
+
+function pixelsForValueEncoding(pixels, mode, absoluteNits) {
+  if (!absoluteNits || mode === "linear") {
+    return pixels;
+  }
+  const result = pixels.slice();
+  for (let index = 0; index < result.length; index += 4) {
+    const mapped = toneMapAbsoluteRgb(result[index], result[index + 1], result[index + 2]);
+    result[index] = mapped[0];
+    result[index + 1] = mapped[1];
+    result[index + 2] = mapped[2];
+  }
+  return result;
+}
+
+function toneMapAbsoluteRgb(redNits, greenNits, blueNits) {
+  const red = Number.isFinite(redNits) ? redNits : 0;
+  const green = Number.isFinite(greenNits) ? greenNits : 0;
+  const blue = Number.isFinite(blueNits) ? blueNits : 0;
+  const luminance = Math.max(0, 0.2126 * red + 0.7152 * green + 0.0722 * blue);
+  if (luminance <= 1e-9) return [0, 0, 0];
+  const mappedLuminance = acesToneMap(luminance / 100);
+  const scale = mappedLuminance / luminance;
+  return fitLinearSrgbGamut(red * scale, green * scale, blue * scale, mappedLuminance);
+}
+
+function acesToneMap(value) {
+  const x = Math.max(0, value) * 0.6;
+  return clamp01((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14));
+}
+
+function fitLinearSrgbGamut(red, green, blue, luminance) {
+  let saturation = 1;
+  for (const channel of [red, green, blue]) {
+    if (channel < 0 && channel < luminance) {
+      saturation = Math.min(saturation, luminance / (luminance - channel));
+    } else if (channel > 1 && channel > luminance) {
+      saturation = Math.min(saturation, (1 - luminance) / (channel - luminance));
+    }
+  }
+  const safeSaturation = clamp01(saturation);
+  return [
+    clamp01(luminance + (red - luminance) * safeSaturation),
+    clamp01(luminance + (green - luminance) * safeSaturation),
+    clamp01(luminance + (blue - luminance) * safeSaturation)
+  ];
 }
 
 function pixelLuminance(pixels, index) {
