@@ -1,4 +1,4 @@
-import { createWorkerRasterSource } from "./raster-source.js?v=20260809-6";
+import { createWorkerRasterSource } from "./raster-source.js?v=20260811-2";
 
 export function isTiffFile(source) {
   const bytes = source instanceof Uint8Array ? source : new Uint8Array(source);
@@ -19,7 +19,7 @@ export function decodeTiff(source, { onProgress = null } = {}) {
   }
 
   return new Promise((resolve, reject) => {
-    const worker = new Worker(new URL("./tiff-worker.js?v=20260809-4", import.meta.url));
+    const worker = new Worker(new URL("./tiff-worker.js?v=20260811-2", import.meta.url));
     worker.addEventListener("message", (event) => {
       const message = event.data || {};
       if (message.type === "progress") {
@@ -57,7 +57,7 @@ export function openTiffRasterSource(file) {
     return Promise.reject(new Error("TIFF tiled source requires a File or Blob."));
   }
   return new Promise((resolve, reject) => {
-    const worker = new Worker(new URL("./tiff-worker.js?v=20260809-4", import.meta.url));
+    const worker = new Worker(new URL("./tiff-worker.js?v=20260811-2", import.meta.url));
     const initId = 0;
     const onMessage = (event) => {
       const message = event.data || {};
@@ -84,6 +84,7 @@ export function openTiffRasterSource(file) {
         channels: result.channels,
         compression: result.compression,
         sampleFormat: result.sampleFormat,
+        accessMode: result.accessMode,
         initialPreview: preview
       });
       resolve({ ...result, preview, rasterSource });

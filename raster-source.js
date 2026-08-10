@@ -25,7 +25,17 @@ export function createWorkerRasterSource(worker, metadata, { maxCachedTiles = 24
     if (message.type === "error") request.reject(new Error(message.message || "Raster worker request failed."));
     else request.resolve(message.result || message);
   });
-  worker.addEventListener("error", (event) => rejectAll(new Error(event.message || "Raster worker failed.")));
+  worker.addEventListener("error", (event) => {
+    disposed = true;
+    const message = typeof event.message === "string" && event.message && event.message !== "[object ProgressEvent]"
+      ? event.message
+      : "Raster worker stopped unexpectedly (possible memory exhaustion or decoder crash).";
+    rejectAll(new Error(message));
+  });
+  worker.addEventListener("messageerror", () => {
+    disposed = true;
+    rejectAll(new Error("Raster worker returned data that could not be transferred."));
+  });
 
   const request = (operation, payload = {}) => {
     if (disposed) return Promise.reject(new Error("Worker raster source is closed."));

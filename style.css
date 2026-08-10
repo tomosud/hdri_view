@@ -348,10 +348,44 @@ textarea {
 }
 
 .window-size {
+  min-width: 0;
+  overflow: hidden;
   color: var(--muted);
   font-family: Consolas, "Courier New", monospace;
   font-size: 11px;
+  text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.image-window.pq-display {
+  grid-template-rows: 46px minmax(0, 1fr);
+}
+
+.pq-display .window-titlebar {
+  grid-template-columns: minmax(0, 1fr) auto 24px;
+  grid-template-rows: 24px 18px;
+  column-gap: 8px;
+  row-gap: 0;
+}
+
+.pq-display .window-title {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+.pq-display .window-mode-tabs {
+  grid-column: 2;
+  grid-row: 1;
+}
+
+.pq-display .window-close {
+  grid-column: 3;
+  grid-row: 1;
+}
+
+.pq-display .window-size {
+  grid-column: 1 / -1;
+  grid-row: 2;
 }
 
 .window-body {

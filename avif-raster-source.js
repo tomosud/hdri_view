@@ -1,4 +1,4 @@
-import { createWorkerRasterSource } from "./raster-source.js?v=20260809-6";
+import { createWorkerRasterSource } from "./raster-source.js?v=20260811-2";
 
 const MAX_DECODED_SAMPLE_BYTES = 512 * 1024 * 1024;
 

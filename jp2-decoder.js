@@ -1,4 +1,4 @@
-import { createWorkerRasterSource } from "./raster-source.js?v=20260809-6";
+import { createWorkerRasterSource } from "./raster-source.js?v=20260811-2";
 
 const DEFAULT_MAX_PIXELS = 4096 * 4096;
 const MAX_FULL_RESOLUTION_SAMPLE_BYTES = 256 * 1024 * 1024;

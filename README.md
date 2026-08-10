@@ -217,7 +217,7 @@ AVIF gain mapの合成は未対応です。
 - [three.js](https://threejs.org/) の `EXRLoader` / `RGBELoader` を利用して HDR/EXR を読み込み
 - AVIF は外部ライブラリを追加せず、ブラウザ内蔵WebCodecsでネイティブYUVを取り出し、CICP/PQ/HLG変換を専用Workerで行う
 - PNG は小～中画像を `png-decoder.js`、巨大画像を `png-tile-worker.js` で自前デコードする。巨大画像は圧縮ファイル全体やRGBA Float32全体を確保せず、待ち時間中だけ最大1024pxの仮画像を使う。ピクセル値は原寸タイルへの切替後に元ビット深度で取得する
-- TIFF はMITライセンスの GeoTIFF.js 3.0.5を常駐Workerで実行し、表示・ピッカー・選択範囲に必要な領域だけを読む。LZW・Deflate・PackBits・JPEGなどの圧縮、strip/tile、整数・浮動小数点サンプルに対応する
+- TIFF はMITライセンスの GeoTIFF.js 3.0.5を常駐Workerで実行し、表示・ピッカー・選択範囲に必要な領域だけを読む。巨大な非圧縮・chunky形式のstrip TIFFは、strip全体を展開せずBlobの必要行区間を直接読む。LZW・Deflate・PackBits・JPEGなどの圧縮、strip/tile、整数・浮動小数点サンプルに対応する
 - JPEG 2000 はMITライセンスの `@cornerstonejs/codec-openjpeg` 1.3.0（OpenJPEG純JS版）をWorkerで実行する。Codecの安全メモリ内に収まる画像は原寸タイル表示し、領域デコードAPIが未公開の巨大画像はwaveletサブ解像度へフォールバックする
 - HDRI Value Matrix は `clipboard-matrix.js` でシリアライズ／解析
 - GLSL 加工・生成は `glsl-runtime.js`（WebGL2 を直接使用、RGBA32F の FBO に描いて `readPixels`）

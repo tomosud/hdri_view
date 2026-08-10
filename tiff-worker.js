@@ -11,6 +11,7 @@ const SAMPLE_FLOAT = 3;
 
 let rasterImage = null;
 let rasterInfo = null;
+let directRasterReader = null;
 
 self.addEventListener("message", async (event) => {
   const message = event.data || {};
@@ -25,6 +26,7 @@ self.addEventListener("message", async (event) => {
   if (message.type === "raster-dispose") {
     rasterImage = null;
     rasterInfo = null;
+    directRasterReader = null;
     self.close();
     return;
   }
@@ -174,6 +176,16 @@ async function initializeRasterSource(message) {
       : uniqueFormats.length === 1 && uniqueFormats[0] === SAMPLE_FLOAT
         ? `${uniqueBits.join("/")}F`
         : `${uniqueBits.join("/")}-bit`;
+    directRasterReader = await createDirectUncompressedStripReader(message.file, directory, {
+      width,
+      height,
+      samplesPerPixel,
+      bits,
+      sampleFormats,
+      photometric,
+      convertedRgb,
+      compression
+    });
     rasterImage = image;
     rasterInfo = {
       width,
@@ -187,7 +199,8 @@ async function initializeRasterSource(message) {
       compression,
       bitDepth: Math.max(...bits),
       bitDepthLabel,
-      sampleFormat: uniqueFormats.length === 1 ? uniqueFormats[0] : 0
+      sampleFormat: uniqueFormats.length === 1 ? uniqueFormats[0] : 0,
+      accessMode: directRasterReader ? "direct-uncompressed-strips" : "geotiff"
     };
     const preview = await readRasterPreview(1024);
     self.postMessage({
@@ -268,6 +281,9 @@ async function readRasterTile({ level, tileX, tileY, gutter = 1 }) {
 }
 
 async function readLinearWindow(window, width, height) {
+  if (directRasterReader) {
+    return readDirectUncompressedWindow(window, width, height);
+  }
   const options = { window, width, height, interleave: true, resampleMethod: "bilinear" };
   let raw;
   let sourceChannels;
@@ -307,6 +323,222 @@ async function readLinearWindow(window, width, height) {
     }
   }
   return pixels;
+}
+
+async function createDirectUncompressedStripReader(file, directory, info) {
+  if (!(file instanceof Blob) || info.compression !== 1 || info.convertedRgb) return null;
+  const planarConfiguration = directory.getValue("PlanarConfiguration") || 1;
+  const predictor = directory.getValue("Predictor") || 1;
+  const fillOrder = directory.getValue("FillOrder") || 1;
+  const stripOffsets = numericTagArray(directory.getValue("StripOffsets"));
+  const stripByteCounts = numericTagArray(directory.getValue("StripByteCounts"));
+  const rowsPerStrip = Number(directory.getValue("RowsPerStrip") || info.height);
+  if (
+    planarConfiguration !== 1 || predictor !== 1 || fillOrder !== 1 ||
+    stripOffsets.length < 1 || stripOffsets.length !== stripByteCounts.length ||
+    !Number.isInteger(rowsPerStrip) || rowsPerStrip < 1 ||
+    info.bits.some((bits, channel) => (
+      ![8, 16, 32].includes(bits) ||
+      (info.sampleFormats[channel] === SAMPLE_FLOAT && bits !== 32)
+    ))
+  ) {
+    return null;
+  }
+
+  const sampleByteOffsets = [];
+  let pixelBytes = 0;
+  for (const bits of info.bits) {
+    sampleByteOffsets.push(pixelBytes);
+    pixelBytes += bits / 8;
+  }
+  const rowBytes = info.width * pixelBytes;
+  const stripCount = Math.ceil(info.height / rowsPerStrip);
+  if (!Number.isSafeInteger(rowBytes) || stripOffsets.length < stripCount) return null;
+  for (let strip = 0; strip < stripCount; strip += 1) {
+    const offset = stripOffsets[strip];
+    const byteCount = stripByteCounts[strip];
+    const rowCount = Math.min(rowsPerStrip, info.height - strip * rowsPerStrip);
+    const requiredBytes = rowCount * rowBytes;
+    if (
+      !Number.isSafeInteger(offset) || !Number.isSafeInteger(byteCount) ||
+      offset < 0 || byteCount < requiredBytes || offset + requiredBytes > file.size
+    ) {
+      return null;
+    }
+  }
+
+  const signature = new Uint8Array(await file.slice(0, 2).arrayBuffer());
+  const littleEndian = signature[0] === 0x49 && signature[1] === 0x49;
+  const bigEndian = signature[0] === 0x4d && signature[1] === 0x4d;
+  if (!littleEndian && !bigEndian) return null;
+  return {
+    file,
+    ...info,
+    rowsPerStrip,
+    stripOffsets,
+    stripByteCounts,
+    sampleByteOffsets,
+    pixelBytes,
+    rowBytes,
+    littleEndian
+  };
+}
+
+function numericTagArray(value) {
+  const values = value == null
+    ? []
+    : Array.isArray(value) || ArrayBuffer.isView(value)
+      ? Array.from(value)
+      : [value];
+  return values.map((entry) => Number(entry));
+}
+
+async function readDirectUncompressedWindow(window, width, height) {
+  const reader = directRasterReader;
+  const left = Math.max(0, Math.min(reader.width - 1, Math.floor(window[0])));
+  const top = Math.max(0, Math.min(reader.height - 1, Math.floor(window[1])));
+  const right = Math.max(left + 1, Math.min(reader.width, Math.ceil(window[2])));
+  const bottom = Math.max(top + 1, Math.min(reader.height, Math.ceil(window[3])));
+  const outputWidth = Math.max(1, Math.floor(width));
+  const outputHeight = Math.max(1, Math.floor(height));
+  const xSamples = directSampleCoordinates(left, right, outputWidth);
+  const ySamples = directSampleCoordinates(top, bottom, outputHeight);
+  const sourceXStart = xSamples.reduce((minimum, sample) => Math.min(minimum, sample.low), right - 1);
+  const sourceXEnd = xSamples.reduce((maximum, sample) => Math.max(maximum, sample.high + 1), left + 1);
+  const neededRows = [...new Set(ySamples.flatMap((sample) => [sample.low, sample.high]))].sort((a, b) => a - b);
+  const rows = await readDirectRowSegments(reader, neededRows, sourceXStart, sourceXEnd);
+  const pixels = new Float32Array(outputWidth * outputHeight * 4);
+  const topLeft = new Float32Array(4);
+  const topRight = new Float32Array(4);
+  const bottomLeft = new Float32Array(4);
+  const bottomRight = new Float32Array(4);
+
+  for (let y = 0; y < outputHeight; y += 1) {
+    const sampleY = ySamples[y];
+    const topRow = rows.get(sampleY.low);
+    const bottomRow = rows.get(sampleY.high);
+    for (let x = 0; x < outputWidth; x += 1) {
+      const sampleX = xSamples[x];
+      const target = (y * outputWidth + x) * 4;
+      if (sampleX.low === sampleX.high && sampleY.low === sampleY.high) {
+        readDirectLinearPixel(reader, topRow, sampleX.low - sourceXStart, topLeft);
+        pixels[target] = topLeft[0];
+        pixels[target + 1] = topLeft[1];
+        pixels[target + 2] = topLeft[2];
+        pixels[target + 3] = topLeft[3];
+        continue;
+      }
+      readDirectLinearPixel(reader, topRow, sampleX.low - sourceXStart, topLeft);
+      readDirectLinearPixel(reader, topRow, sampleX.high - sourceXStart, topRight);
+      readDirectLinearPixel(reader, bottomRow, sampleX.low - sourceXStart, bottomLeft);
+      readDirectLinearPixel(reader, bottomRow, sampleX.high - sourceXStart, bottomRight);
+      for (let channel = 0; channel < 4; channel += 1) {
+        const upper = topLeft[channel] + (topRight[channel] - topLeft[channel]) * sampleX.fraction;
+        const lower = bottomLeft[channel] + (bottomRight[channel] - bottomLeft[channel]) * sampleX.fraction;
+        pixels[target + channel] = upper + (lower - upper) * sampleY.fraction;
+      }
+    }
+  }
+  return pixels;
+}
+
+function directSampleCoordinates(start, end, outputSize) {
+  const span = end - start;
+  if (span === outputSize) {
+    return Array.from({ length: outputSize }, (_, index) => ({
+      low: start + index,
+      high: start + index,
+      fraction: 0
+    }));
+  }
+  return Array.from({ length: outputSize }, (_, index) => {
+    const position = Math.max(start, Math.min(end - 1, start + (index + 0.5) * span / outputSize - 0.5));
+    const low = Math.floor(position);
+    const high = Math.min(end - 1, low + 1);
+    return { low, high, fraction: position - low };
+  });
+}
+
+async function readDirectRowSegments(reader, rowNumbers, sourceXStart, sourceXEnd) {
+  const rows = new Map();
+  const segmentBytes = (sourceXEnd - sourceXStart) * reader.pixelBytes;
+  const concurrency = 32;
+  for (let start = 0; start < rowNumbers.length; start += concurrency) {
+    const batch = rowNumbers.slice(start, start + concurrency);
+    const resolved = await Promise.all(batch.map(async (rowNumber) => {
+      const strip = Math.floor(rowNumber / reader.rowsPerStrip);
+      const rowWithinStrip = rowNumber - strip * reader.rowsPerStrip;
+      const offset = reader.stripOffsets[strip] + rowWithinStrip * reader.rowBytes + sourceXStart * reader.pixelBytes;
+      const stripEnd = reader.stripOffsets[strip] + reader.stripByteCounts[strip];
+      if (offset < reader.stripOffsets[strip] || offset + segmentBytes > stripEnd) {
+        throw new Error(`TIFF row ${rowNumber} exceeds its strip byte range.`);
+      }
+      const buffer = await reader.file.slice(offset, offset + segmentBytes).arrayBuffer();
+      if (buffer.byteLength !== segmentBytes) {
+        throw new Error(`TIFF row ${rowNumber} could not be read completely.`);
+      }
+      return [rowNumber, { bytes: new Uint8Array(buffer), view: new DataView(buffer) }];
+    }));
+    for (const [rowNumber, row] of resolved) rows.set(rowNumber, row);
+  }
+  return rows;
+}
+
+function readDirectLinearPixel(reader, row, localX, target) {
+  const pixelOffset = localX * reader.pixelBytes;
+  if (reader.photometric === PHOTOMETRIC_RGB) {
+    const red = readDirectChannel(reader, row, pixelOffset, 0);
+    const green = readDirectChannel(reader, row, pixelOffset, 1);
+    const blue = readDirectChannel(reader, row, pixelOffset, 2);
+    target[0] = colorValue(red, reader.bits[0], reader.sampleFormats[0]);
+    target[1] = colorValue(green, reader.bits[1], reader.sampleFormats[1]);
+    target[2] = colorValue(blue, reader.bits[2], reader.sampleFormats[2]);
+    if (reader.samplesPerPixel >= 4) {
+      const alpha = readDirectChannel(reader, row, pixelOffset, 3);
+      target[3] = alphaValue(alpha, reader.bits[3], reader.sampleFormats[3]);
+    } else {
+      target[3] = 1;
+    }
+    return;
+  }
+  const graySample = readDirectChannel(reader, row, pixelOffset, 0);
+  let encoded = normalizedValue(graySample, reader.bits[0], reader.sampleFormats[0]);
+  if (reader.photometric === PHOTOMETRIC_WHITE_IS_ZERO) encoded = 1 - encoded;
+  const gray = reader.sampleFormats[0] === SAMPLE_FLOAT ? encoded : srgbToLinear(encoded);
+  target[0] = gray;
+  target[1] = gray;
+  target[2] = gray;
+  if (reader.samplesPerPixel >= 2) {
+    const alpha = readDirectChannel(reader, row, pixelOffset, 1);
+    target[3] = alphaValue(alpha, reader.bits[1], reader.sampleFormats[1]);
+  } else {
+    target[3] = 1;
+  }
+}
+
+function readDirectChannel(reader, row, pixelOffset, channel) {
+  return readDirectSample(
+    reader,
+    row,
+    pixelOffset + reader.sampleByteOffsets[channel],
+    reader.bits[channel],
+    reader.sampleFormats[channel]
+  );
+}
+
+function readDirectSample(reader, row, offset, bits, sampleFormat) {
+  if (bits === 8) {
+    return sampleFormat === SAMPLE_SIGNED ? row.view.getInt8(offset) : row.bytes[offset];
+  }
+  if (bits === 16) {
+    return sampleFormat === SAMPLE_SIGNED
+      ? row.view.getInt16(offset, reader.littleEndian)
+      : row.view.getUint16(offset, reader.littleEndian);
+  }
+  if (sampleFormat === SAMPLE_FLOAT) return row.view.getFloat32(offset, reader.littleEndian);
+  return sampleFormat === SAMPLE_SIGNED
+    ? row.view.getInt32(offset, reader.littleEndian)
+    : row.view.getUint32(offset, reader.littleEndian);
 }
 
 function normalizedValue(value, bits, sampleFormat) {

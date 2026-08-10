@@ -3,9 +3,9 @@ import { EXRLoader } from "three/addons/loaders/EXRLoader.js";
 import { HDRLoader } from "three/addons/loaders/HDRLoader.js";
 import { decodePng, isPngFile, pngTypeLabel } from "./png-decoder.js?v=20260809-7";
 import { canOpenPngAsTiles, openPngRasterSource } from "./png-raster-source.js?v=20260809-2";
-import { decodeTiff, openTiffRasterSource } from "./tiff-decoder.js?v=20260809-6";
+import { decodeTiff, openTiffRasterSource } from "./tiff-decoder.js?v=20260811-2";
 import { decodeJpeg2000, openJpeg2000RasterSource } from "./jp2-decoder.js?v=20260809-6";
-import { createBitmapRasterSource, createMemoryRasterSource, createSwitchableRasterSource, RASTER_TILE_SIZE } from "./raster-source.js?v=20260809-6";
+import { createBitmapRasterSource, createMemoryRasterSource, createSwitchableRasterSource, RASTER_TILE_SIZE } from "./raster-source.js?v=20260811-2";
 import { openAvifRasterSource } from "./avif-raster-source.js?v=20260810-2";
 import {
   MAX_VALUE_MATRIX_PIXELS,
@@ -1069,7 +1069,7 @@ async function loadTiffImage(file) {
       file,
       opened.width,
       opened.height,
-      `tiff/${opened.channels}${opened.bitDepth}`,
+      `tiff/${opened.channels}${opened.bitDepth}${opened.accessMode === "direct-uncompressed-strips" ? " · direct strips" : ""}`,
       null,
       "raster",
       {
@@ -1605,6 +1605,7 @@ function createImageWindow(image, dropPoint, placementIndex) {
 
   const frame = document.createElement("section");
   frame.className = "image-window";
+  frame.classList.toggle("pq-display", image.transfer === "pq" && image.valueUnit === "nit");
   frame.dataset.id = String(image.id);
 
   const titlebar = document.createElement("div");
@@ -1615,6 +1616,7 @@ function createImageWindow(image, dropPoint, placementIndex) {
   const size = document.createElement("div");
   size.className = "window-size";
   size.textContent = imageInfoLabel(image);
+  size.title = size.textContent;
   const modeTabs = document.createElement("div");
   modeTabs.className = "window-mode-tabs";
   const originalButton = document.createElement("button");
@@ -2213,7 +2215,10 @@ function updateImageModeTabs(image) {
 
 function updateImageWindowSize(image) {
   if (image.elements?.size) {
-    image.elements.size.textContent = imageInfoLabel(image);
+    const label = imageInfoLabel(image);
+    image.elements.size.textContent = label;
+    image.elements.size.title = label;
+    image.elements.frame.classList.toggle("pq-display", image.transfer === "pq" && image.valueUnit === "nit");
     return;
   }
   const sizeLabel = image.elements?.frame.querySelector(".window-size");
@@ -2226,7 +2231,10 @@ function imageInfoLabel(image) {
   const preview = image.downsample > 1 ? `↓${image.downsample}` : "";
   const width = image.sourceWidth || image.width;
   const height = image.sourceHeight || image.height;
-  return [`${width}x${height}`, image.format, image.bitDepth, preview].filter(Boolean).join(" · ");
+  const pqDisplay = image.transfer === "pq" && image.valueUnit === "nit"
+    ? "PQ → Linear [nit] · SDR tone-mapped"
+    : "";
+  return [`${width}x${height}`, image.format, image.bitDepth, pqDisplay, preview].filter(Boolean).join(" · ");
 }
 
 function openGlslEditor(sourceImage) {
