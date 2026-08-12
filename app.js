@@ -23,6 +23,7 @@ import {
   runGlslShader
 } from "./glsl-runtime.js?v=20260809-7";
 import { decodeGlslShareHash, encodeGlslShareHash } from "./glsl-share.js?v=20260809-3";
+import { createWebGpuRenderer, HDR_REFERENCE_WHITE_NITS } from "./webgpu-renderer.js?v=20260812-1";
 
 const fileInput = document.querySelector("#fileInput");
 const fileHint = document.querySelector("#fileHint");
@@ -52,6 +53,8 @@ const emptySettings = document.querySelector("#emptySettings");
 const settingsForm = document.querySelector("#settingsForm");
 const zoomSelect = document.querySelector("#zoomSelect");
 const filterSelect = document.querySelector("#filterSelect");
+const outputModeSelect = document.querySelector("#outputModeSelect");
+const outputStatus = document.querySelector("#outputStatus");
 const autoLevelInput = document.querySelector("#autoLevelInput");
 const brightnessInput = document.querySelector("#brightnessInput");
 const brightnessReset = document.querySelector("#brightnessReset");
@@ -141,6 +144,8 @@ let selectionMatrixCopyFrame = null;
 let selectionMatrixCopyWorker = null;
 let selectionMatrixCopyJobId = 0;
 let selectionMatrixCopyInFlight = null;
+let webGpuRenderer = null;
+let webGpuInitializationError = null;
 
 fileInput.addEventListener("click", (event) => {
   if (!window.showOpenFilePicker) {
@@ -609,6 +614,16 @@ filterSelect.addEventListener("change", () => {
     return;
   }
   image.settings.filter = filterSelect.value;
+  requestRender();
+  scheduleSessionSave();
+});
+
+outputModeSelect.addEventListener("change", () => {
+  const image = currentImage();
+  if (!image) {
+    return;
+  }
+  image.settings.outputMode = outputModeSelect.value;
   requestRender();
   scheduleSessionSave();
 });
@@ -1168,7 +1183,7 @@ async function loadPngExact(file) {
         if (note) record.type = `${record.type} ${note}`;
         record.range = computeRange(opened.preview.pixels);
         record.displayDirty = true;
-        record.displayTileCache?.clear();
+        webGpuRenderer?.invalidateCanvas(record.elements?.canvas);
         selectionDetailsCache.delete(record);
         updateImageWindowSize(record);
         if (currentImage() === record) {
@@ -1563,7 +1578,8 @@ function createImageRecord(file, width, height, type, pixels, sourceFormat = "ra
       brightness: 1,
       // UE 書き出しの EXR などアルファが全面 0 の画像は RGBA 表示だと真っ黒になるため RGB を既定にする
       channel: range.max[3] > 0 ? "rgba" : "rgb",
-      filter: "auto"
+      filter: "auto",
+      outputMode: "auto"
     },
     view: {
       scale: 1,
@@ -1581,7 +1597,6 @@ function createImageRecord(file, width, height, type, pixels, sourceFormat = "ra
       z: 1
     },
     elements: null,
-    displayCanvas: null,
     displayDirty: true,
     mode: "original",
     original: null,
@@ -1642,11 +1657,14 @@ function createImageWindow(image, dropPoint, placementIndex) {
 
   const canvas = document.createElement("canvas");
   canvas.className = "image-canvas";
+  const overlay = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  overlay.classList.add("image-overlay");
+  overlay.setAttribute("aria-hidden", "true");
 
   const resizeHandle = document.createElement("div");
   resizeHandle.className = "resize-handle";
 
-  body.append(canvas, resizeHandle);
+  body.append(canvas, overlay, resizeHandle);
   frame.append(titlebar, body);
   windowLayer.append(frame);
 
@@ -1655,7 +1673,7 @@ function createImageWindow(image, dropPoint, placementIndex) {
     titlebar,
     body,
     canvas,
-    ctx: canvas.getContext("2d", { alpha: false }),
+    overlay,
     resizeHandle,
     closeButton,
     size,
@@ -1974,6 +1992,9 @@ function closeImage(image) {
   if (image.pickers.some((picker) => picker.id === hoveredPickerId)) {
     hoveredPickerId = null;
   }
+  if (image.elements?.canvas && webGpuRenderer) {
+    webGpuRenderer.disposeCanvas(image.elements.canvas);
+  }
   image.elements?.frame.remove();
   const rasterSources = new Set([
     image.rasterSource,
@@ -1981,7 +2002,6 @@ function closeImage(image) {
     image.glsl?.rasterSource
   ]);
   rasterSources.forEach((source) => source?.dispose?.());
-  image.displayTileCache?.clear();
   images.splice(index, 1);
   if (glslTargetId === image.id) {
     closeGlslEditor();
@@ -2168,7 +2188,6 @@ function applyImageVariant(image, mode) {
   image.pixels = variant.pixels;
   image.rasterSource = variant.rasterSource;
   image.range = variant.range;
-  image.displayCanvas = null;
   image.displayDirty = true;
 
   if (sizeChanged) {
@@ -2232,7 +2251,7 @@ function imageInfoLabel(image) {
   const width = image.sourceWidth || image.width;
   const height = image.sourceHeight || image.height;
   const pqDisplay = image.transfer === "pq" && image.valueUnit === "nit"
-    ? "PQ → Linear [nit] · SDR tone-mapped"
+    ? `PQ → Linear [nit] · white ${HDR_REFERENCE_WHITE_NITS} nit`
     : "";
   return [`${width}x${height}`, image.format, image.bitDepth, pqDisplay, preview].filter(Boolean).join(" · ");
 }
@@ -2308,11 +2327,30 @@ function addGeneratedGlslImage({ code, renderedCode, pixels, width, height, focu
   return image;
 }
 
-function initializeApp() {
+async function initializeApp() {
+  try {
+    webGpuRenderer = await createWebGpuRenderer({
+      onNeedsRender: () => {
+        requestRender();
+        updateSettingsPanel();
+      },
+      onError: (error) => {
+        console.warn(error);
+        if (currentImage()) {
+          outputStatus.textContent = error.message || String(error);
+        }
+      }
+    });
+  } catch (error) {
+    webGpuInitializationError = error;
+    console.error(error);
+    fileHint.textContent = error.message || "WebGPU initialization failed.";
+  }
+  updateSettingsPanel();
   if (openGlslShareFromLocation()) {
     return;
   }
-  void restoreSavedSession();
+  await restoreSavedSession();
 }
 
 function openGlslShareFromLocation() {
@@ -2549,7 +2587,6 @@ function applyGlslResult(image, pixels, width, height, code) {
     statusKind: "ok",
     status: "Ready."
   };
-  image.displayCanvas = null;
   image.displayDirty = true;
 
   if (sizeChanged) {
@@ -2744,93 +2781,6 @@ function removePicker(pickerId) {
   }
 }
 
-function drawPickers(image, ctx) {
-  if (activePanelTab !== "pickers") return;
-  const { width, height } = canvasCssSize(image);
-  for (const picker of image.pickers) {
-    const x = image.view.offsetX + (picker.x + 0.5) * image.view.scale;
-    const y = image.view.offsetY + (picker.y + 0.5) * image.view.scale;
-    if (x < -24 || y < -24 || x > width + 24 || y > height + 24) {
-      continue;
-    }
-
-    const arm = 9;
-    ctx.save();
-    if (picker.id === hoveredPickerId) {
-      ctx.beginPath();
-      ctx.arc(x, y, 14, 0, Math.PI * 2);
-      ctx.strokeStyle = "#000";
-      ctx.lineWidth = 4;
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.arc(x, y, 14, 0, Math.PI * 2);
-      ctx.strokeStyle = "#fff";
-      ctx.lineWidth = 1.5;
-      ctx.setLineDash([3, 3]);
-      ctx.stroke();
-      ctx.setLineDash([]);
-    }
-    ctx.lineCap = "square";
-    ctx.strokeStyle = "#000";
-    ctx.lineWidth = 4;
-    drawCross(ctx, x, y, arm);
-    ctx.strokeStyle = picker.color;
-    ctx.lineWidth = 2;
-    drawCross(ctx, x, y, arm);
-    ctx.fillStyle = picker.color;
-    ctx.font = "11px Consolas, monospace";
-    ctx.fillText(String(picker.id), x + 7, y - 7);
-    ctx.restore();
-  }
-}
-
-function drawCross(ctx, x, y, arm) {
-  ctx.beginPath();
-  ctx.moveTo(x - arm, y);
-  ctx.lineTo(x + arm, y);
-  ctx.moveTo(x, y - arm);
-  ctx.lineTo(x, y + arm);
-  ctx.stroke();
-}
-
-function drawSelection(image, ctx) {
-  if (!image.selection) {
-    return;
-  }
-  const rect = image.selection;
-  const x = image.view.offsetX + rect.x * image.view.scale;
-  const y = image.view.offsetY + rect.y * image.view.scale;
-  const width = rect.width * image.view.scale;
-  const height = rect.height * image.view.scale;
-  const canvasSize = canvasCssSize(image);
-  ctx.save();
-  ctx.strokeStyle = "#000000";
-  ctx.lineWidth = 3;
-  ctx.setLineDash([6, 6]);
-  ctx.strokeRect(x + 0.5, y + 0.5, width, height);
-  ctx.strokeStyle = "#ffffff";
-  ctx.lineWidth = 1.5;
-  ctx.setLineDash([6, 6]);
-  ctx.lineDashOffset = 6;
-  ctx.strokeRect(x + 0.5, y + 0.5, width, height);
-  ctx.setLineDash([]);
-
-  const label = `${rect.width} x ${rect.height} px`;
-  ctx.font = "12px Consolas, monospace";
-  const metrics = ctx.measureText(label);
-  const labelWidth = Math.ceil(metrics.width) + 8;
-  const labelHeight = 18;
-  const labelX = Math.max(2, Math.min(x, canvasSize.width - labelWidth - 2));
-  const labelY = y >= labelHeight + 4 ? y - labelHeight - 4 : y + 4;
-
-  ctx.fillStyle = "rgba(0, 0, 0, 0.78)";
-  ctx.fillRect(labelX, labelY, labelWidth, labelHeight);
-  ctx.strokeStyle = "rgba(255, 255, 255, 0.75)";
-  ctx.strokeRect(labelX + 0.5, labelY + 0.5, labelWidth, labelHeight);
-  ctx.fillStyle = "#ffffff";
-  ctx.fillText(label, labelX + 4, labelY + 13);
-  ctx.restore();
-}
 
 function normalizePixelRect(a, b) {
   const x = Math.min(a.x, b.x);
@@ -5345,11 +5295,16 @@ function updateSettingsPanel() {
   emptySettings.classList.toggle("hidden", Boolean(image));
   settingsForm.classList.toggle("hidden", !image);
   if (!image) {
+    outputStatus.textContent = webGpuInitializationError
+      ? webGpuInitializationError.message
+      : webGpuRenderer ? "WebGPU ready" : "WebGPU initializing...";
     return;
   }
 
   zoomSelect.value = matchingZoomValue(image);
   filterSelect.value = image.settings.filter;
+  outputModeSelect.value = image.settings.outputMode || "auto";
+  updateOutputStatus(image);
   autoLevelInput.checked = image.settings.autoLevel;
   brightnessInput.value = String(image.settings.brightness);
   pickerValueMode.options[0].textContent = image.valueUnit === "nit" ? "Linear [nit]" : "Linear";
@@ -5424,7 +5379,7 @@ function renderImage(image) {
   if (!image.elements) {
     return;
   }
-  const { canvas, ctx } = image.elements;
+  const { canvas } = image.elements;
   const { width, height } = canvasCssSize(image);
   const dpr = Math.max(1, window.devicePixelRatio || 1);
   const pixelWidth = Math.max(1, Math.round(width * dpr));
@@ -5438,170 +5393,64 @@ function renderImage(image) {
     }
   }
 
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.imageSmoothingEnabled = false;
-  ctx.fillStyle = "#000";
-  ctx.fillRect(0, 0, width, height);
-
-  drawImageTiles(image, ctx, width, height, dpr);
-  drawPixelGrid(image, ctx, width, height);
-  drawPickers(image, ctx);
-  drawSelection(image, ctx);
-}
-
-const displayTileSize = RASTER_TILE_SIZE;
-const displayTileGutter = 1;
-const maxCachedDisplayTiles = 96;
-
-function drawImageTiles(image, ctx, canvasWidth, canvasHeight, dpr) {
-  if (!image.rasterSource || image.width < 1 || image.height < 1 || image.view.scale <= 0) {
-    return;
-  }
-  const cache = displayTileCache(image);
-  drawImageOverview(image, ctx);
-  const sourcePixelsPerDevicePixel = 1 / Math.max(0.000001, image.view.scale * dpr);
-  const maximumLevel = Math.max(0, Math.ceil(Math.log2(Math.max(image.width, image.height))));
-  const level = clamp(Math.floor(Math.log2(Math.max(1, sourcePixelsPerDevicePixel))), 0, maximumLevel);
-  const factor = 2 ** level;
-  const levelWidth = Math.ceil(image.width / factor);
-  const levelHeight = Math.ceil(image.height / factor);
-
-  const sourceLeft = Math.max(0, (-image.view.offsetX) / image.view.scale);
-  const sourceTop = Math.max(0, (-image.view.offsetY) / image.view.scale);
-  const sourceRight = Math.min(image.width, (canvasWidth - image.view.offsetX) / image.view.scale);
-  const sourceBottom = Math.min(image.height, (canvasHeight - image.view.offsetY) / image.view.scale);
-  if (sourceRight <= sourceLeft || sourceBottom <= sourceTop) {
-    return;
-  }
-
-  const firstTileX = clamp(Math.floor(sourceLeft / factor / displayTileSize), 0, Math.ceil(levelWidth / displayTileSize) - 1);
-  const lastTileX = clamp(Math.floor((sourceRight - 1) / factor / displayTileSize), 0, Math.ceil(levelWidth / displayTileSize) - 1);
-  const firstTileY = clamp(Math.floor(sourceTop / factor / displayTileSize), 0, Math.ceil(levelHeight / displayTileSize) - 1);
-  const lastTileY = clamp(Math.floor((sourceBottom - 1) / factor / displayTileSize), 0, Math.ceil(levelHeight / displayTileSize) - 1);
-
-  ctx.imageSmoothingEnabled = shouldSmooth(image);
-  for (let tileY = firstTileY; tileY <= lastTileY; tileY += 1) {
-    for (let tileX = firstTileX; tileX <= lastTileX; tileX += 1) {
-      const tile = getDisplayTile(image, cache, level, tileX, tileY);
-      if (!tile) {
-        continue;
-      }
-      const sourceX = tileX * displayTileSize * factor;
-      const sourceY = tileY * displayTileSize * factor;
-      const sourceWidth = Math.min(tile.width * factor, image.width - sourceX);
-      const sourceHeight = Math.min(tile.height * factor, image.height - sourceY);
-      ctx.drawImage(
-        tile.canvas,
-        displayTileGutter,
-        displayTileGutter,
-        tile.width,
-        tile.height,
-        image.view.offsetX + sourceX * image.view.scale,
-        image.view.offsetY + sourceY * image.view.scale,
-        sourceWidth * image.view.scale,
-        sourceHeight * image.view.scale
-      );
-    }
-  }
-}
-
-function displayTileCache(image) {
-  image.displayTileCache ||= new Map();
-  if (image.displayDirty) {
-    image.displayTileCache.clear();
-    image.displayOverview = null;
-    image.displayDirty = false;
-  }
-  return image.displayTileCache;
-}
-
-function drawImageOverview(image, ctx) {
-  const overview = image.overview;
-  if (!overview?.pixels || overview.width < 1 || overview.height < 1) return;
-  if (!image.displayOverview) {
-    image.displayOverview = createDisplayTile(image, {
-      width: overview.width,
-      height: overview.height,
-      gutter: 0,
-      stride: overview.width,
-      pixels: overview.pixels
-    });
-  }
-  ctx.imageSmoothingEnabled = true;
-  ctx.imageSmoothingQuality = "medium";
-  ctx.drawImage(
-    image.displayOverview.canvas,
-    0,
-    0,
-    overview.width,
-    overview.height,
-    image.view.offsetX,
-    image.view.offsetY,
-    image.width * image.view.scale,
-    image.height * image.view.scale
-  );
-}
-
-function getDisplayTile(image, cache, level, tileX, tileY) {
-  const key = `${level}:${tileX}:${tileY}`;
-  const cached = cache.get(key);
-  if (cached) {
-    cache.delete(key);
-    cache.set(key, cached);
-    return cached;
-  }
-  const sourceTile = image.rasterSource.getTile(level, tileX, tileY, displayTileGutter);
-  if (sourceTile && typeof sourceTile.then === "function") {
-    image.pendingDisplayTiles ||= new Map();
-    if (!image.pendingDisplayTiles.has(key)) {
-      const pending = sourceTile.then((resolved) => {
-        image.pendingDisplayTiles.delete(key);
-        const tile = createDisplayTile(image, resolved);
-        cache.set(key, tile);
-        trimDisplayTileCache(cache);
-        requestRender();
-      }).catch((error) => {
-        image.pendingDisplayTiles.delete(key);
-        console.error("Raster tile failed.", error);
-        fileHint.textContent = `Tile failed: ${error?.message || error}`;
+  if (webGpuRenderer) {
+    try {
+      const info = webGpuRenderer.render(canvas, {
+        image,
+        cssWidth: width,
+        cssHeight: height,
+        dpr,
+        tileSize: RASTER_TILE_SIZE,
+        outputMode: image.settings.outputMode || "auto",
+        display: displayConversion(image)
       });
-      image.pendingDisplayTiles.set(key, pending);
-    }
-    return null;
-  }
-  const tile = createDisplayTile(image, sourceTile);
-  cache.set(key, tile);
-  trimDisplayTileCache(cache);
-  return tile;
-}
-
-function trimDisplayTileCache(cache) {
-  while (cache.size > maxCachedDisplayTiles) cache.delete(cache.keys().next().value);
-}
-
-function createDisplayTile(image, sourceTile) {
-  const { width, height, gutter, stride, pixels } = sourceTile;
-  const canvas = document.createElement("canvas");
-  canvas.width = width + gutter * 2;
-  canvas.height = height + gutter * 2;
-  const context = canvas.getContext("2d", { alpha: false });
-  const imageData = context.createImageData(canvas.width, canvas.height);
-  const target = imageData.data;
-  const display = displayConversion(image);
-
-  for (let y = 0; y < canvas.height; y += 1) {
-    for (let x = 0; x < canvas.width; x += 1) {
-      const offset = (y * canvas.width + x) * 4;
-      writeDisplayPixel(target, offset, pixels, (y * stride + x) * 4, display);
+      const previousStatus = image.displayInfo
+        ? `${image.displayInfo.actualMode}:${image.displayInfo.format}:${image.displayInfo.toneMapping}:${image.displayInfo.fallback}`
+        : "";
+      image.displayInfo = info;
+      image.renderError = null;
+      const nextStatus = `${info.actualMode}:${info.format}:${info.toneMapping}:${info.fallback}`;
+      if (selectedId === image.id && previousStatus !== nextStatus) updateOutputStatus(image);
+    } catch (error) {
+      image.renderError = error;
+      console.error("WebGPU render failed.", error);
+      if (selectedId === image.id) updateOutputStatus(image);
     }
   }
-  context.putImageData(imageData, 0, 0);
-  return { canvas, width, height };
+  image.displayDirty = false;
+  renderImageOverlay(image, width, height);
 }
 
+function updateOutputStatus(image) {
+  if (image?.renderError) {
+    outputStatus.textContent = image.renderError.message || String(image.renderError);
+    return;
+  }
+  if (webGpuInitializationError) {
+    outputStatus.textContent = webGpuInitializationError.message;
+    return;
+  }
+  if (!webGpuRenderer) {
+    outputStatus.textContent = "WebGPU initializing...";
+    return;
+  }
+  const info = image?.displayInfo;
+  if (!info) {
+    outputStatus.textContent = webGpuRenderer.hdrDisplayCapable
+      ? "WebGPU ready · HDR display reported"
+      : "WebGPU ready · SDR display reported";
+    return;
+  }
+  const mode = info.actualMode === "hdr" ? `HDR · ${HDR_REFERENCE_WHITE_NITS} nit white` : "SDR";
+  const fallback = info.fallback ? " · HDR fallback" : "";
+  outputStatus.textContent = `${mode} · ${info.format} · ${info.toneMapping}${fallback}`;
+}
 function displayConversion(image) {
   const range = getDisplayNormalizationRange(image);
   const width = range.max - range.min;
+  const logEpsilon = Math.max(1e-6, Math.abs(range.max) * 1e-6);
+  const logMin = Math.log2(Math.max(range.min, 0) + logEpsilon);
+  const logMax = Math.log2(Math.max(range.max, 0) + logEpsilon);
   return {
     mode: image.settings.channel,
     brightness: image.settings.brightness,
@@ -5609,59 +5458,113 @@ function displayConversion(image) {
     absoluteNits: image.valueUnit === "nit",
     levelOffset: range.min,
     levelScale: width > 0 ? 1 / width : 1,
-    logNormalize: image.settings.logDisplay ? graphValueNormalizer(range.min, range.max, "log") : null
+    logNormalize: Boolean(image.settings.logDisplay),
+    logEpsilon,
+    logMin,
+    logRange: (logMax - logMin) || 1,
+    smooth: shouldSmooth(image)
   };
 }
 
-function writeDisplayPixel(target, offset, source, sourceOffset, display) {
-  if (display.mode === "a") {
-    let alpha = source[sourceOffset + 3];
-    if (display.logNormalize) {
-      alpha = display.logNormalize(alpha * display.brightness);
-    } else if (display.autoLevel) {
-      alpha = clamp01((alpha - display.levelOffset) * display.levelScale * display.brightness);
-    } else {
-      alpha = clamp01(alpha * display.brightness);
-    }
-    const byte = Math.round(alpha * 255);
-    target[offset] = byte;
-    target[offset + 1] = byte;
-    target[offset + 2] = byte;
-    target[offset + 3] = 255;
-    return;
-  }
 
-  let sourceR = 0;
-  let sourceG = 1;
-  let sourceB = 2;
-  if (display.mode === "r" || display.mode === "g" || display.mode === "b") {
-    sourceR = display.mode === "r" ? 0 : display.mode === "g" ? 1 : 2;
-    sourceG = sourceR;
-    sourceB = sourceR;
+function renderImageOverlay(image, width, height) {
+  const overlay = image.elements?.overlay;
+  if (!overlay) return;
+  overlay.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  overlay.replaceChildren();
+  drawPixelGridOverlay(image, overlay, width, height);
+  drawPickerOverlay(image, overlay, width, height);
+  drawSelectionOverlay(image, overlay, width);
+  if (image.renderError || webGpuInitializationError) {
+    const message = image.renderError?.message || webGpuInitializationError?.message || "WebGPU unavailable";
+    overlay.append(svgElement("text", {
+      x: 12, y: 24, fill: "#ff8a8a", stroke: "#000", "stroke-width": 3,
+      "paint-order": "stroke", "font-family": "Consolas, monospace", "font-size": 12
+    }, message));
   }
-  if (display.absoluteNits && !display.logNormalize && !display.autoLevel) {
-    const preview = toneMapAbsoluteRgb(
-      source[sourceOffset + sourceR],
-      source[sourceOffset + sourceG],
-      source[sourceOffset + sourceB],
-      display.brightness
+}
+
+function drawPixelGridOverlay(image, overlay, canvasWidth, canvasHeight) {
+  if (image.view.scale < 12) return;
+  const scale = image.view.scale;
+  const offsetX = image.view.offsetX;
+  const offsetY = image.view.offsetY;
+  const firstX = Math.max(0, Math.floor(-offsetX / scale));
+  const lastX = Math.min(image.width, Math.ceil((canvasWidth - offsetX) / scale));
+  const firstY = Math.max(0, Math.floor(-offsetY / scale));
+  const lastY = Math.min(image.height, Math.ceil((canvasHeight - offsetY) / scale));
+  if (firstX > lastX || firstY > lastY) return;
+  const left = offsetX + firstX * scale;
+  const top = offsetY + firstY * scale;
+  const right = offsetX + lastX * scale;
+  const bottom = offsetY + lastY * scale;
+  let path = "";
+  for (let x = firstX; x <= lastX; x += 1) {
+    const screenX = Math.round(offsetX + x * scale) + 0.5;
+    path += `M${screenX},${top}L${screenX},${bottom}`;
+  }
+  for (let y = firstY; y <= lastY; y += 1) {
+    const screenY = Math.round(offsetY + y * scale) + 0.5;
+    path += `M${left},${screenY}L${right},${screenY}`;
+  }
+  overlay.append(
+    svgElement("path", { d: path, fill: "none", stroke: "rgba(0,0,0,0.62)", "stroke-width": 1 }),
+    svgElement("path", { d: path, fill: "none", stroke: "rgba(255,255,255,0.38)", "stroke-width": 1, "stroke-dasharray": "2 3" })
+  );
+}
+
+function drawPickerOverlay(image, overlay, width, height) {
+  if (activePanelTab !== "pickers") return;
+  for (const picker of image.pickers) {
+    const x = image.view.offsetX + (picker.x + 0.5) * image.view.scale;
+    const y = image.view.offsetY + (picker.y + 0.5) * image.view.scale;
+    if (x < -24 || y < -24 || x > width + 24 || y > height + 24) continue;
+    if (picker.id === hoveredPickerId) {
+      overlay.append(
+        svgElement("circle", { cx: x, cy: y, r: 14, fill: "none", stroke: "#000", "stroke-width": 4 }),
+        svgElement("circle", { cx: x, cy: y, r: 14, fill: "none", stroke: "#fff", "stroke-width": 1.5, "stroke-dasharray": "3 3" })
+      );
+    }
+    const arm = 9;
+    const path = `M${x - arm},${y}L${x + arm},${y}M${x},${y - arm}L${x},${y + arm}`;
+    overlay.append(
+      svgElement("path", { d: path, fill: "none", stroke: "#000", "stroke-width": 4 }),
+      svgElement("path", { d: path, fill: "none", stroke: picker.color, "stroke-width": 2 }),
+      svgElement("text", {
+        x: x + 7, y: y - 7, fill: picker.color, stroke: "#000", "stroke-width": 2.5,
+        "paint-order": "stroke", "font-family": "Consolas, monospace", "font-size": 11
+      }, String(picker.id))
     );
-    target[offset] = linearToSrgbByte(preview[0]);
-    target[offset + 1] = linearToSrgbByte(preview[1]);
-    target[offset + 2] = linearToSrgbByte(preview[2]);
-    target[offset + 3] = display.mode === "rgba" ? Math.round(clamp01(source[sourceOffset + 3]) * 255) : 255;
-    return;
   }
-  for (let channel = 0; channel < 3; channel += 1) {
-    const channelOffset = channel === 0 ? sourceR : channel === 1 ? sourceG : sourceB;
-    const value = source[sourceOffset + channelOffset];
-    target[offset + channel] = display.logNormalize
-      ? Math.round(display.logNormalize(value * display.brightness) * 255)
-      : display.autoLevel
-        ? linearToSrgbByte((value - display.levelOffset) * display.levelScale * display.brightness)
-        : linearToSrgbByte(value * display.brightness);
-  }
-  target[offset + 3] = display.mode === "rgba" ? Math.round(clamp01(source[sourceOffset + 3]) * 255) : 255;
+}
+
+function drawSelectionOverlay(image, overlay, canvasWidth) {
+  if (!image.selection) return;
+  const rect = image.selection;
+  const x = image.view.offsetX + rect.x * image.view.scale;
+  const y = image.view.offsetY + rect.y * image.view.scale;
+  const width = rect.width * image.view.scale;
+  const height = rect.height * image.view.scale;
+  overlay.append(
+    svgElement("rect", { x: x + 0.5, y: y + 0.5, width, height, fill: "none", stroke: "#000", "stroke-width": 3, "stroke-dasharray": "6 6" }),
+    svgElement("rect", { x: x + 0.5, y: y + 0.5, width, height, fill: "none", stroke: "#fff", "stroke-width": 1.5, "stroke-dasharray": "6 6", "stroke-dashoffset": 6 })
+  );
+  const label = `${rect.width} x ${rect.height} px`;
+  const labelWidth = Math.ceil(label.length * 7.2) + 8;
+  const labelHeight = 18;
+  const labelX = Math.max(2, Math.min(x, canvasWidth - labelWidth - 2));
+  const labelY = y >= labelHeight + 4 ? y - labelHeight - 4 : y + 4;
+  overlay.append(
+    svgElement("rect", { x: labelX, y: labelY, width: labelWidth, height: labelHeight, fill: "rgba(0,0,0,0.78)", stroke: "rgba(255,255,255,0.75)" }),
+    svgElement("text", { x: labelX + 4, y: labelY + 13, fill: "#fff", "font-family": "Consolas, monospace", "font-size": 12 }, label)
+  );
+}
+
+function svgElement(name, attributes, text = null) {
+  const element = document.createElementNS("http://www.w3.org/2000/svg", name);
+  for (const [key, value] of Object.entries(attributes)) element.setAttribute(key, String(value));
+  if (text !== null) element.textContent = text;
+  return element;
 }
 
 function displayPreviewLinear(image, linear) {
@@ -5683,7 +5586,7 @@ function toneMapAbsoluteRgb(redNits, greenNits, blueNits, brightness = 1) {
     return [0, 0, 0];
   }
   // SDR preview only. Measurement pixels remain untouched in absolute cd/m².
-  const mappedLuminance = acesToneMap(luminance / 100 * Math.max(0, brightness));
+  const mappedLuminance = acesToneMap(luminance / HDR_REFERENCE_WHITE_NITS * Math.max(0, brightness));
   const scale = mappedLuminance / luminance;
   return fitLinearSrgbGamut(red * scale, green * scale, blue * scale, mappedLuminance);
 }
@@ -5710,50 +5613,6 @@ function fitLinearSrgbGamut(red, green, blue, luminance) {
   ];
 }
 
-function drawPixelGrid(image, ctx, canvasWidth, canvasHeight) {
-  if (image.view.scale < 12) {
-    return;
-  }
-
-  const scale = image.view.scale;
-  const offsetX = image.view.offsetX;
-  const offsetY = image.view.offsetY;
-  const firstX = Math.max(0, Math.floor(-offsetX / scale));
-  const lastX = Math.min(image.width, Math.ceil((canvasWidth - offsetX) / scale));
-  const firstY = Math.max(0, Math.floor(-offsetY / scale));
-  const lastY = Math.min(image.height, Math.ceil((canvasHeight - offsetY) / scale));
-  if (firstX > lastX || firstY > lastY) {
-    return;
-  }
-
-  const imageLeft = offsetX + firstX * scale;
-  const imageTop = offsetY + firstY * scale;
-  const imageRight = offsetX + lastX * scale;
-  const imageBottom = offsetY + lastY * scale;
-  ctx.save();
-  ctx.beginPath();
-  ctx.rect(imageLeft, imageTop, imageRight - imageLeft, imageBottom - imageTop);
-  ctx.clip();
-  ctx.beginPath();
-  for (let x = firstX; x <= lastX; x += 1) {
-    const screenX = Math.round(offsetX + x * scale) + 0.5;
-    ctx.moveTo(screenX, imageTop);
-    ctx.lineTo(screenX, imageBottom);
-  }
-  for (let y = firstY; y <= lastY; y += 1) {
-    const screenY = Math.round(offsetY + y * scale) + 0.5;
-    ctx.moveTo(imageLeft, screenY);
-    ctx.lineTo(imageRight, screenY);
-  }
-  ctx.lineWidth = 1;
-  ctx.strokeStyle = "rgba(0, 0, 0, 0.62)";
-  ctx.setLineDash([]);
-  ctx.stroke();
-  ctx.strokeStyle = "rgba(255, 255, 255, 0.38)";
-  ctx.setLineDash([2, 3]);
-  ctx.stroke();
-  ctx.restore();
-}
 
 function displayChannels(source, mode) {
   const [r, g, b, a] = source;

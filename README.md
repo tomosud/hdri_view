@@ -19,7 +19,7 @@ https://tomosud.github.io/hdri_view/
 
 - PNG / JPEG / WebP / AVIF / GIF / BMP / **JPEG 2000 (JP2/J2K, 1/3ch, 1〜16bit)** / **TIFF / BigTIFF（LZW・Deflate・PackBits・JPEGなど）** に加え、**HDR (Radiance)** / **EXR (OpenEXR)** をブラウザ上でそのまま開ける
 - 16,777,216画素を超える非インターレース8/16bit Gray / Gray+Alpha / RGB(A) PNGは、まず縮小した仮画像を表示し、Worker内で元ビット深度の512pxタイルへストリーム展開できた時点で原寸表示へ自動で差し替える
-- 通常表示は低解像度の全体プレビューを常に背景へ表示し、その上へ読み込み済みの512pxタイルを重ねる。移動・ズーム先のタイルが未到着でも黒抜けさせず、ズーム率に応じたMipレベルだけを生成・LRUキャッシュする
+- 通常表示は WebGPU に統一し、低解像度の全体プレビューを常に背景へ表示した上へ、読み込み済みの512pxタイルを重ねる。HDR対応環境ではfloat出力、SDR環境ではシェーダー内トーンマップを使い、移動・ズーム先のタイルが未到着でも黒抜けさせない
 - カーソル位置の **linear値 / sRGB値** をステータスバーにリアルタイム表示。配置済みピッカーはクリックで選択し、左ドラッグで移動できる
 - 複数の画像をウィンドウとして並べて比較
 - 任意の点をピックしてリストに記録、CSV としてコピー
@@ -43,6 +43,7 @@ https://tomosud.github.io/hdri_view/
 
 - **Zoom**: Fit / 100%〜3200% の固定倍率
 - **Filtering**: Auto / Nearest / Linear（拡大時の補間）
+- **Output**: Auto / SDR / HDR。AutoはブラウザのHDR表示能力に従い、SDRでは標準出力、HDRではfloatのextended出力を選ぶ。現在使われている出力形式は選択欄の下に表示される
 - **Auto level**: HDR画像の輝度を自動でレベル補正
 - **Brightness**: 露出値を数値入力、または ±1 EV ボタンで調整
 - **Channel**: RGBA / RGB / R / G / B / A の表示切り替え。**RGBA を選んでいる間は、Picker /
@@ -206,8 +207,9 @@ AVIF はブラウザの WebCodecs `ImageDecoder` が返すネイティブYUVプ�
 対応ブラウザでは 8/10/12-bit、4:2:0 / 4:2:2 / 4:4:4、full / limited range を保持し、
 CICP の色域（BT.709 / BT.2020 / Display P3）、伝達特性、行列係数を使ってlinear sRGBへ変換します。
 PQは規格どおり0〜10000 cd/m²へ復元するため、Picker・Selection・Selection Graphの
-`Linear [nit]` / `Luminance [nit]` は絶対輝度です。画面表示とsRGB値だけはSDRプレビュー用に
-トーンマップします。HLGは基準ディスプレイ輝度がファイル単独では決まらないため相対linearです。
+`Linear [nit]` / `Luminance [nit]` は絶対輝度です。HDR表示では **203 nitを出力値1.0** として
+絶対輝度をWebGPUへ渡します。SDR表示とsRGB値は同じ203 nit基準でトーンマップします。
+HLGは基準ディスプレイ輝度がファイル単独では決まらないため相対linearです。
 WebCodecsが使えない形式・ブラウザではCanvasの8-bit互換経路へフォールバックし、Type欄に表示します。
 AVIF gain mapの合成は未対応です。
 
@@ -221,7 +223,8 @@ AVIF gain mapの合成は未対応です。
 - JPEG 2000 はMITライセンスの `@cornerstonejs/codec-openjpeg` 1.3.0（OpenJPEG純JS版）をWorkerで実行する。Codecの安全メモリ内に収まる画像は原寸タイル表示し、領域デコードAPIが未公開の巨大画像はwaveletサブ解像度へフォールバックする
 - HDRI Value Matrix は `clipboard-matrix.js` でシリアライズ／解析
 - GLSL 加工・生成は `glsl-runtime.js`（WebGL2 を直接使用、RGBA32F の FBO に描いて `readPixels`）
-- 通常画像の表示は `raster-source.js` の共通画素ソースと `app.js` の512pxタイルコンポジタ（常設全体プレビュー、Mip選択、raw/display二段LRU）を使用。メモリ・ImageBitmap・非同期Workerを同じプロトコルで扱い、表示・ピッカー・範囲選択は同じ画素ソースを参照する
+- 通常画像の表示は `raster-source.js` の共通画素ソースと `webgpu-renderer.js` のWebGPUレンダラーを使用。Float32画素を `rgba32float` テクスチャへ載せ、HDRは `rgba16float` / extended tone mapping、SDRはブラウザ推奨形式 / standard tone mappingへ描画する。メモリ・ImageBitmap・非同期Workerを同じプロトコルで扱い、表示・ピッカー・範囲選択は同じ画素ソースを参照する
+- メイン画像上のピクセルグリッド、ピッカー、選択範囲はSVGオーバーレイで描画し、選択範囲の3Dグラフだけは独立したCanvas 2Dを使用する
 - 選択範囲の集計処理は Web Worker（`selection-worker.js`）にオフロード
 
 ### 値の正確性について

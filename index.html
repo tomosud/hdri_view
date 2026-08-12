@@ -72,6 +72,16 @@
               </select>
             </label>
 
+            <label class="field">
+              <span>Output</span>
+              <select id="outputModeSelect">
+                <option value="auto">Auto</option>
+                <option value="sdr">SDR</option>
+                <option value="hdr">HDR</option>
+              </select>
+              <small id="outputStatus" class="output-status">WebGPU initializing...</small>
+            </label>
+
             <label class="check-field">
               <input id="autoLevelInput" type="checkbox">
               <span>Auto level</span>
@@ -206,6 +216,6 @@
     </footer>
   </div>
 
-  <script type="module" src="./app.js?v=20260811-5"></script>
+  <script type="module" src="./app.js?v=20260812-1"></script>
 </body>
 </html>
