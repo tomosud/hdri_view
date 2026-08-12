@@ -23,7 +23,7 @@ import {
   runGlslShader
 } from "./glsl-runtime.js?v=20260809-7";
 import { decodeGlslShareHash, encodeGlslShareHash } from "./glsl-share.js?v=20260809-3";
-import { createWebGpuRenderer, HDR_REFERENCE_WHITE_NITS } from "./webgpu-renderer.js?v=20260812-1";
+import { createWebGpuRenderer, HDR_REFERENCE_WHITE_NITS } from "./webgpu-renderer.js?v=20260812-2";
 
 const fileInput = document.querySelector("#fileInput");
 const fileHint = document.querySelector("#fileHint");

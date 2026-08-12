@@ -86,14 +86,23 @@ fn toneMapAbsolute(rgb: vec3<f32>, brightness: f32, referenceWhite: f32) -> vec3
   return mix(vec3<f32>(mappedLuminance), scaled, saturation);
 }
 
-fn normalizeLog(value: f32) -> f32 {
+fn normalizedLogValue(value: f32) -> f32 {
   let safeValue = max(value, 0.0);
-  return clamp((log2(safeValue + display.p2.x) - display.p2.y) / display.p2.z, 0.0, 1.0);
+  return (log2(safeValue + display.p2.x) - display.p2.y) / display.p2.z;
+}
+
+fn limitNormalizedRgb(value: f32) -> f32 {
+  // Extended HDR must retain values above reference white. SDR is bounded by design.
+  if (display.p1.w > 0.5) {
+    return max(value, 0.0);
+  }
+  return clamp(value, 0.0, 1.0);
 }
 
 fn normalizedScalar(value: f32) -> f32 {
+  // Alpha visualization is always a normalized scalar, even on an HDR canvas.
   if (display.p0.w > 0.5) {
-    return normalizeLog(value * display.p0.y);
+    return clamp(normalizedLogValue(value * display.p0.y), 0.0, 1.0);
   }
   if (display.p0.z > 0.5) {
     return clamp((value - display.p1.x) * display.p1.y * display.p0.y, 0.0, 1.0);
@@ -123,13 +132,19 @@ fn normalizedScalar(value: f32) -> f32 {
   var output: vec3<f32>;
   if (display.p0.w > 0.5) {
     output = vec3<f32>(
-      normalizeLog(rgb.r * display.p0.y),
-      normalizeLog(rgb.g * display.p0.y),
-      normalizeLog(rgb.b * display.p0.y)
+      limitNormalizedRgb(normalizedLogValue(rgb.r * display.p0.y)),
+      limitNormalizedRgb(normalizedLogValue(rgb.g * display.p0.y)),
+      limitNormalizedRgb(normalizedLogValue(rgb.b * display.p0.y))
     );
   } else if (display.p0.z > 0.5) {
-    let linear = clamp((rgb - vec3<f32>(display.p1.x)) * display.p1.y * display.p0.y, vec3<f32>(0.0), vec3<f32>(1.0));
-    output = vec3<f32>(linearToSrgb(linear.r), linearToSrgb(linear.g), linearToSrgb(linear.b));
+    let normalized = (rgb - vec3<f32>(display.p1.x)) * display.p1.y * display.p0.y;
+    if (display.p1.w > 0.5) {
+      // At 0 EV the source maximum is reference white. Positive EV may extend above it.
+      output = max(normalized, vec3<f32>(0.0));
+    } else {
+      let linear = clamp(normalized, vec3<f32>(0.0), vec3<f32>(1.0));
+      output = vec3<f32>(linearToSrgb(linear.r), linearToSrgb(linear.g), linearToSrgb(linear.b));
+    }
   } else if (display.p1.w > 0.5) {
     output = rgb * display.p0.y;
     if (display.p1.z > 0.5) {

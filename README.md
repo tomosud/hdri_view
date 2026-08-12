@@ -209,6 +209,8 @@ CICP の色域（BT.709 / BT.2020 / Display P3）、伝達特性、行列係数�
 PQは規格どおり0〜10000 cd/m²へ復元するため、Picker・Selection・Selection Graphの
 `Linear [nit]` / `Luminance [nit]` は絶対輝度です。HDR表示では **203 nitを出力値1.0** として
 絶対輝度をWebGPUへ渡します。SDR表示とsRGB値は同じ203 nit基準でトーンマップします。
+HDR表示でAuto levelまたはLog表示を使った場合も、正のBrightness（EV）による1.0超の値は
+クランプせずextended出力へ渡します。SDR表示とalpha単独表示だけは0〜1へ制限します。
 HLGは基準ディスプレイ輝度がファイル単独では決まらないため相対linearです。
 WebCodecsが使えない形式・ブラウザではCanvasの8-bit互換経路へフォールバックし、Type欄に表示します。
 AVIF gain mapの合成は未対応です。
