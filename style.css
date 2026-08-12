@@ -393,11 +393,12 @@ textarea {
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  background:
-    linear-gradient(90deg, rgba(255,255,255,0.04) 1px, transparent 1px),
-    linear-gradient(rgba(255,255,255,0.04) 1px, transparent 1px),
-    #000;
-  background-size: 16px 16px;
+  background: conic-gradient(
+    #0d1014 25%,
+    #090b0e 0 50%,
+    #0d1014 0 75%,
+    #090b0e 0
+  ) 0 0 / 32px 32px;
 }
 
 .image-canvas {
@@ -441,16 +442,54 @@ textarea {
   cursor: grabbing;
 }
 
-.resize-handle {
+.image-resize-edge {
   position: absolute;
+  z-index: 3;
+  touch-action: none;
+}
+
+.resize-w,
+.resize-e {
+  top: 0;
+  bottom: 10px;
+  width: 7px;
+  cursor: ew-resize;
+}
+
+.resize-w {
+  left: 0;
+}
+
+.resize-e {
   right: 0;
+}
+
+.resize-s {
+  right: 10px;
   bottom: 0;
-  width: 18px;
-  height: 18px;
+  left: 10px;
+  height: 7px;
+  cursor: ns-resize;
+}
+
+.resize-sw,
+.resize-se {
+  bottom: 0;
+  width: 14px;
+  height: 14px;
   cursor: nwse-resize;
 }
 
-.resize-handle::after {
+.resize-sw {
+  left: 0;
+  cursor: nesw-resize;
+}
+
+.resize-se {
+  right: 0;
+}
+
+.resize-se::after {
   position: absolute;
   right: 4px;
   bottom: 4px;
@@ -935,6 +974,7 @@ button:hover {
 .glsl-panel.collapsed {
   height: auto !important;
   min-height: 0;
+  grid-template-rows: 36px;
   overflow: hidden;
 }
 

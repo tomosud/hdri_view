@@ -1,6 +1,42 @@
 const MAX_CACHED_TILES = 96;
 const HDR_REFERENCE_WHITE_NITS = 203;
 
+const BACKGROUND_SHADER = /* wgsl */`
+struct DisplayParams {
+  p0: vec4<f32>,
+  p1: vec4<f32>,
+  p2: vec4<f32>,
+  // smooth, devicePixelRatio, unused...
+  p3: vec4<f32>,
+};
+
+struct BackgroundVertexOutput {
+  @builtin(position) position: vec4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> display: DisplayParams;
+
+@vertex fn backgroundVertex(@builtin(vertex_index) vertexIndex: u32) -> BackgroundVertexOutput {
+  let positions = array<vec2<f32>, 3>(
+    vec2<f32>(-1.0, -1.0),
+    vec2<f32>(3.0, -1.0),
+    vec2<f32>(-1.0, 3.0)
+  );
+  var output: BackgroundVertexOutput;
+  output.position = vec4<f32>(positions[vertexIndex], 0.0, 1.0);
+  return output;
+}
+
+@fragment fn backgroundFragment(input: BackgroundVertexOutput) -> @location(0) vec4<f32> {
+  let cellSize = 16.0 * max(display.p3.y, 1.0);
+  let cell = vec2<i32>(floor(input.position.xy / cellSize));
+  let alternate = (cell.x + cell.y) & 1;
+  let dark = vec3<f32>(0.035, 0.043, 0.055);
+  let light = vec3<f32>(0.051, 0.063, 0.078);
+  return vec4<f32>(select(dark, light, alternate != 0), 1.0);
+}
+`;
+
 const SHADER = /* wgsl */`
 struct VertexInput {
   @location(0) position: vec2<f32>,
@@ -19,7 +55,7 @@ struct DisplayParams {
   p1: vec4<f32>,
   // logEpsilon, logMin, logRange, referenceWhiteNits
   p2: vec4<f32>,
-  // smooth, unused...
+  // smooth, devicePixelRatio, unused...
   p3: vec4<f32>,
 };
 
@@ -183,7 +219,9 @@ class WebGpuImageRenderer {
     this.onNeedsRender = onNeedsRender;
     this.onError = onError;
     this.preferredFormat = navigator.gpu.getPreferredCanvasFormat();
+    this.backgroundShaderModule = device.createShaderModule({ code: BACKGROUND_SHADER });
     this.shaderModule = device.createShaderModule({ code: SHADER });
+    this.backgroundPipelines = new Map();
     this.pipelines = new Map();
     this.canvasStates = new WeakMap();
     this.hdrQuery = matchMedia("(dynamic-range: high)");
@@ -204,7 +242,8 @@ class WebGpuImageRenderer {
     this.configureCanvas(state, canvas, requestedHdr);
 
     const pipeline = this.pipelineFor(state.format);
-    this.writeDisplayUniform(state, frame.display, state.actualHdr);
+    const backgroundPipeline = this.backgroundPipelineFor(state.format);
+    this.writeDisplayUniform(state, frame.display, state.actualHdr, frame.dpr);
     const encoder = this.device.createCommandEncoder();
     const pass = encoder.beginRenderPass({
       colorAttachments: [{
@@ -214,6 +253,17 @@ class WebGpuImageRenderer {
         clearValue: { r: 0, g: 0, b: 0, a: 1 }
       }]
     });
+    let backgroundBindGroup = state.backgroundBindGroups.get(state.format);
+    if (!backgroundBindGroup) {
+      backgroundBindGroup = this.device.createBindGroup({
+        layout: backgroundPipeline.getBindGroupLayout(0),
+        entries: [{ binding: 0, resource: { buffer: state.uniformBuffer } }]
+      });
+      state.backgroundBindGroups.set(state.format, backgroundBindGroup);
+    }
+    pass.setPipeline(backgroundPipeline);
+    pass.setBindGroup(0, backgroundBindGroup);
+    pass.draw(3);
     pass.setPipeline(pipeline);
 
     const overview = this.overviewResource(state, frame.image);
@@ -283,6 +333,7 @@ class WebGpuImageRenderer {
       format: this.preferredFormat,
       toneMapping: "standard",
       actualHdr: false,
+      backgroundBindGroups: new Map(),
       source: null,
       tileCache: new Map(),
       pendingTiles: new Map(),
@@ -361,7 +412,27 @@ class WebGpuImageRenderer {
     return pipeline;
   }
 
-  writeDisplayUniform(state, display, outputHdr) {
+  backgroundPipelineFor(format) {
+    let pipeline = this.backgroundPipelines.get(format);
+    if (pipeline) return pipeline;
+    pipeline = this.device.createRenderPipeline({
+      layout: "auto",
+      vertex: {
+        module: this.backgroundShaderModule,
+        entryPoint: "backgroundVertex"
+      },
+      fragment: {
+        module: this.backgroundShaderModule,
+        entryPoint: "backgroundFragment",
+        targets: [{ format }]
+      },
+      primitive: { topology: "triangle-list" }
+    });
+    this.backgroundPipelines.set(format, pipeline);
+    return pipeline;
+  }
+
+  writeDisplayUniform(state, display, outputHdr, dpr) {
     const values = new Float32Array(16);
     values.set([
       channelModeIndex(display.mode), display.brightness,
@@ -370,7 +441,7 @@ class WebGpuImageRenderer {
       display.absoluteNits ? 1 : 0, outputHdr ? 1 : 0,
       display.logEpsilon || 1e-6, display.logMin || 0, display.logRange || 1,
       HDR_REFERENCE_WHITE_NITS,
-      display.smooth ? 1 : 0, 0, 0, 0
+      display.smooth ? 1 : 0, dpr, 0, 0
     ]);
     this.device.queue.writeBuffer(state.uniformBuffer, 0, values);
   }

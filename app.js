@@ -23,7 +23,7 @@ import {
   runGlslShader
 } from "./glsl-runtime.js?v=20260809-7";
 import { decodeGlslShareHash, encodeGlslShareHash } from "./glsl-share.js?v=20260809-3";
-import { createWebGpuRenderer, HDR_REFERENCE_WHITE_NITS } from "./webgpu-renderer.js?v=20260812-2";
+import { createWebGpuRenderer, HDR_REFERENCE_WHITE_NITS } from "./webgpu-renderer.js?v=20260813-1";
 
 const fileInput = document.querySelector("#fileInput");
 const fileHint = document.querySelector("#fileHint");
@@ -344,6 +344,22 @@ document.addEventListener("copy", (event) => {
   }
   event.preventDefault();
   void copySelection(image, image.selection, event.clipboardData);
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey || event.key.toLowerCase() !== "f") {
+    return;
+  }
+  const target = event.target;
+  if (target instanceof Element && target.closest("input, textarea, select, [contenteditable='true']")) {
+    return;
+  }
+  const image = currentImage();
+  if (!image) {
+    return;
+  }
+  event.preventDefault();
+  fitImageToWindow(image);
 });
 
 function shouldKeepNativeClipboardEvent(event) {
@@ -735,8 +751,7 @@ document.addEventListener("pointermove", (event) => {
     activeDrag.image.window.y = next.y;
     applyWindowGeometry(activeDrag.image);
   } else if (activeDrag.kind === "resize") {
-    activeDrag.image.window.width = Math.max(minWindowWidth, activeDrag.width + dx);
-    activeDrag.image.window.height = Math.max(minWindowHeight, activeDrag.height + dy);
+    resizeImageWindow(activeDrag, dx, dy);
     activeDrag.image.view.fit = false;
     applyWindowGeometry(activeDrag.image);
     requestRender();
@@ -1661,10 +1676,15 @@ function createImageWindow(image, dropPoint, placementIndex) {
   overlay.classList.add("image-overlay");
   overlay.setAttribute("aria-hidden", "true");
 
-  const resizeHandle = document.createElement("div");
-  resizeHandle.className = "resize-handle";
+  const resizeHandles = ["w", "e", "s", "sw", "se"].map((direction) => {
+    const handle = document.createElement("div");
+    handle.className = `image-resize-edge resize-${direction}`;
+    handle.dataset.resizeDirection = direction;
+    handle.setAttribute("aria-hidden", "true");
+    return handle;
+  });
 
-  body.append(canvas, overlay, resizeHandle);
+  body.append(canvas, overlay, ...resizeHandles);
   frame.append(titlebar, body);
   windowLayer.append(frame);
 
@@ -1674,7 +1694,7 @@ function createImageWindow(image, dropPoint, placementIndex) {
     body,
     canvas,
     overlay,
-    resizeHandle,
+    resizeHandles,
     closeButton,
     size,
     modeTabs,
@@ -1724,23 +1744,28 @@ function createImageWindow(image, dropPoint, placementIndex) {
     }
   });
 
-  resizeHandle.addEventListener("pointerdown", (event) => {
-    if (event.button !== 0) {
-      return;
-    }
-    event.preventDefault();
-    event.stopPropagation();
-    selectImage(image);
-    activeDrag = {
-      kind: "resize",
-      image,
-      startX: event.clientX,
-      startY: event.clientY,
-      width: image.window.width,
-      height: image.window.height
-    };
-    resizeHandle.setPointerCapture(event.pointerId);
-  });
+  for (const resizeHandle of resizeHandles) {
+    resizeHandle.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      selectImage(image);
+      activeDrag = {
+        kind: "resize",
+        direction: resizeHandle.dataset.resizeDirection,
+        image,
+        startX: event.clientX,
+        startY: event.clientY,
+        x: image.window.x,
+        y: image.window.y,
+        width: image.window.width,
+        height: image.window.height
+      };
+      resizeHandle.setPointerCapture(event.pointerId);
+    });
+  }
 
   canvas.addEventListener("contextmenu", (event) => event.preventDefault());
 
@@ -1901,6 +1926,32 @@ function applyWindowGeometry(image) {
   frame.style.width = `${image.window.width}px`;
   frame.style.height = `${image.window.height}px`;
   frame.style.zIndex = String(image.window.z);
+}
+
+function resizeImageWindow(drag, dx, dy) {
+  const viewportRect = viewport.getBoundingClientRect();
+  const direction = drag.direction || "se";
+  const right = drag.x + drag.width;
+  let x = drag.x;
+  let width = drag.width;
+  let height = drag.height;
+
+  if (direction.includes("w")) {
+    x = clamp(drag.x + dx, 8, right - minWindowWidth);
+    width = right - x;
+  } else if (direction.includes("e")) {
+    const maxWidth = Math.max(minWindowWidth, viewportRect.width - drag.x - 8);
+    width = clamp(drag.width + dx, minWindowWidth, maxWidth);
+  }
+
+  if (direction.includes("s")) {
+    const maxHeight = Math.max(minWindowHeight, viewportRect.height - drag.y - 8);
+    height = clamp(drag.height + dy, minWindowHeight, maxHeight);
+  }
+
+  drag.image.window.x = x;
+  drag.image.window.width = width;
+  drag.image.window.height = height;
 }
 
 function clampImageWindowPosition(image, x, y) {

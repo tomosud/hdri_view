@@ -41,7 +41,7 @@ https://tomosud.github.io/hdri_view/
 
 画像ウィンドウを選択すると、右側の **VIEW SETTINGS** パネルで以下を調整できます。
 
-- **Zoom**: Fit / 100%〜3200% の固定倍率
+- **Zoom**: Fit / 100%〜3200% の固定倍率。画像ウィンドウを選択して `F` キーを押すと、画像をウィンドウ内へフィットして中央配置
 - **Filtering**: Auto / Nearest / Linear（拡大時の補間）
 - **Output**: Auto / SDR / HDR。AutoはブラウザのHDR表示能力に従い、SDRでは標準出力、HDRではfloatのextended出力を選ぶ。現在使われている出力形式は選択欄の下に表示される
 - **Auto level**: HDR画像の輝度を自動でレベル補正
