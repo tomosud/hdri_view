@@ -593,6 +593,23 @@ textarea {
   box-shadow: inset 0 0 0 1px var(--accent);
 }
 
+.tab-button.selection-changing {
+  animation: selectionTabPulse 1.05s ease-in-out infinite;
+}
+
+@keyframes selectionTabPulse {
+  0%, 100% {
+    background: rgba(255, 154, 46, 0.05);
+    color: var(--text);
+    box-shadow: inset 0 0 0 1px rgba(255, 154, 46, 0.24);
+  }
+  50% {
+    background: rgba(255, 154, 46, 0.19);
+    color: #ffc27a;
+    box-shadow: inset 0 0 0 1px rgba(255, 154, 46, 0.68);
+  }
+}
+
 .picker-title .tool-button {
   height: 26px;
   padding: 0 8px;
@@ -732,8 +749,8 @@ textarea {
 }
 
 .panel-title {
-  height: 36px;
-  padding: 10px 12px;
+  height: 32px;
+  padding: 8px 10px;
   border-bottom: 1px solid var(--line-soft);
   color: var(--muted);
   font-size: 11px;
@@ -745,7 +762,7 @@ textarea {
 
 .settings-form,
 .empty-settings {
-  padding: 12px;
+  padding: 9px 10px 10px;
 }
 
 .hidden {
@@ -760,8 +777,8 @@ textarea {
 .field,
 .check-field {
   display: grid;
-  gap: 6px;
-  margin-bottom: 14px;
+  gap: 4px;
+  margin-bottom: 9px;
 }
 
 .field > span,
@@ -774,7 +791,24 @@ textarea {
 .check-field {
   grid-template-columns: auto 1fr;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
+}
+
+.settings-form .compact-field {
+  grid-template-columns: 72px minmax(0, 1fr);
+  align-items: center;
+}
+
+.settings-form .compact-field > span {
+  grid-column: 1;
+}
+
+.settings-form .compact-field > :not(span) {
+  grid-column: 2;
+}
+
+.settings-form .output-field .output-status {
+  margin-top: -1px;
 }
 
 .check-field input {
@@ -788,7 +822,7 @@ select,
 input[type="number"] {
   width: 100%;
   min-width: 0;
-  height: 32px;
+  height: 28px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: #0b0d10;
@@ -806,7 +840,7 @@ input[type="number"] {
 .inline-input {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 64px;
-  gap: 8px;
+  gap: 6px;
 }
 
 button {
@@ -824,18 +858,24 @@ button:hover {
 }
 
 .inline-input button {
-  height: 32px;
+  height: 28px;
   font-size: 12px;
 }
 
-.ev-buttons {
+.ev-buttons,
+.gamma-buttons {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
+  gap: 6px;
 }
 
-.ev-buttons button {
-  height: 28px;
+.gamma-buttons {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.ev-buttons button,
+.gamma-buttons button {
+  height: 24px;
   padding: 0 6px;
   font-size: 11px;
 }
@@ -843,11 +883,11 @@ button:hover {
 .segmented {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 6px;
+  gap: 4px;
 }
 
 .segmented button {
-  height: 32px;
+  height: 27px;
   padding: 0 4px;
   font-size: 12px;
 }
@@ -860,8 +900,8 @@ button:hover {
 
 .meta {
   display: grid;
-  gap: 8px;
-  padding-top: 12px;
+  gap: 4px;
+  padding-top: 8px;
   border-top: 1px solid var(--line-soft);
 }
 

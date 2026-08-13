@@ -44,6 +44,7 @@ https://tomosud.github.io/hdri_view/
 - **Zoom**: Fit / 100%〜3200% の固定倍率。画像ウィンドウを選択して `F` キーを押すと、画像をウィンドウ内へフィットして中央配置
 - **Filtering**: Auto / Nearest / Linear（拡大時の補間）
 - **Output**: Auto / SDR / HDR。AutoはブラウザのHDR表示能力に従い、SDRでは標準出力、HDRではfloatのextended出力を選ぶ。現在使われている出力形式は選択欄の下に表示される
+- **Display Gamma**: WebGPU Canvasへ渡す直前の表示指数。HDR画像は1.0、SDR画像は1/2.2（0.454545）を読み込み時の既定値にする。1.0 / 2.2 / 0.454545のプリセットまたは数値入力で画像ごとに変更できる
 - **Auto level**: HDR画像の輝度を自動でレベル補正
 - **Brightness**: 露出値を数値入力、または ±1 EV ボタンで調整
 - **Channel**: RGBA / RGB / R / G / B / A の表示切り替え。**RGBA を選んでいる間は、Picker /

@@ -86,11 +86,8 @@ fn sampleSource(texel: vec2<f32>) -> vec4<f32> {
   return mix(top, bottom, fraction.y);
 }
 
-fn linearToSrgb(value: f32) -> f32 {
-  if (value <= 0.0031308) {
-    return value * 12.92;
-  }
-  return 1.055 * pow(max(value, 0.0), 1.0 / 2.4) - 0.055;
+fn applyDisplayGamma(rgb: vec3<f32>) -> vec3<f32> {
+  return pow(max(rgb, vec3<f32>(0.0)), vec3<f32>(display.p3.z));
 }
 
 fn acesToneMap(value: f32) -> f32 {
@@ -153,7 +150,7 @@ fn normalizedScalar(value: f32) -> f32 {
 
   if (mode == 5) {
     let value = normalizedScalar(source.a);
-    return vec4<f32>(value, value, value, 1.0);
+    return vec4<f32>(applyDisplayGamma(vec3<f32>(value)), 1.0);
   }
 
   var rgb = source.rgb;
@@ -165,9 +162,9 @@ fn normalizedScalar(value: f32) -> f32 {
     rgb = vec3<f32>(source.b);
   }
 
-  var output: vec3<f32>;
+  var linearOutput: vec3<f32>;
   if (display.p0.w > 0.5) {
-    output = vec3<f32>(
+    linearOutput = vec3<f32>(
       limitNormalizedRgb(normalizedLogValue(rgb.r * display.p0.y)),
       limitNormalizedRgb(normalizedLogValue(rgb.g * display.p0.y)),
       limitNormalizedRgb(normalizedLogValue(rgb.b * display.p0.y))
@@ -176,24 +173,22 @@ fn normalizedScalar(value: f32) -> f32 {
     let normalized = (rgb - vec3<f32>(display.p1.x)) * display.p1.y * display.p0.y;
     if (display.p1.w > 0.5) {
       // At 0 EV the source maximum is reference white. Positive EV may extend above it.
-      output = max(normalized, vec3<f32>(0.0));
+      linearOutput = max(normalized, vec3<f32>(0.0));
     } else {
-      let linear = clamp(normalized, vec3<f32>(0.0), vec3<f32>(1.0));
-      output = vec3<f32>(linearToSrgb(linear.r), linearToSrgb(linear.g), linearToSrgb(linear.b));
+      linearOutput = clamp(normalized, vec3<f32>(0.0), vec3<f32>(1.0));
     }
   } else if (display.p1.w > 0.5) {
-    output = rgb * display.p0.y;
+    linearOutput = rgb * display.p0.y;
     if (display.p1.z > 0.5) {
-      output /= display.p2.w;
+      linearOutput /= display.p2.w;
     }
   } else if (display.p1.z > 0.5) {
-    let linear = toneMapAbsolute(rgb, display.p0.y, display.p2.w);
-    output = vec3<f32>(linearToSrgb(linear.r), linearToSrgb(linear.g), linearToSrgb(linear.b));
+    linearOutput = toneMapAbsolute(rgb, display.p0.y, display.p2.w);
   } else {
-    let linear = rgb * display.p0.y;
-    output = vec3<f32>(linearToSrgb(linear.r), linearToSrgb(linear.g), linearToSrgb(linear.b));
+    linearOutput = rgb * display.p0.y;
   }
 
+  var output = applyDisplayGamma(linearOutput);
   if (mode == 0) {
     output *= alpha;
   }
@@ -441,7 +436,7 @@ class WebGpuImageRenderer {
       display.absoluteNits ? 1 : 0, outputHdr ? 1 : 0,
       display.logEpsilon || 1e-6, display.logMin || 0, display.logRange || 1,
       HDR_REFERENCE_WHITE_NITS,
-      display.smooth ? 1 : 0, dpr, 0, 0
+      display.smooth ? 1 : 0, dpr, display.displayGamma || (1 / 2.2), 0
     ]);
     this.device.queue.writeBuffer(state.uniformBuffer, 0, values);
   }

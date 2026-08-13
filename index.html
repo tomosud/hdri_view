@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>HDRI Value Viewer</title>
-  <link rel="stylesheet" href="./style.css?v=20260813-3">
+  <link rel="stylesheet" href="./style.css?v=20260813-7">
   <script type="importmap">
     {
       "imports": {
@@ -49,7 +49,7 @@
           <div id="emptySettings" class="empty-settings">Select an image window.</div>
 
           <div id="settingsForm" class="settings-form hidden">
-            <label class="field">
+            <label class="field compact-field">
               <span>Zoom</span>
               <select id="zoomSelect">
                 <option value="fit">Fit</option>
@@ -63,7 +63,7 @@
               </select>
             </label>
 
-            <label class="field">
+            <label class="field compact-field">
               <span>Filtering</span>
               <select id="filterSelect">
                 <option value="auto">Auto</option>
@@ -72,7 +72,7 @@
               </select>
             </label>
 
-            <label class="field">
+            <label class="field compact-field output-field">
               <span>Output</span>
               <select id="outputModeSelect">
                 <option value="auto">Auto</option>
@@ -87,9 +87,19 @@
               <span>Auto level</span>
             </label>
 
-            <div class="field">
+            <div class="field compact-field">
               <span>Color Scale</span>
               <button id="logDisplayButton" class="log-display-toggle" type="button" title="Toggle linear/log color scale for viewer and Selection Graph">Log</button>
+            </div>
+
+            <div class="field">
+              <span>Display Gamma</span>
+              <input id="displayGammaInput" type="number" value="0.454545" min="0.01" max="8" step="0.000001" inputmode="decimal">
+              <div class="gamma-buttons">
+                <button id="displayGamma1" type="button" title="Apply pow(color, 1.0)">1.0</button>
+                <button id="displayGamma22" type="button" title="Apply pow(color, 2.2)">2.2</button>
+                <button id="displayGamma04545" type="button" title="Apply pow(color, 1 / 2.2)">0.454545</button>
+              </div>
             </div>
 
             <div class="field">
@@ -216,6 +226,6 @@
     </footer>
   </div>
 
-  <script type="module" src="./app.js?v=20260813-2"></script>
+  <script type="module" src="./app.js?v=20260813-6"></script>
 </body>
 </html>

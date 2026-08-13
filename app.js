@@ -23,7 +23,7 @@ import {
   runGlslShader
 } from "./glsl-runtime.js?v=20260809-7";
 import { decodeGlslShareHash, encodeGlslShareHash } from "./glsl-share.js?v=20260809-3";
-import { createWebGpuRenderer, HDR_REFERENCE_WHITE_NITS } from "./webgpu-renderer.js?v=20260813-1";
+import { createWebGpuRenderer, HDR_REFERENCE_WHITE_NITS } from "./webgpu-renderer.js?v=20260813-2";
 
 const fileInput = document.querySelector("#fileInput");
 const fileHint = document.querySelector("#fileHint");
@@ -46,6 +46,10 @@ const selectionGraphCanvas = document.querySelector("#selectionGraphCanvas");
 const selectionGraphLabel = document.querySelector("#selectionGraphLabel");
 const selectionGraphResize = document.querySelector("#selectionGraphResize");
 const logDisplayButton = document.querySelector("#logDisplayButton");
+const displayGammaInput = document.querySelector("#displayGammaInput");
+const displayGamma1 = document.querySelector("#displayGamma1");
+const displayGamma22 = document.querySelector("#displayGamma22");
+const displayGamma04545 = document.querySelector("#displayGamma04545");
 const windowLayer = document.querySelector("#windowLayer");
 const dropPrompt = document.querySelector("#dropPrompt");
 const inspector = document.querySelector("#inspector");
@@ -644,6 +648,29 @@ outputModeSelect.addEventListener("change", () => {
   scheduleSessionSave();
 });
 
+displayGammaInput.addEventListener("input", () => setDisplayGamma(displayGammaInput.value, false));
+displayGammaInput.addEventListener("change", () => setDisplayGamma(displayGammaInput.value, true));
+displayGamma1.addEventListener("click", () => setDisplayGamma(1, true));
+displayGamma22.addEventListener("click", () => setDisplayGamma(2.2, true));
+displayGamma04545.addEventListener("click", () => setDisplayGamma(1 / 2.2, true));
+
+function setDisplayGamma(rawValue, normalizeInput) {
+  const image = currentImage();
+  if (!image) return;
+  const value = Number(rawValue);
+  if (!Number.isFinite(value) || value <= 0) {
+    if (normalizeInput) {
+      displayGammaInput.value = formatDisplayGamma(image.settings.displayGamma ?? defaultDisplayGamma(image));
+    }
+    return;
+  }
+  image.settings.displayGamma = Math.min(8, Math.max(0.01, value));
+  if (normalizeInput) displayGammaInput.value = formatDisplayGamma(image.settings.displayGamma);
+  image.displayDirty = true;
+  requestRender();
+  scheduleSessionSave();
+}
+
 autoLevelInput.addEventListener("change", () => {
   const image = currentImage();
   if (!image) {
@@ -832,6 +859,7 @@ document.addEventListener("pointerup", (event) => {
   }
   activeDrag = null;
   if (completedDragKind === "selectRect") {
+    setSelectionDragIndicator(false);
     updateSelectionPanel();
   }
   if (["selectRect", "graphResize", "graphRotate"].includes(completedDragKind)) {
@@ -840,6 +868,15 @@ document.addEventListener("pointerup", (event) => {
   if (completedDragKind) {
     scheduleSessionSave();
   }
+});
+
+document.addEventListener("pointercancel", () => {
+  if (activeDrag?.kind !== "selectRect") return;
+  activeDrag = null;
+  setSelectionDragIndicator(false);
+  updateSelectionPanel();
+  requestSelectionGraphDraw();
+  requestRender();
 });
 
 makeFloatingPanelDraggable(inspector);
@@ -1594,7 +1631,8 @@ function createImageRecord(file, width, height, type, pixels, sourceFormat = "ra
       // UE 書き出しの EXR などアルファが全面 0 の画像は RGBA 表示だと真っ黒になるため RGB を既定にする
       channel: range.max[3] > 0 ? "rgba" : "rgb",
       filter: "auto",
-      outputMode: "auto"
+      outputMode: "auto",
+      displayGamma: metadata.hdr || sourceFormat === "hdr" || sourceFormat === "exr" ? 1 : 1 / 2.2
     },
     view: {
       scale: 1,
@@ -1813,6 +1851,7 @@ function createImageWindow(image, dropPoint, placementIndex) {
         startPixel: pixel,
         moved: false
       };
+      setSelectionDragIndicator(true);
       canvas.setPointerCapture(event.pointerId);
       requestRender();
       return;
@@ -3698,6 +3737,10 @@ function setPanelTab(tab) {
   scheduleSessionSave();
 }
 
+function setSelectionDragIndicator(changing) {
+  selectionTabButton.classList.toggle("selection-changing", changing);
+}
+
 function setPickerMode(enabled) {
   pickerMode = enabled && activePanelTab === "pickers";
   pickerModeButton.classList.toggle("active", pickerMode);
@@ -5355,6 +5398,7 @@ function updateSettingsPanel() {
   zoomSelect.value = matchingZoomValue(image);
   filterSelect.value = image.settings.filter;
   outputModeSelect.value = image.settings.outputMode || "auto";
+  displayGammaInput.value = formatDisplayGamma(image.settings.displayGamma ?? defaultDisplayGamma(image));
   updateOutputStatus(image);
   autoLevelInput.checked = image.settings.autoLevel;
   brightnessInput.value = String(image.settings.brightness);
@@ -5513,8 +5557,19 @@ function displayConversion(image) {
     logEpsilon,
     logMin,
     logRange: (logMax - logMin) || 1,
+    displayGamma: Number.isFinite(Number(image.settings.displayGamma))
+      ? Math.min(8, Math.max(0.01, Number(image.settings.displayGamma)))
+      : defaultDisplayGamma(image),
     smooth: shouldSmooth(image)
   };
+}
+
+function defaultDisplayGamma(image) {
+  return image.hdr || image.sourceFormat === "hdr" || image.sourceFormat === "exr" ? 1 : 1 / 2.2;
+}
+
+function formatDisplayGamma(value) {
+  return Number(value.toFixed(6)).toString();
 }
 
 
