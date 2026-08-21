@@ -6,7 +6,7 @@ struct DisplayParams {
   p0: vec4<f32>,
   p1: vec4<f32>,
   p2: vec4<f32>,
-  // smooth, devicePixelRatio, unused...
+  // smooth, devicePixelRatio, displayGamma, invert
   p3: vec4<f32>,
 };
 
@@ -55,7 +55,7 @@ struct DisplayParams {
   p1: vec4<f32>,
   // logEpsilon, logMin, logRange, referenceWhiteNits
   p2: vec4<f32>,
-  // smooth, devicePixelRatio, unused...
+  // smooth, devicePixelRatio, displayGamma, invert
   p3: vec4<f32>,
 };
 
@@ -189,6 +189,9 @@ fn normalizedScalar(value: f32) -> f32 {
   }
 
   var output = applyDisplayGamma(linearOutput);
+  if (display.p3.w > 0.5) {
+    output = vec3<f32>(1.0) - output;
+  }
   if (mode == 0) {
     output *= alpha;
   }
@@ -436,7 +439,7 @@ class WebGpuImageRenderer {
       display.absoluteNits ? 1 : 0, outputHdr ? 1 : 0,
       display.logEpsilon || 1e-6, display.logMin || 0, display.logRange || 1,
       HDR_REFERENCE_WHITE_NITS,
-      display.smooth ? 1 : 0, dpr, display.displayGamma || (1 / 2.2), 0
+      display.smooth ? 1 : 0, dpr, display.displayGamma || (1 / 2.2), display.invert ? 1 : 0
     ]);
     this.device.queue.writeBuffer(state.uniformBuffer, 0, values);
   }

@@ -175,7 +175,7 @@ textarea {
 
 .graph-titlebar {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   gap: 8px;
   align-items: center;
   min-width: 0;
@@ -223,6 +223,7 @@ textarea {
 
 .graph-titlebar span,
 .graph-titlebar strong {
+  justify-self: end;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -593,6 +594,57 @@ textarea {
   box-shadow: inset 0 0 0 1px var(--accent);
 }
 
+.graph-value-mode {
+  padding: 2px 7px;
+  overflow: visible;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1.2;
+  text-transform: none;
+}
+
+.selection-graph-panel[data-value-mode="linear"] .graph-value-mode {
+  color: #58c8ff;
+  background: rgba(88, 200, 255, 0.1);
+}
+
+.selection-graph-panel[data-value-mode="srgb"] .graph-value-mode {
+  color: #d995ff;
+  background: rgba(217, 149, 255, 0.1);
+}
+
+.selection-graph-panel[data-value-mode="code"] .graph-value-mode {
+  color: #ffbd59;
+  background: rgba(255, 189, 89, 0.1);
+}
+
+.selection-graph-panel[data-value-mode="srgb"] .graph-value-mode,
+.selection-graph-panel[data-value-mode="code"] .graph-value-mode {
+  animation: graphValueModePulse 2.4s ease-in-out infinite;
+}
+
+@keyframes graphValueModePulse {
+  0%, 100% {
+    opacity: 0.72;
+    box-shadow: 0 0 0 rgba(255, 255, 255, 0);
+  }
+  50% {
+    opacity: 1;
+    box-shadow: 0 0 7px currentColor;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .selection-graph-panel[data-value-mode="srgb"] .graph-value-mode,
+  .selection-graph-panel[data-value-mode="code"] .graph-value-mode {
+    animation: none;
+    opacity: 1;
+  }
+}
+
 .tab-button.selection-changing {
   animation: selectionTabPulse 1.05s ease-in-out infinite;
 }
@@ -619,6 +671,54 @@ textarea {
 .picker-title select {
   height: 26px;
   font-size: 12px;
+  font-weight: 700;
+  transition: color 160ms ease, border-color 160ms ease, background-color 160ms ease;
+}
+
+#pickerValueMode[data-value-mode="linear"] {
+  border-color: rgba(88, 200, 255, 0.7);
+  background: rgba(24, 66, 86, 0.55);
+  color: #58c8ff;
+}
+
+#pickerValueMode[data-value-mode="srgb"] {
+  border-color: rgba(217, 149, 255, 0.7);
+  background: rgba(67, 36, 84, 0.55);
+  color: #d995ff;
+}
+
+#pickerValueMode[data-value-mode="code"] {
+  border-color: rgba(255, 189, 89, 0.75);
+  background: rgba(79, 55, 20, 0.58);
+  color: #ffbd59;
+}
+
+#pickerValueMode option {
+  background: #0b0d10;
+}
+
+#pickerValueMode option.value-mode-linear {
+  color: #58c8ff;
+}
+
+#pickerValueMode option.value-mode-srgb {
+  color: #d995ff;
+}
+
+#pickerValueMode option.value-mode-code {
+  color: #ffbd59;
+}
+
+.picker-panel[data-value-mode="linear"] .selection-summary {
+  box-shadow: inset 2px 0 #58c8ff;
+}
+
+.picker-panel[data-value-mode="srgb"] .selection-summary {
+  box-shadow: inset 2px 0 #d995ff;
+}
+
+.picker-panel[data-value-mode="code"] .selection-summary {
+  box-shadow: inset 2px 0 #ffbd59;
 }
 
 .picker-rows {

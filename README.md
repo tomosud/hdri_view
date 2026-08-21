@@ -17,10 +17,12 @@ https://tomosud.github.io/hdri_view/
 
 ## できること
 
-- PNG / JPEG / WebP / AVIF / GIF / BMP / **JPEG 2000 (JP2/J2K, 1/3ch, 1〜16bit)** / **TIFF / BigTIFF（LZW・Deflate・PackBits・JPEGなど）** に加え、**HDR (Radiance)** / **EXR (OpenEXR)** をブラウザ上でそのまま開ける
+- PNG / JPEG / WebP / AVIF / GIF / BMP / **JPEG 2000 (JP2/J2K, 1/3ch, 1〜16bit)** / **TIFF / BigTIFF（LZW・Deflate・PackBits・JPEGなど）** / **DICOM（非圧縮・単一フレーム）** に加え、**HDR (Radiance)** / **EXR (OpenEXR)** をブラウザ上でそのまま開ける
 - 16,777,216画素を超える非インターレース8/16bit Gray / Gray+Alpha / RGB(A) PNGは、まず縮小した仮画像を表示し、Worker内で元ビット深度の512pxタイルへストリーム展開できた時点で原寸表示へ自動で差し替える
 - 通常表示は WebGPU に統一し、低解像度の全体プレビューを常に背景へ表示した上へ、読み込み済みの512pxタイルを重ねる。HDR対応環境ではfloat出力、SDR環境ではシェーダー内トーンマップを使い、移動・ズーム先のタイルが未到着でも黒抜けさせない
 - カーソル位置の **linear値 / sRGB値** をステータスバーにリアルタイム表示。配置済みピッカーはクリックで選択し、左ドラッグで移動できる
+- ピッカーとSelectionの値モードは **Linear / sRGB / Code Value** を切替可能。各モードはピッカーとSelection Graphで共通のアクセント色を使い、Linear以外のグラフ表示はモードバッジが控えめに点滅する。整数画像のLinearはビット深度で0〜1へ正規化し、Code Valueは8-bitなら0〜255、12-bitなら0〜4095の量子化コードを表示する。Float/HDR/EXRのLinearとCode Valueは元の値を保つ
+- Code ValueはPNG/TIFF/DICOMなどでは画素コードに対応する。JPEGでは伸長後RGB、AVIFではYUVからRGBへ変換後のビット深度相当値であり、圧縮係数や元YUVプレーン値そのものではない
 - 複数の画像をウィンドウとして並べて比較
 - 任意の点をピックしてリストに記録、CSV としてコピー
 - 矩形選択した範囲の最小・最大・平均値と、値の分布を **3Dグラフ** で可視化
@@ -76,7 +78,7 @@ https://tomosud.github.io/hdri_view/
 
 ![Selectionタブの詳細](doc_asset/crop/selection_panel.png)
 
-**Selection** タブでは選択範囲の Rect / Count / Min / Max / Average（RGB・Luminance）が数値で確認でき、生の値マトリクスを **Copy Matrix** または **CSV** で書き出せます。
+**Selection** タブでは選択範囲の Rect / Count / Min / Max / Average（RGB・Luminance）が数値で確認でき、選択中の値モードで値マトリクスを **Copy Matrix** または **CSV** へ書き出せます。
 
 ### 5. 画像・HDR値・数値マトリクスをコピー／ペーストする
 
@@ -104,8 +106,7 @@ Selection の **Copy Matrix** もこの完全形式をコピーするため、�
 ```
 
 スカラーだけの行列はグレースケール、2〜4要素のタプルは RG / RGB / RGBA として解釈します。
-HDRI Value Matrix は寸法、チャンネル、linear / sRGB、alpha乗算状態を保持し、貼り付け時にlinear RGBAへ
-戻します。貼り付けた値画像は PNG / JPEG / WebP / HDR / EXR で保存できます。
+HDRI Value Matrix は寸法、チャンネル、linear / sRGB / Code Value、alpha乗算状態を保持します。linear / sRGBは貼り付け時にlinear RGBAへ戻し、Code Valueは数値コードのまま読み込みます。貼り付けた値画像は PNG / JPEG / WebP / HDR / EXR で保存できます。
 
 貼り付け候補が同時に存在する場合の優先順位は次のとおりです。
 
@@ -201,7 +202,7 @@ GPU メモリと readPixels によるフリーズを避けるため、GLSL の�
 
 | 用途 | 形式 |
 | --- | --- |
-| 読み込み | PNG, JPEG, WebP, AVIF, GIF, BMP, JPEG 2000 (JP2/J2K), TIFF / BigTIFF, HDR (Radiance), EXR (OpenEXR) |
+| 読み込み | PNG, JPEG, WebP, AVIF, GIF, BMP, JPEG 2000 (JP2/J2K), TIFF / BigTIFF, DICOM (非圧縮・単一フレーム・グレースケール), HDR (Radiance), EXR (OpenEXR) |
 | 保存 | PNG, JPEG, WebP, HDR RGBE（HDRI画像）, EXR Float（HDRI画像） |
 
 AVIF はブラウザの WebCodecs `ImageDecoder` が返すネイティブYUVプレーンをWorkerで読みます。
@@ -224,6 +225,7 @@ AVIF gain mapの合成は未対応です。
 - PNG は小～中画像を `png-decoder.js`、巨大画像を `png-tile-worker.js` で自前デコードする。巨大画像は圧縮ファイル全体やRGBA Float32全体を確保せず、待ち時間中だけ最大1024pxの仮画像を使う。ピクセル値は原寸タイルへの切替後に元ビット深度で取得する
 - TIFF はMITライセンスの GeoTIFF.js 3.0.5を常駐Workerで実行し、表示・ピッカー・選択範囲に必要な領域だけを読む。巨大な非圧縮・chunky形式のstrip TIFFは、strip全体を展開せずBlobの必要行区間を直接読む。LZW・Deflate・PackBits・JPEGなどの圧縮、strip/tile、整数・浮動小数点サンプルに対応する
 - JPEG 2000 はMITライセンスの `@cornerstonejs/codec-openjpeg` 1.3.0（OpenJPEG純JS版）をWorkerで実行する。Codecの安全メモリ内に収まる画像は原寸タイル表示し、領域デコードAPIが未公開の巨大画像はwaveletサブ解像度へフォールバックする
+- DICOM はMITライセンスの `dicom-parser` 1.8.21でタグを解析する。非圧縮のImplicit/Explicit VR Little EndianとExplicit VR Big Endian、単一フレームの8/16-bit MONOCHROME1/2に対応する。画像テクスチャとGLSL入力はBits Storedと符号範囲で0〜1へ正規化し、Code Value表示では元コードへ復元する。Rescale Slope/Interceptを介してWindow Center/Widthも同じ正規化座標へ変換する。圧縮転送構文とマルチフレームは未対応
 - HDRI Value Matrix は `clipboard-matrix.js` でシリアライズ／解析
 - GLSL 加工・生成は `glsl-runtime.js`（WebGL2 を直接使用、RGBA32F の FBO に描いて `readPixels`）
 - 通常画像の表示は `raster-source.js` の共通画素ソースと `webgpu-renderer.js` のWebGPUレンダラーを使用。Float32画素を `rgba32float` テクスチャへ載せ、HDRは `rgba16float` / extended tone mapping、SDRはブラウザ推奨形式 / standard tone mappingへ描画する。メモリ・ImageBitmap・非同期Workerを同じプロトコルで扱い、表示・ピッカー・範囲選択は同じ画素ソースを参照する

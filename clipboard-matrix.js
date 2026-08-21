@@ -259,7 +259,7 @@ function normalizeChannels(channels) {
 
 function normalizeEncoding(encoding) {
   const normalized = String(encoding || "linear").toLowerCase();
-  if (!["linear", "srgb", "srgb255"].includes(normalized)) {
+  if (!["linear", "srgb", "srgb255", "code"].includes(normalized)) {
     throw new Error(`Unknown Value Matrix encoding: ${encoding}`);
   }
   return normalized;

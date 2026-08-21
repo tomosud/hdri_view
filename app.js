@@ -5,6 +5,7 @@ import { decodePng, isPngFile, pngTypeLabel } from "./png-decoder.js?v=20260809-
 import { canOpenPngAsTiles, openPngRasterSource } from "./png-raster-source.js?v=20260809-2";
 import { decodeTiff, openTiffRasterSource } from "./tiff-decoder.js?v=20260811-2";
 import { decodeJpeg2000, openJpeg2000RasterSource } from "./jp2-decoder.js?v=20260809-6";
+import { decodeDicom, isDicomFile } from "./dicom-decoder.js?v=20260821-3";
 import { createBitmapRasterSource, createMemoryRasterSource, createSwitchableRasterSource, RASTER_TILE_SIZE } from "./raster-source.js?v=20260811-2";
 import { openAvifRasterSource } from "./avif-raster-source.js?v=20260810-2";
 import {
@@ -14,7 +15,7 @@ import {
   parseValueMatrix,
   serializeInternalValueReference,
   serializeValueMatrix
-} from "./clipboard-matrix.js?v=20260808-1";
+} from "./clipboard-matrix.js?v=20260821-1";
 import {
   DEFAULT_FILTER_CODE,
   DEFAULT_GENERATOR_CODE,
@@ -23,7 +24,7 @@ import {
   runGlslShader
 } from "./glsl-runtime.js?v=20260809-7";
 import { decodeGlslShareHash, encodeGlslShareHash } from "./glsl-share.js?v=20260809-3";
-import { createWebGpuRenderer, HDR_REFERENCE_WHITE_NITS } from "./webgpu-renderer.js?v=20260813-2";
+import { createWebGpuRenderer, HDR_REFERENCE_WHITE_NITS } from "./webgpu-renderer.js?v=20260821-1";
 
 const fileInput = document.querySelector("#fileInput");
 const fileHint = document.querySelector("#fileHint");
@@ -44,6 +45,7 @@ const viewport = document.querySelector("#viewport");
 const selectionGraphPanel = document.querySelector("#selectionGraphPanel");
 const selectionGraphCanvas = document.querySelector("#selectionGraphCanvas");
 const selectionGraphLabel = document.querySelector("#selectionGraphLabel");
+const selectionGraphValueMode = document.querySelector("#selectionGraphValueMode");
 const selectionGraphResize = document.querySelector("#selectionGraphResize");
 const logDisplayButton = document.querySelector("#logDisplayButton");
 const displayGammaInput = document.querySelector("#displayGammaInput");
@@ -138,6 +140,7 @@ const graphView = {
 };
 let logDisplayMode = false;
 const graphCtx = selectionGraphCanvas.getContext("2d");
+const valueModeLabels = { linear: "Linear", srgb: "sRGB", code: "Code Value" };
 const selectionDetailsCache = new WeakMap();
 let selectionDetailsTimer = null;
 let selectionCopyFrame = null;
@@ -169,10 +172,20 @@ pickerModeButton.addEventListener("click", () => {
 });
 
 pickerValueMode.addEventListener("change", () => {
+  applyValueModeTheme();
   updatePickerPanel();
   updateSelectionPanel();
+  requestSelectionGraphDraw();
   scheduleSessionSave();
 });
+
+function applyValueModeTheme() {
+  const mode = valueModeLabels[pickerValueMode.value] ? pickerValueMode.value : "linear";
+  pickerPanel.dataset.valueMode = mode;
+  selectionGraphPanel.dataset.valueMode = mode;
+  pickerValueMode.dataset.valueMode = mode;
+  selectionGraphValueMode.textContent = valueModeLabels[mode];
+}
 
 pickerCopyMode.addEventListener("change", () => {
   updatePickerPanel();
@@ -884,6 +897,7 @@ makeFloatingPanelDraggable(pickerPanel);
 makeFloatingPanelDraggable(selectionGraphPanel);
 initGlslEditor();
 updatePickerPanel();
+applyValueModeTheme();
 updateLogDisplayButton();
 requestRender();
 requestSelectionGraphDraw();
@@ -896,7 +910,8 @@ async function openFilesWithPicker() {
       types: [{
         description: "Images",
         accept: {
-          "image/*": [".png", ".jpg", ".jpeg", ".webp", ".avif", ".gif", ".bmp", ".hdr", ".pic", ".exr"]
+          "image/*": [".png", ".jpg", ".jpeg", ".webp", ".avif", ".gif", ".bmp", ".hdr", ".pic", ".exr"],
+          "application/dicom": [".dcm"]
         }
       }]
     });
@@ -1021,6 +1036,9 @@ function formatFileError(file, error) {
 
 async function loadImageFile(file) {
   const extension = file.name.split(".").pop().toLowerCase();
+  if (extension === "dcm" || isDicomFile(file)) {
+    return loadDicomImage(file);
+  }
   if (extension === "exr") {
     return loadDataTexture(file, "exr");
   }
@@ -1037,6 +1055,30 @@ async function loadImageFile(file) {
     return loadAvifImage(file);
   }
   return loadRasterImage(file);
+}
+
+async function loadDicomImage(file) {
+  const decoded = await decodeDicom(file);
+  const signedLabel = decoded.signed ? "signed" : "unsigned";
+  const record = createImageRecord(
+    file,
+    decoded.width,
+    decoded.height,
+    `dicom/${decoded.photometric.toLowerCase()} · ${decoded.bitsStored}-bit ${signedLabel}`,
+    decoded.pixels,
+    "dicom",
+    {
+      format: "DICOM",
+      bitDepth: `${decoded.bitsStored}-bit in ${decoded.bitsAllocated}-bit`,
+      displayRange: decoded.displayRange,
+      displayInvert: decoded.displayInvert,
+      integerEncoding: decoded.integerEncoding,
+      autoLevel: true,
+      displayGamma: 1
+    }
+  );
+  record.transferSyntax = decoded.transferSyntaxUid;
+  return record;
 }
 
 async function loadAvifImage(file) {
@@ -1059,6 +1101,9 @@ async function loadAvifImage(file) {
       {
         format: hdr ? "AVIF HDR" : "AVIF",
         bitDepth: `${opened.bitDepth}-bit`,
+        integerEncoding: hdr
+          ? null
+          : { bits: opened.bitDepth, signed: false, normalized: true, transfer: "srgb" },
         rasterSource: opened.rasterSource,
         range: computeRange(opened.preview.pixels),
         overview: rasterOverview(opened.preview),
@@ -1097,6 +1142,7 @@ async function loadJpeg2000Image(file) {
       {
         format: opened.container,
         bitDepth: `${opened.bitDepth}-bit`,
+        integerEncoding: { bits: opened.bitDepth, signed: Boolean(opened.signed), normalized: true, transfer: "srgb" },
         rasterSource: opened.rasterSource,
         range: computeRange(opened.preview.pixels),
         overview: rasterOverview(opened.preview)
@@ -1122,6 +1168,7 @@ async function loadJpeg2000Image(file) {
     {
       format: decoded.container,
       bitDepth: `${decoded.bitDepth}-bit`,
+      integerEncoding: { bits: decoded.bitDepth, signed: Boolean(decoded.signed), normalized: true, transfer: "srgb" },
       sourceWidth: decoded.sourceWidth,
       sourceHeight: decoded.sourceHeight,
       downsample: decoded.downsample
@@ -1145,7 +1192,10 @@ async function loadTiffImage(file) {
         rasterSource: opened.rasterSource,
         range: computeRange(opened.preview.pixels),
         overview: rasterOverview(opened.preview),
-        hdr: opened.sampleFormat === 3
+        hdr: opened.sampleFormat === 3,
+        integerEncoding: opened.sampleFormat === 3
+          ? null
+          : { bits: opened.bitDepth, signed: opened.sampleFormat === 2, normalized: true, transfer: "srgb" }
       }
     );
   } catch (error) {
@@ -1163,7 +1213,13 @@ async function loadTiffImage(file) {
     `tiff/${decoded.channels}${decoded.bitDepth}`,
     decoded.pixels,
     "raster",
-    { format: "TIFF", bitDepth: decoded.bitDepthLabel || `${decoded.bitDepth}-bit` }
+    {
+      format: "TIFF",
+      bitDepth: decoded.bitDepthLabel || `${decoded.bitDepth}-bit`,
+      integerEncoding: decoded.sampleFormat === 3
+        ? null
+        : { bits: decoded.bitDepth, signed: decoded.sampleFormat === 2, normalized: true, transfer: "srgb" }
+    }
   );
 }
 
@@ -1456,7 +1512,8 @@ function rasterOverview(preview, maximumEdge = 1024) {
 
 async function rasterFileMetadata(file) {
   const format = rasterFormat(file);
-  let bitDepth = ["JPEG", "WEBP", "GIF"].includes(format) ? "8-bit" : "";
+  // Canvas compatibility paths expose decoded channels as 8-bit even when the source container was deeper.
+  let bitDepth = ["JPEG", "WEBP", "GIF", "PNG", "AVIF"].includes(format) ? "8-bit" : "";
   try {
     const bytes = new Uint8Array(await file.slice(0, 65536).arrayBuffer());
     if (format === "JPEG") {
@@ -1619,20 +1676,23 @@ function createImageRecord(file, width, height, type, pixels, sourceFormat = "ra
     transfer: metadata.transfer || null,
     matrix: metadata.matrix || null,
     fullRange: metadata.fullRange ?? null,
+    displayRange: metadata.displayRange || null,
+    displayInvert: Boolean(metadata.displayInvert),
+    integerEncoding: metadata.integerEncoding || null,
     source: { kind: "external", name: file.name },
     pixels,
     rasterSource,
     range,
     overview: metadata.overview || null,
     settings: {
-      autoLevel: false,
+      autoLevel: Boolean(metadata.autoLevel),
       logDisplay: metadata.logDisplay ?? metadata.hdr ?? (sourceFormat === "hdr" || sourceFormat === "exr"),
       brightness: 1,
       // UE 書き出しの EXR などアルファが全面 0 の画像は RGBA 表示だと真っ黒になるため RGB を既定にする
       channel: range.max[3] > 0 ? "rgba" : "rgb",
       filter: "auto",
       outputMode: "auto",
-      displayGamma: metadata.hdr || sourceFormat === "hdr" || sourceFormat === "exr" ? 1 : 1 / 2.2
+      displayGamma: metadata.displayGamma ?? (metadata.hdr || sourceFormat === "hdr" || sourceFormat === "exr" ? 1 : 1 / 2.2)
     },
     view: {
       scale: 1,
@@ -2142,6 +2202,9 @@ function imageVariant(image) {
     transfer: image.transfer,
     matrix: image.matrix,
     fullRange: image.fullRange,
+    displayRange: image.displayRange,
+    displayInvert: image.displayInvert,
+    integerEncoding: image.integerEncoding,
     name: image.name,
     pixels: image.pixels,
     rasterSource: image.rasterSource,
@@ -2168,6 +2231,9 @@ function glslVariant(code, pixels, width, height) {
     transfer: "linear",
     matrix: "rgb",
     fullRange: true,
+    displayRange: null,
+    displayInvert: false,
+    integerEncoding: null,
     pixels,
     rasterSource: createMemoryRasterSource(pixels, width, height),
     range: computeRange(pixels)
@@ -2275,6 +2341,9 @@ function applyImageVariant(image, mode) {
   image.transfer = variant.transfer || null;
   image.matrix = variant.matrix || null;
   image.fullRange = variant.fullRange ?? null;
+  image.displayRange = variant.displayRange || null;
+  image.displayInvert = Boolean(variant.displayInvert);
+  image.integerEncoding = variant.integerEncoding || null;
   image.pixels = variant.pixels;
   image.rasterSource = variant.rasterSource;
   image.range = variant.range;
@@ -3512,7 +3581,8 @@ function panelSessionState(panel) {
 
 function applyAppSessionState(session) {
   if (typeof session.pickerValueMode === "string") {
-    pickerValueMode.value = session.pickerValueMode;
+    pickerValueMode.value = session.pickerValueMode === "srgb255" ? "code" : session.pickerValueMode;
+    applyValueModeTheme();
   }
   if (typeof session.pickerCopyMode === "string") {
     pickerCopyMode.value = session.pickerCopyMode;
@@ -3848,7 +3918,7 @@ function updateHoveredPickerUi({ scroll = false } = {}) {
   const linear = readDisplayedLinear(hovered.image, hovered.picker.x, hovered.picker.y, () => {
     if (hoveredPickerId === currentHoverId) requestHoveredPickerUi();
   });
-  let modeLabel = { linear: "Linear", srgb: "sRGB", srgb255: "sRGB 255" }[pickerValueMode.value] || pickerValueMode.value;
+  let modeLabel = valueModeLabels[pickerValueMode.value] || pickerValueMode.value;
   if (pickerValueMode.value === "linear" && hovered.image.valueUnit === "nit") modeLabel += " [nit]";
   hoveredPickerValue.textContent = linear
     ? `P${hovered.picker.id} ${modeLabel}: ${formatPickerValue(hovered.image, valuesFromLinear(linear, hovered.image))}`
@@ -3920,7 +3990,8 @@ function updateSelectionPanel() {
     `Image: ${image.name}`,
     `Rect: x ${rect.x}, y ${rect.y}, ${rect.width} x ${rect.height} px`,
     `Count: ${rect.width * rect.height}`,
-    `Display: ${displayChannelLabel(image)}`
+    `Display: ${displayChannelLabel(image)}`,
+    `Values: ${pickerValueMode.options[pickerValueMode.selectedIndex]?.textContent || pickerValueMode.value}`
   ];
 
   if (stats) {
@@ -4049,7 +4120,7 @@ function runSelectionWorker(image, rect, rectKey, matrixKey, valueMode, channels
     return;
   }
   try {
-    selectionWorker = new Worker(new URL("./selection-worker.js?v=20260810-3", import.meta.url), { type: "module" });
+    selectionWorker = new Worker(new URL("./selection-worker.js?v=20260821-2", import.meta.url), { type: "module" });
   } catch (error) {
     selectionDetailsInFlight = null;
     console.error("Selection worker could not start.", error);
@@ -4106,6 +4177,7 @@ function runSelectionWorker(image, rect, rectKey, matrixKey, valueMode, channels
     channels,
     alphaWeighted: usesAlphaWeightedValues(image),
     absoluteNits: image.valueUnit === "nit",
+    integerEncoding: pickerIntegerEncoding(image),
     previewRows: selectionMatrixPreviewRows,
     previewColumns: selectionMatrixPreviewColumns
   }, [pixels.buffer]);
@@ -4191,7 +4263,7 @@ function runFullSelectionMatrixWorker(image, rect, matrixKey, valueMode, channel
     return;
   }
   try {
-    selectionMatrixCopyWorker = new Worker(new URL("./selection-worker.js?v=20260810-3", import.meta.url), { type: "module" });
+    selectionMatrixCopyWorker = new Worker(new URL("./selection-worker.js?v=20260821-2", import.meta.url), { type: "module" });
   } catch (error) {
     console.error("Matrix copy worker could not start.", error);
     fileHint.textContent = "Matrix copy failed.";
@@ -4226,7 +4298,8 @@ function runFullSelectionMatrixWorker(image, rect, matrixKey, valueMode, channel
     valueMode,
     channels,
     alphaWeighted: usesAlphaWeightedValues(image),
-    absoluteNits: image.valueUnit === "nit"
+    absoluteNits: image.valueUnit === "nit",
+    integerEncoding: pickerIntegerEncoding(image)
   }, [pixels.buffer]);
 }
 
@@ -4613,7 +4686,8 @@ function graphPixelValue(image, x, y) {
   if (!linear) {
     return Number.NaN;
   }
-  return channelValueFromRgba(image.settings.channel, linear[0], linear[1], linear[2], linear[3]);
+  const values = numericValuesForMode(valuesFromLinear(linear, image), pickerValueMode.value);
+  return channelValueFromRgba(image.settings.channel, values[0], values[1], values[2], values[3]);
 }
 
 function channelValueFromRgba(mode, r, g, b, a) {
@@ -5169,20 +5243,64 @@ function displayedLinearFromRgba(image, rgba) {
 }
 
 function valuesFromLinear(linear, image = null) {
-  const displayLinear = image ? displayPreviewLinear(image, linear) : linear;
+  const normalizedLinear = image ? normalizeIntegerLinear(image, linear) : linear;
+  const displayLinear = image ? displayPreviewLinear(image, normalizedLinear) : normalizedLinear;
   const srgb = [
     linearToSrgb(displayLinear[0]),
     linearToSrgb(displayLinear[1]),
     linearToSrgb(displayLinear[2]),
     linear[3]
   ];
-  const srgb255 = [
-    Math.round(clamp01(srgb[0]) * 255),
-    Math.round(clamp01(srgb[1]) * 255),
-    Math.round(clamp01(srgb[2]) * 255),
-    Math.round(clamp01(srgb[3]) * 255)
-  ];
-  return { linear, srgb, srgb255 };
+  const code = image ? integerCodeValues(image, linear, srgb) : linear;
+  return { linear: normalizedLinear, srgb, code };
+}
+
+function normalizeIntegerLinear(image, values) {
+  const encoding = image?.integerEncoding;
+  if (!encoding) return values;
+  if (encoding.normalized) return values;
+  const code = integerCodeValues(image, values);
+  const minimum = encoding.signed ? -(2 ** (encoding.bits - 1)) : 0;
+  const maximum = encoding.signed ? (2 ** (encoding.bits - 1)) - 1 : (2 ** encoding.bits) - 1;
+  const range = maximum - minimum || 1;
+  return code.map((value, channel) => channel < 3 ? clamp01((value - minimum) / range) : value);
+}
+
+function integerCodeValues(image, values, srgbValues = null) {
+  const encoding = image?.integerEncoding;
+  if (!encoding || encoding.normalized) {
+    const inferred = encoding || pickerIntegerEncoding(image);
+    if (!inferred) return values;
+    const minimum = inferred.signed ? -(2 ** (inferred.bits - 1)) : 0;
+    const maximum = inferred.signed ? (2 ** (inferred.bits - 1)) - 1 : (2 ** inferred.bits) - 1;
+    const range = maximum - minimum;
+    const encoded = inferred.transfer === "linear"
+      ? values
+      : srgbValues || [
+        linearToSrgb(values[0]), linearToSrgb(values[1]), linearToSrgb(values[2]), values[3]
+      ];
+    return encoded.map((value, channel) => channel < 3
+      ? Math.round(clamp01(value) * range + minimum)
+      : inferred.syntheticAlpha
+        ? value
+        : Math.round(clamp01(value) * ((2 ** inferred.bits) - 1)));
+  }
+  const slope = Number(encoding.slope);
+  const intercept = Number(encoding.intercept);
+  return values.map((value, channel) => channel < 3
+    ? (slope ? Math.round((value - intercept) / slope) : value)
+    : value);
+}
+
+function pickerIntegerEncoding(image) {
+  if (image?.integerEncoding) return image.integerEncoding;
+  if (!image || image.hdr || ["hdr", "exr", "glsl", "values", "dicom"].includes(image.sourceFormat)) return null;
+  if (/float|\d+f/i.test(image.bitDepth || "")) return null;
+  const match = String(image.bitDepth || "").match(/(\d+)-bit/i);
+  let bits = match ? Number(match[1]) : 0;
+  if (/bit\/pixel/i.test(image.bitDepth || "")) bits = 8;
+  if (!Number.isInteger(bits) || bits < 1 || bits > 16) return null;
+  return { bits, signed: false, normalized: true, transfer: "srgb" };
 }
 
 function csvCell(value) {
@@ -5214,13 +5332,19 @@ function valueTupleForMode(values, mode, channels = allDisplayChannels()) {
 }
 
 function valuesForMode(values, mode) {
-  if (mode === "srgb255") {
-    return values.srgb255;
+  if (mode === "code") {
+    return values.code.map(formatNumber);
   }
   if (mode === "srgb") {
     return values.srgb.map(formatNumber);
   }
   return values.linear.map(formatNumber);
+}
+
+function numericValuesForMode(values, mode) {
+  if (mode === "code") return values.code;
+  if (mode === "srgb") return values.srgb;
+  return values.linear;
 }
 
 function valueChannels(image) {
@@ -5366,6 +5490,9 @@ function computeRange(pixels) {
 }
 
 function getDisplayNormalizationRange(image) {
+  if (image.displayRange && Number.isFinite(image.displayRange.min) && Number.isFinite(image.displayRange.max)) {
+    return image.displayRange;
+  }
   const channelIndex = { r: 0, g: 1, b: 2, a: 3 }[image.settings.channel];
 
   // R/G/B/A単独表示時はそのチャンネル専用の範囲を使う
@@ -5560,7 +5687,8 @@ function displayConversion(image) {
     displayGamma: Number.isFinite(Number(image.settings.displayGamma))
       ? Math.min(8, Math.max(0.01, Number(image.settings.displayGamma)))
       : defaultDisplayGamma(image),
-    smooth: shouldSmooth(image)
+    smooth: shouldSmooth(image),
+    invert: Boolean(image.displayInvert)
   };
 }
 

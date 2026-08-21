@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>HDRI Value Viewer</title>
-  <link rel="stylesheet" href="./style.css?v=20260813-7">
+  <link rel="stylesheet" href="./style.css?v=20260821-1">
   <script type="importmap">
     {
       "imports": {
@@ -19,7 +19,7 @@
     <header class="topbar">
       <div class="brand">HDRI Value Viewer</div>
       <label class="file-button">
-        <input id="fileInput" type="file" multiple accept="image/*,.jp2,.j2k,.j2c,.tif,.tiff,.hdr,.pic,.exr">
+        <input id="fileInput" type="file" multiple accept="image/*,.jp2,.j2k,.j2c,.tif,.tiff,.hdr,.pic,.exr,.dcm,application/dicom">
         Open
       </label>
       <button id="newImageButton" class="tool-button" type="button" title="Generate a new image from GLSL code only">New Image</button>
@@ -32,6 +32,7 @@
         <aside id="selectionGraphPanel" class="selection-graph-panel hidden" aria-label="Selection value graph">
           <div class="graph-titlebar">
             <span>Selection Graph</span>
+            <span id="selectionGraphValueMode" class="graph-value-mode">Linear</span>
             <strong id="selectionGraphLabel">-</strong>
           </div>
           <canvas id="selectionGraphCanvas" class="selection-graph-canvas"></canvas>
@@ -40,7 +41,7 @@
         <div id="windowLayer" class="window-layer"></div>
         <div id="dropPrompt" class="drop-prompt">
           <div>Drop images here</div>
-          <span>PNG / JPEG / WebP / AVIF / GIF / BMP / JP2 / TIFF / HDR / EXR</span>
+          <span>PNG / JPEG / WebP / AVIF / GIF / BMP / JP2 / TIFF / DICOM / HDR / EXR</span>
         </div>
 
         <aside id="inspector" class="inspector" aria-label="View settings">
@@ -187,9 +188,9 @@
               <button id="selectionTabButton" class="tab-button" type="button">Selection</button>
             </div>
             <select id="pickerValueMode" aria-label="Picker value mode">
-              <option value="linear">Linear</option>
-              <option value="srgb">sRGB</option>
-              <option value="srgb255">sRGB 255</option>
+              <option value="linear" class="value-mode-linear">Linear</option>
+              <option value="srgb" class="value-mode-srgb">sRGB</option>
+              <option value="code" class="value-mode-code">Code Value</option>
             </select>
           </div>
           <div id="pickersTabContent" class="panel-tab-content">
@@ -226,6 +227,6 @@
     </footer>
   </div>
 
-  <script type="module" src="./app.js?v=20260813-6"></script>
+  <script type="module" src="./app.js?v=20260821-4"></script>
 </body>
 </html>

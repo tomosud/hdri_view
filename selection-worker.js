@@ -1,4 +1,4 @@
-import { serializeValueMatrix } from "./clipboard-matrix.js?v=20260808-1";
+import { serializeValueMatrix } from "./clipboard-matrix.js?v=20260821-1";
 
 self.addEventListener("message", (event) => {
   const {
@@ -10,6 +10,7 @@ self.addEventListener("message", (event) => {
     channels,
     alphaWeighted = false,
     absoluteNits = false,
+    integerEncoding = null,
     previewRows,
     previewColumns
   } = event.data;
@@ -26,10 +27,12 @@ self.addEventListener("message", (event) => {
     }
   }
 
+  const basePixels = pixelsForValueEncoding(pixels, valueMode, absoluteNits, integerEncoding);
+  const displayPixels = valueMode === "srgb" ? applySrgbEncoding(basePixels) : basePixels;
+
   if (task === "matrix") {
-    const matrixPixels = pixelsForValueEncoding(pixels, valueMode, absoluteNits);
     const matrix = serializeValueMatrix({
-      pixels: matrixPixels,
+      pixels: basePixels,
       width,
       height,
       channels,
@@ -42,16 +45,15 @@ self.addEventListener("message", (event) => {
     return;
   }
 
-  const stats = selectionStats(pixels, width, height);
-  const pooled = selectionPooledGrid(pixels, width, height);
-  const texture = selectionPeakTexture(pixels, width, height);
+  const stats = selectionStats(displayPixels, width, height);
+  const pooled = selectionPooledGrid(displayPixels, width, height);
+  const texture = selectionPeakTexture(displayPixels, width, height);
   self.postMessage(
     { kind: "stats", jobId, stats, pooled, texture },
     [pooled.values.buffer, texture.values.buffer]
   );
-  const matrixPixels = pixelsForValueEncoding(pixels, valueMode, absoluteNits);
   const matrix = selectionMatrixValue(
-    matrixPixels,
+    basePixels,
     width,
     height,
     valueMode,
@@ -220,26 +222,65 @@ function selectionMatrixValue(
 }
 
 function formatPixelValue(value, channel, mode) {
-  if (mode === "srgb255") {
-    const converted = channel < 3 ? linearToSrgb(value) : value;
-    return Math.round(clamp01(converted) * 255);
-  }
   if (mode === "srgb" && channel < 3) {
     return formatNumber(linearToSrgb(value));
   }
   return formatNumber(value);
 }
 
-function pixelsForValueEncoding(pixels, mode, absoluteNits) {
-  if (!absoluteNits || mode === "linear") {
-    return pixels;
-  }
+function pixelsForValueEncoding(pixels, mode, absoluteNits, integerEncoding) {
+  if (integerEncoding) return integerPixelsForMode(pixels, mode, integerEncoding);
+  if (!absoluteNits || mode !== "srgb") return pixels;
   const result = pixels.slice();
   for (let index = 0; index < result.length; index += 4) {
     const mapped = toneMapAbsoluteRgb(result[index], result[index + 1], result[index + 2]);
     result[index] = mapped[0];
     result[index + 1] = mapped[1];
     result[index + 2] = mapped[2];
+  }
+  return result;
+}
+
+function integerPixelsForMode(pixels, mode, encoding) {
+  const result = pixels.slice();
+  if (encoding.normalized) {
+    if (mode !== "code") return result;
+    const minimum = encoding.signed ? -(2 ** (encoding.bits - 1)) : 0;
+    const maximum = encoding.signed ? (2 ** (encoding.bits - 1)) - 1 : (2 ** encoding.bits) - 1;
+    const range = maximum - minimum;
+    const codeValue = encoding.transfer === "linear"
+      ? (value) => value
+      : (value) => linearToSrgb(value);
+    for (let index = 0; index < result.length; index += 4) {
+      result[index] = Math.round(clamp01(codeValue(result[index])) * range + minimum);
+      result[index + 1] = Math.round(clamp01(codeValue(result[index + 1])) * range + minimum);
+      result[index + 2] = Math.round(clamp01(codeValue(result[index + 2])) * range + minimum);
+      result[index + 3] = encoding.syntheticAlpha
+        ? result[index + 3]
+        : Math.round(clamp01(result[index + 3]) * ((2 ** encoding.bits) - 1));
+    }
+    return result;
+  }
+  const minimum = encoding.signed ? -(2 ** (encoding.bits - 1)) : 0;
+  const maximum = encoding.signed ? (2 ** (encoding.bits - 1)) - 1 : (2 ** encoding.bits) - 1;
+  const range = maximum - minimum || 1;
+  const slope = Number(encoding.slope);
+  const intercept = Number(encoding.intercept);
+  for (let index = 0; index < result.length; index += 4) {
+    for (let channel = 0; channel < 3; channel += 1) {
+      const code = slope ? Math.round((result[index + channel] - intercept) / slope) : result[index + channel];
+      result[index + channel] = mode === "code" ? code : clamp01((code - minimum) / range);
+    }
+  }
+  return result;
+}
+
+function applySrgbEncoding(pixels) {
+  const result = pixels.slice();
+  for (let index = 0; index < result.length; index += 4) {
+    result[index] = linearToSrgb(result[index]);
+    result[index + 1] = linearToSrgb(result[index + 1]);
+    result[index + 2] = linearToSrgb(result[index + 2]);
   }
   return result;
 }
