@@ -6,7 +6,8 @@ import { canOpenPngAsTiles, openPngRasterSource } from "./png-raster-source.js?v
 import { decodeTiff, openTiffRasterSource } from "./tiff-decoder.js?v=20260811-2";
 import { decodeJpeg2000, openJpeg2000RasterSource } from "./jp2-decoder.js?v=20260809-6";
 import { decodeDicom, isDicomFile } from "./dicom-decoder.js?v=20260821-3";
-import { createBitmapRasterSource, createMemoryRasterSource, createSwitchableRasterSource, RASTER_TILE_SIZE } from "./raster-source.js?v=20260811-2";
+import { openExrRasterSource } from "./exr-decoder.js?v=20260901-2";
+import { createBitmapRasterSource, createHalfFloatRasterSource, createMemoryRasterSource, createSwitchableRasterSource, RASTER_TILE_SIZE } from "./raster-source.js?v=20260901-3";
 import { openAvifRasterSource } from "./avif-raster-source.js?v=20260810-2";
 import {
   MAX_VALUE_MATRIX_PIXELS,
@@ -24,7 +25,7 @@ import {
   runGlslShader
 } from "./glsl-runtime.js?v=20260809-7";
 import { decodeGlslShareHash, encodeGlslShareHash } from "./glsl-share.js?v=20260809-3";
-import { createWebGpuRenderer, HDR_REFERENCE_WHITE_NITS } from "./webgpu-renderer.js?v=20260821-1";
+import { createWebGpuRenderer, HDR_REFERENCE_WHITE_NITS } from "./webgpu-renderer.js?v=20260901-2";
 
 const fileInput = document.querySelector("#fileInput");
 const fileHint = document.querySelector("#fileHint");
@@ -1040,7 +1041,20 @@ async function loadImageFile(file) {
     return loadDicomImage(file);
   }
   if (extension === "exr") {
-    return loadDataTexture(file, "exr");
+    try {
+      const opened = await openExrRasterSource(file);
+      return createImageRecord(file, opened.width, opened.height, "openexr/linear", null, "exr", {
+        format: "EXR",
+        bitDepth: "32F",
+        rasterSource: opened.rasterSource,
+        range: computeRange(opened.preview.pixels),
+        overview: rasterOverview(opened.preview)
+      });
+    } catch (error) {
+      console.warn("Streaming EXR decode unavailable; using compatibility loader.", error);
+      if (file.size > 512 * 1024 * 1024) throw error;
+      return loadDataTexture(file, "exr");
+    }
   }
   if (extension === "hdr" || extension === "pic") {
     return loadDataTexture(file, "hdr");
@@ -1418,6 +1432,17 @@ async function loadDataTexture(file, kind) {
   const parsed = loader.parse(buffer);
   const { data, width, height } = extractTextureData(parsed);
   const itemSize = Math.max(1, Math.round(data.length / (width * height)));
+  if (kind === "exr" && data instanceof Uint16Array) {
+    const rasterSource = createHalfFloatRasterSource(data, width, height, { itemSize, flipY: true });
+    const preview = rasterSource.readPreview(1024);
+    parsed.dispose?.();
+    return createImageRecord(file, width, height, "openexr/linear", null, kind, {
+      format: "EXR",
+      bitDepth: exrBitDepth(buffer),
+      rasterSource,
+      range: computeRange(preview.pixels)
+    });
+  }
   const canReusePixels = data instanceof Float32Array && itemSize === 4;
   const pixels = canReusePixels ? data : new Float32Array(width * height * 4);
 
@@ -4040,6 +4065,7 @@ function scheduleSelectionDetails(image, rect, rectKey, matrixKey) {
   const valueMode = pickerValueMode.value;
   const channels = valueChannels(image).map((channel) => channel.index);
   selectionDetailsInFlight = { image, rectKey, matrixKey, jobId };
+  requestSelectionGraphDraw();
   selectionDetailsTimer = setTimeout(() => {
     selectionDetailsTimer = null;
     if (activeDrag?.kind === "selectRect") {
@@ -4457,6 +4483,30 @@ function drawSelectionGraph() {
   drawGraphLegend(width, height, min, max, statistics, normalize);
   drawGraphSamplingNotice({ ...sampling, cols: samples.cols, rows: samples.rows }, colorTexture);
   graphCtx.restore();
+  if (
+    selectionDetailsInFlight?.image === image &&
+    selectionDetailsInFlight.rectKey === selectionRectKey(image, rect)
+  ) {
+    drawGraphUpdatingNotice(width, height);
+  }
+}
+
+function drawGraphUpdatingNotice(width, height) {
+  const label = "Updating exact values...";
+  graphCtx.save();
+  graphCtx.font = "11px Consolas, monospace";
+  graphCtx.textAlign = "center";
+  const boxWidth = Math.ceil(graphCtx.measureText(label).width) + 20;
+  const boxHeight = 24;
+  const x = Math.max(6, (width - boxWidth) / 2);
+  const y = Math.max(34, height - boxHeight - 8);
+  graphCtx.fillStyle = "rgba(8, 13, 18, 0.9)";
+  graphCtx.fillRect(x, y, boxWidth, boxHeight);
+  graphCtx.strokeStyle = "#4cc9f0";
+  graphCtx.strokeRect(x + 0.5, y + 0.5, boxWidth - 1, boxHeight - 1);
+  graphCtx.fillStyle = "#bdefff";
+  graphCtx.fillText(label, x + boxWidth / 2, y + 16);
+  graphCtx.restore();
 }
 
 // Maps a raw value to a 0-1 position for color/height, either linearly or on a log10 scale.
@@ -4682,6 +4732,15 @@ function selectionGraphStatistics(image, rect) {
   };
 }
 function graphPixelValue(image, x, y) {
+  if (image.rasterSource.asynchronous && image.overview) {
+    const overview = image.overview;
+    const overviewX = Math.min(overview.width - 1, Math.floor((x + 0.5) * overview.width / image.width));
+    const overviewY = Math.min(overview.height - 1, Math.floor((y + 0.5) * overview.height / image.height));
+    const offset = (overviewY * overview.width + overviewX) * 4;
+    const linear = displayedLinearFromRgba(image, overview.pixels.subarray(offset, offset + 4));
+    const values = numericValuesForMode(valuesFromLinear(linear, image), pickerValueMode.value);
+    return channelValueFromRgba(image.settings.channel, values[0], values[1], values[2], values[3]);
+  }
   const linear = readDisplayedLinear(image, x, y, requestSelectionGraphDraw);
   if (!linear) {
     return Number.NaN;

@@ -203,9 +203,17 @@ export async function createWebGpuRenderer({ onNeedsRender = null, onError = nul
   if (!navigator.gpu) {
     throw new Error("WebGPU is not supported by this browser.");
   }
-  const adapter = await navigator.gpu.requestAdapter();
+  let adapter = null;
+  const adapterOptions = [
+    undefined,
+    { forceFallbackAdapter: true }
+  ];
+  for (const options of adapterOptions) {
+    adapter = await navigator.gpu.requestAdapter(options);
+    if (adapter) break;
+  }
   if (!adapter) {
-    throw new Error("A WebGPU adapter is not available.");
+    throw new Error("WebGPU exists, but Chrome did not provide a GPU adapter. Check chrome://gpu and hardware acceleration.");
   }
   const device = await adapter.requestDevice();
   return new WebGpuImageRenderer(device, { onNeedsRender, onError });

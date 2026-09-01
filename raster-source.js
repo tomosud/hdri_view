@@ -1,5 +1,101 @@
 export const RASTER_TILE_SIZE = 512;
 
+export function createHalfFloatRasterSource(data, width, height, {
+  itemSize = 4,
+  flipY = false,
+  maxCachedTiles = 24
+} = {}) {
+  if (!(data instanceof Uint16Array) || data.length !== width * height * itemSize || itemSize < 1) {
+    throw new Error("Half-float raster source requires width x height packed Uint16 pixels.");
+  }
+  const cache = new Map();
+  const read = (x, y, channel) => {
+    const sourceY = flipY ? height - 1 - y : y;
+    return halfToFloat(data[(sourceY * width + x) * itemSize + Math.min(channel, itemSize - 1)]);
+  };
+  const readRgba = (x, y, target, offset) => {
+    target[offset] = read(x, y, 0);
+    target[offset + 1] = read(x, y, 1);
+    target[offset + 2] = read(x, y, 2);
+    target[offset + 3] = itemSize >= 4 ? read(x, y, 3) : 1;
+  };
+  return {
+    width,
+    height,
+    pixels: null,
+    getTile(level, tileX, tileY, gutter = 1) {
+      const key = `${level}:${tileX}:${tileY}:${gutter}`;
+      const cached = cache.get(key);
+      if (cached) {
+        cache.delete(key);
+        cache.set(key, cached);
+        return cached;
+      }
+      const factor = 2 ** level;
+      const levelWidth = Math.ceil(width / factor);
+      const levelHeight = Math.ceil(height / factor);
+      const levelX = tileX * RASTER_TILE_SIZE;
+      const levelY = tileY * RASTER_TILE_SIZE;
+      const tileWidth = Math.min(RASTER_TILE_SIZE, levelWidth - levelX);
+      const tileHeight = Math.min(RASTER_TILE_SIZE, levelHeight - levelY);
+      if (tileWidth < 1 || tileHeight < 1) throw new Error("Half-float tile is outside the image.");
+      const stride = tileWidth + gutter * 2;
+      const pixels = new Float32Array(stride * (tileHeight + gutter * 2) * 4);
+      for (let localY = -gutter; localY < tileHeight + gutter; localY += 1) {
+        const sampleY = clamp((levelY + localY) * factor, 0, height - 1);
+        for (let localX = -gutter; localX < tileWidth + gutter; localX += 1) {
+          const sampleX = clamp((levelX + localX) * factor, 0, width - 1);
+          readRgba(sampleX, sampleY, pixels, ((localY + gutter) * stride + localX + gutter) * 4);
+        }
+      }
+      const tile = { level, tileX, tileY, gutter, width: tileWidth, height: tileHeight, stride, pixels };
+      cache.set(key, tile);
+      while (cache.size > maxCachedTiles) cache.delete(cache.keys().next().value);
+      return tile;
+    },
+    getPixel(x, y, target = new Float32Array(4)) {
+      readRgba(x, y, target, 0);
+      return target;
+    },
+    copyRegion(rect) {
+      const output = new Float32Array(rect.width * rect.height * 4);
+      this.copyRegionInto(rect, output, 0);
+      return output;
+    },
+    copyRegionInto(rect, target, targetOffset = 0) {
+      for (let y = 0; y < rect.height; y += 1) {
+        for (let x = 0; x < rect.width; x += 1) {
+          readRgba(rect.x + x, rect.y + y, target, targetOffset + (y * rect.width + x) * 4);
+        }
+      }
+      return target;
+    },
+    materialize() {
+      return this.copyRegion({ x: 0, y: 0, width, height });
+    },
+    readPreview(maximumEdge = 1024) {
+      const scale = Math.min(1, maximumEdge / Math.max(width, height));
+      const previewWidth = Math.max(1, Math.round(width * scale));
+      const previewHeight = Math.max(1, Math.round(height * scale));
+      const pixels = new Float32Array(previewWidth * previewHeight * 4);
+      for (let y = 0; y < previewHeight; y += 1) {
+        const sourceY = Math.min(height - 1, Math.floor((y + 0.5) * height / previewHeight));
+        for (let x = 0; x < previewWidth; x += 1) {
+          const sourceX = Math.min(width - 1, Math.floor((x + 0.5) * width / previewWidth));
+          readRgba(sourceX, sourceY, pixels, (y * previewWidth + x) * 4);
+        }
+      }
+      return { width: previewWidth, height: previewHeight, pixels };
+    },
+    clearCache() {
+      cache.clear();
+    },
+    dispose() {
+      cache.clear();
+    }
+  };
+}
+
 export function createWorkerRasterSource(worker, metadata, { maxCachedTiles = 24 } = {}) {
   const { width, height } = metadata;
   let initialPreview = metadata.initialPreview || null;
@@ -74,6 +170,12 @@ export function createWorkerRasterSource(worker, metadata, { maxCachedTiles = 24
       return promise;
     },
     getPixel(x, y, target = new Float32Array(4)) {
+      if (metadata.directPixel) {
+        return request("pixel", { x, y }).then((result) => {
+          target.set(result.values);
+          return target;
+        });
+      }
       const tileX = Math.floor(x / RASTER_TILE_SIZE);
       const tileY = Math.floor(y / RASTER_TILE_SIZE);
       const tile = this.getTile(0, tileX, tileY, 0);
@@ -451,4 +553,13 @@ function averagePixel(source, sourceWidth, left, top, right, bottom, target, tar
 
 function clamp(value, minimum, maximum) {
   return Math.max(minimum, Math.min(maximum, value));
+}
+
+function halfToFloat(value) {
+  const sign = (value & 0x8000) ? -1 : 1;
+  const exponent = (value >> 10) & 0x1f;
+  const fraction = value & 0x03ff;
+  if (exponent === 0) return sign * 2 ** -14 * (fraction / 1024);
+  if (exponent === 31) return fraction ? NaN : sign * Infinity;
+  return sign * 2 ** (exponent - 15) * (1 + fraction / 1024);
 }
