@@ -1,15 +1,15 @@
 const TILE_SIZE = 512;
 let state = null;
-const rowCache = new Map();
-const inFlightRows = new Map();
-const MAX_CACHED_ROWS = 600;
+const blockCache = new Map();
+const inFlightBlocks = new Map();
+const MAX_CACHED_BLOCKS = 40;
 
 self.onmessage = async (event) => {
   const message = event.data || {};
   if (message.type === "raster-dispose") {
     state = null;
-    rowCache.clear();
-    inFlightRows.clear();
+    blockCache.clear();
+    inFlightBlocks.clear();
     return;
   }
   try {
@@ -33,24 +33,27 @@ async function initialize(file) {
   if (!(file instanceof Blob)) throw new Error("EXR streaming requires a File or Blob.");
   const headerBytes = new Uint8Array(await file.slice(0, Math.min(file.size, 1024 * 1024)).arrayBuffer());
   const header = parseHeader(headerBytes);
-  if (header.compression !== 2) throw new Error("Streaming currently supports ZIPS-compressed EXR files only.");
-  if (header.channels.length !== 3 || header.channels.some((channel) => channel.pixelType !== 2 || channel.xSampling !== 1 || channel.ySampling !== 1)) {
-    throw new Error("Streaming currently supports full-resolution RGB 32F EXR channels only.");
+  if (![0, 2, 3].includes(header.compression)) throw new Error("Streaming currently supports uncompressed and ZIP(S)-compressed EXR files only.");
+  if (!header.channels.some((channel) => channel.name === "R") || !header.channels.some((channel) => channel.name === "G") || !header.channels.some((channel) => channel.name === "B") || header.channels.some((channel) => ![1, 2].includes(channel.pixelType) || channel.xSampling !== 1 || channel.ySampling !== 1)) {
+    throw new Error("Streaming requires full-resolution RGB EXR channels using 16F or 32F samples.");
   }
   const width = header.xMax - header.xMin + 1;
   const height = header.yMax - header.yMin + 1;
-  const tableBytes = await file.slice(header.end, header.end + height * 8).arrayBuffer();
+  const blockLines = header.compression === 3 ? 16 : 1;
+  const blockCount = Math.ceil(height / blockLines);
+  const tableBytes = await file.slice(header.end, header.end + blockCount * 8).arrayBuffer();
   const table = new DataView(tableBytes);
-  const offsets = new Array(height);
-  for (let index = 0; index < height; index += 1) offsets[index] = Number(table.getBigUint64(index * 8, true));
+  const offsets = new Array(blockCount);
+  for (let index = 0; index < blockCount; index += 1) offsets[index] = Number(table.getBigUint64(index * 8, true));
   state = {
-    file, width, height, yMin: header.yMin, channels: header.channels, offsets,
+    file, width, height, yMin: header.yMin, channels: header.channels, offsets, blockLines,
     channelIndex: Object.fromEntries(header.channels.map((channel, index) => [channel.name, index]))
   };
   const preview = await getPreview(1024);
   return {
     width,
     height,
+    bitDepth: header.channels.every((channel) => channel.pixelType === 1) ? "16F" : "32F",
     previewWidth: preview.width,
     previewHeight: preview.height,
     previewPixels: preview.pixels
@@ -69,6 +72,7 @@ function parseHeader(bytes) {
     const size = view.getUint32(offset, true); offset += 4;
     const end = offset + size;
     if (name.value === "compression") header.compression = bytes[offset];
+    if (name.value === "lineOrder") header.lineOrder = bytes[offset];
     if (name.value === "dataWindow") {
       header.xMin = view.getInt32(offset, true); header.yMin = view.getInt32(offset + 4, true);
       header.xMax = view.getInt32(offset + 8, true); header.yMax = view.getInt32(offset + 12, true);
@@ -99,31 +103,31 @@ function readString(bytes, start) {
 }
 
 async function decodeRow(y) {
-  const cached = rowCache.get(y);
-  if (cached) {
-    rowCache.delete(y); rowCache.set(y, cached); return cached;
-  }
-  const pending = inFlightRows.get(y);
-  if (pending) return pending;
-  const promise = decodeRowUncached(y);
-  inFlightRows.set(y, promise);
-  try {
-    return await promise;
-  } finally {
-    inFlightRows.delete(y);
-  }
+  const block = await decodeBlock(Math.floor(y / state.blockLines));
+  return { block, line: y - block.startY };
 }
 
-async function decodeRowUncached(y) {
-  const fileRow = y;
-  const offset = state.offsets[fileRow];
+async function decodeBlock(blockIndex) {
+  const cached = blockCache.get(blockIndex);
+  if (cached) { blockCache.delete(blockIndex); blockCache.set(blockIndex, cached); return cached; }
+  const pending = inFlightBlocks.get(blockIndex);
+  if (pending) return pending;
+  const promise = decodeBlockUncached(blockIndex);
+  inFlightBlocks.set(blockIndex, promise);
+  try { return await promise; } finally { inFlightBlocks.delete(blockIndex); }
+}
+
+async function decodeBlockUncached(blockIndex) {
+  const offset = state.offsets[blockIndex];
   const chunkHeader = new DataView(await state.file.slice(offset, offset + 8).arrayBuffer());
-  const storedY = chunkHeader.getInt32(0, true) - state.yMin;
+  const startY = chunkHeader.getInt32(0, true) - state.yMin;
+  const lines = Math.min(state.blockLines, state.height - startY);
   const packedSize = chunkHeader.getUint32(4, true);
   const packed = state.file.slice(offset + 8, offset + 8 + packedSize);
-  const expectedSize = state.width * state.channels.length * 4;
+  const bytesPerPixel = state.channels.reduce((sum, channel) => sum + channel.pixelType * 2, 0);
+  const expectedSize = state.width * lines * bytesPerPixel;
   let raw;
-  if (packedSize === expectedSize) {
+  if (packedSize >= expectedSize) {
     raw = new Uint8Array(await packed.arrayBuffer());
   } else {
     const stream = packed.stream().pipeThrough(new DecompressionStream("deflate"));
@@ -137,18 +141,36 @@ async function decodeRowUncached(y) {
       if (i + 1 < raw.length) raw[i + 1] = shuffled[second++];
     }
   }
-  const planar = new Float32Array(raw.buffer);
-  if (storedY !== fileRow) throw new Error("EXR scanline offset table is inconsistent.");
-  rowCache.set(y, planar);
-  while (rowCache.size > MAX_CACHED_ROWS) rowCache.delete(rowCache.keys().next().value);
-  return planar;
+  if (raw.byteLength < expectedSize) throw new Error("EXR scanline block is truncated.");
+  const block = { raw, view: new DataView(raw.buffer, raw.byteOffset, raw.byteLength), startY, lines, bytesPerPixel };
+  blockCache.set(blockIndex, block);
+  while (blockCache.size > MAX_CACHED_BLOCKS) blockCache.delete(blockCache.keys().next().value);
+  return block;
 }
 
 function copyPixel(row, x, target, offset) {
-  target[offset] = row[state.channelIndex.R * state.width + x];
-  target[offset + 1] = row[state.channelIndex.G * state.width + x];
-  target[offset + 2] = row[state.channelIndex.B * state.width + x];
-  target[offset + 3] = 1;
+  target[offset] = readChannel(row, "R", x);
+  target[offset + 1] = readChannel(row, "G", x);
+  target[offset + 2] = readChannel(row, "B", x);
+  target[offset + 3] = state.channelIndex.A === undefined ? 1 : readChannel(row, "A", x);
+}
+
+function readChannel(row, name, x) {
+  const channelIndex = state.channelIndex[name];
+  let byteOffset = row.line * state.width * row.block.bytesPerPixel;
+  for (let index = 0; index < channelIndex; index += 1) byteOffset += state.width * state.channels[index].pixelType * 2;
+  const channel = state.channels[channelIndex];
+  byteOffset += x * channel.pixelType * 2;
+  return channel.pixelType === 1 ? halfToFloat(row.block.view.getUint16(byteOffset, true)) : row.block.view.getFloat32(byteOffset, true);
+}
+
+function halfToFloat(value) {
+  const sign = value & 0x8000 ? -1 : 1;
+  const exponent = (value >>> 10) & 0x1f;
+  const fraction = value & 0x3ff;
+  if (exponent === 0) return sign * fraction * 2 ** -24;
+  if (exponent === 31) return fraction ? Number.NaN : sign * Infinity;
+  return sign * (1 + fraction / 1024) * 2 ** (exponent - 15);
 }
 
 async function getTile({ level, tileX, tileY, gutter = 1 }) {

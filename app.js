@@ -6,7 +6,7 @@ import { canOpenPngAsTiles, openPngRasterSource } from "./png-raster-source.js?v
 import { decodeTiff, openTiffRasterSource } from "./tiff-decoder.js?v=20260811-2";
 import { decodeJpeg2000, openJpeg2000RasterSource } from "./jp2-decoder.js?v=20260809-6";
 import { decodeDicom, isDicomFile } from "./dicom-decoder.js?v=20260821-3";
-import { openExrRasterSource } from "./exr-decoder.js?v=20260901-2";
+import { openExrRasterSource } from "./exr-decoder.js?v=20260902-1";
 import { createBitmapRasterSource, createHalfFloatRasterSource, createMemoryRasterSource, createSwitchableRasterSource, RASTER_TILE_SIZE } from "./raster-source.js?v=20260901-3";
 import { openAvifRasterSource } from "./avif-raster-source.js?v=20260810-2";
 import {
@@ -1045,7 +1045,7 @@ async function loadImageFile(file) {
       const opened = await openExrRasterSource(file);
       return createImageRecord(file, opened.width, opened.height, "openexr/linear", null, "exr", {
         format: "EXR",
-        bitDepth: "32F",
+        bitDepth: opened.bitDepth,
         rasterSource: opened.rasterSource,
         range: computeRange(opened.preview.pixels),
         overview: rasterOverview(opened.preview)
