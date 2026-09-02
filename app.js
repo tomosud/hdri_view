@@ -148,6 +148,7 @@ let selectionCopyFrame = null;
 let selectionWorker = null;
 let selectionJobId = 0;
 let selectionDetailsInFlight = null;
+let selectionNoticePulseTimer = null;
 let selectionMatrixCopyFrame = null;
 let selectionMatrixCopyWorker = null;
 let selectionMatrixCopyJobId = 0;
@@ -4010,6 +4011,7 @@ function updateSelectionPanel() {
   }
   const cached = selectionDetailsCache.get(image);
   const stats = cached?.rectKey === rectKey ? cached.stats : null;
+  const provisionalAverage = stats ? null : provisionalSelectionAverage(image, rect);
   const channels = valueChannels(image);
   const summaryLines = [
     `Image: ${image.name}`,
@@ -4027,7 +4029,15 @@ function updateSelectionPanel() {
       `Average RGB: ${formatRgbStats(stats.average)}${unit}; Luminance ${formatNumber(stats.averageLuminance)}${unit}`
     );
   } else {
-    summaryLines.push("Statistics: pending...");
+    if (provisionalAverage) {
+      const unit = image.valueUnit === "nit" ? " nit" : "";
+      summaryLines.push(
+        `Average RGB (provisional preview): ${formatRgbStats(provisionalAverage.average)}${unit}; Luminance ${formatNumber(provisionalAverage.averageLuminance)}${unit}`,
+        `Statistics: calculating exact values...`
+      );
+    } else {
+      summaryLines.push("Statistics: calculating exact values...");
+    }
   }
   selectionSummary.textContent = summaryLines.join("\n");
   const matrixReady = cached?.matrixKey === matrixKey;
@@ -4109,7 +4119,10 @@ function copySelectionPixelsInChunks(image, rect, rectKey, matrixKey, valueMode,
         runSelectionWorker(image, rect, rectKey, matrixKey, valueMode, channels, pixels, jobId);
       }
     }).catch((error) => {
-      if (jobId === selectionJobId) selectionDetailsInFlight = null;
+      if (jobId === selectionJobId) {
+        selectionDetailsInFlight = null;
+        requestSelectionGraphDraw();
+      }
       console.error("Selection tile read failed.", error);
     });
     return;
@@ -4184,6 +4197,7 @@ function runSelectionWorker(image, rect, rectKey, matrixKey, valueMode, channels
       selectionWorker?.terminate();
       selectionWorker = null;
       updateSelectionPanel();
+      requestSelectionGraphDraw();
     }
   });
   selectionWorker.addEventListener("error", (error) => {
@@ -4191,6 +4205,7 @@ function runSelectionWorker(image, rect, rectKey, matrixKey, valueMode, channels
       selectionDetailsInFlight = null;
       selectionWorker?.terminate();
       selectionWorker = null;
+      requestSelectionGraphDraw();
     }
     console.error("Selection worker failed.", error);
   });
@@ -4461,7 +4476,11 @@ function drawSelectionGraph() {
     return;
   }
 
-  const statistics = activeDrag?.kind === "selectRect" ? null : selectionGraphStatistics(image, rect);
+  const exactStatistics = activeDrag?.kind === "selectRect" ? null : selectionGraphStatistics(image, rect);
+  const provisional = !exactStatistics && activeDrag?.kind !== "selectRect" && samples.values.length
+    ? provisionalGraphStatistics(samples)
+    : null;
+  const statistics = exactStatistics || provisional;
   const min = statistics?.min ?? samples.min;
   const max = statistics?.max ?? samples.max;
   const normalize = graphValueNormalizer(min, max, image.settings.logDisplay ? "log" : "linear");
@@ -4488,7 +4507,16 @@ function drawSelectionGraph() {
     selectionDetailsInFlight.rectKey === selectionRectKey(image, rect)
   ) {
     drawGraphUpdatingNotice(width, height);
+    scheduleSelectionNoticePulse();
   }
+}
+
+function scheduleSelectionNoticePulse() {
+  if (selectionNoticePulseTimer !== null) return;
+  selectionNoticePulseTimer = setTimeout(() => {
+    selectionNoticePulseTimer = null;
+    if (selectionDetailsInFlight) requestSelectionGraphDraw();
+  }, 100);
 }
 
 function drawGraphUpdatingNotice(width, height) {
@@ -4500,6 +4528,8 @@ function drawGraphUpdatingNotice(width, height) {
   const boxHeight = 24;
   const x = Math.max(6, (width - boxWidth) / 2);
   const y = Math.max(34, height - boxHeight - 8);
+  const pulse = 0.45 + 0.55 * (0.5 + 0.5 * Math.sin(performance.now() / 180));
+  graphCtx.globalAlpha = pulse;
   graphCtx.fillStyle = "rgba(8, 13, 18, 0.9)";
   graphCtx.fillRect(x, y, boxWidth, boxHeight);
   graphCtx.strokeStyle = "#4cc9f0";
@@ -4730,6 +4760,46 @@ function selectionGraphStatistics(image, rect) {
     max: stats.luminanceMax,
     average: stats.averageLuminance
   };
+}
+
+function provisionalGraphStatistics(samples) {
+  let sum = 0;
+  let count = 0;
+  for (const row of samples.values) {
+    for (const value of row) {
+      if (Number.isFinite(value)) {
+        sum += value;
+        count += 1;
+      }
+    }
+  }
+  return count ? { min: samples.min, max: samples.max, average: sum / count, provisional: true } : null;
+}
+
+function provisionalSelectionAverage(image, rect) {
+  const overview = image.overview;
+  if (!overview?.pixels?.length) return null;
+  const cols = Math.max(1, Math.min(32, rect.width));
+  const rows = Math.max(1, Math.min(32, rect.height));
+  const sum = [0, 0, 0, 0];
+  let luminanceSum = 0;
+  let count = 0;
+  for (let row = 0; row < rows; row += 1) {
+    const sourceY = rect.y + (row + 0.5) * rect.height / rows;
+    const overviewY = Math.min(overview.height - 1, Math.floor(sourceY * overview.height / image.height));
+    for (let col = 0; col < cols; col += 1) {
+      const sourceX = rect.x + (col + 0.5) * rect.width / cols;
+      const overviewX = Math.min(overview.width - 1, Math.floor(sourceX * overview.width / image.width));
+      const offset = (overviewY * overview.width + overviewX) * 4;
+      const linear = displayedLinearFromRgba(image, overview.pixels.subarray(offset, offset + 4));
+      const values = numericValuesForMode(valuesFromLinear(linear, image), pickerValueMode.value);
+      if (!values.slice(0, 4).every(Number.isFinite)) continue;
+      for (let channel = 0; channel < 4; channel += 1) sum[channel] += values[channel];
+      luminanceSum += channelValueFromRgba("luminance", values[0], values[1], values[2], values[3]);
+      count += 1;
+    }
+  }
+  return count ? { average: sum.map((value) => value / count), averageLuminance: luminanceSum / count } : null;
 }
 function graphPixelValue(image, x, y) {
   if (image.rasterSource.asynchronous && image.overview) {
@@ -5164,7 +5234,7 @@ function drawGraphLegend(width, height, min, max, statistics = null, normalize =
     return;
   }
   const markers = [
-    { label: "Avg", value: statistics.average, color: "#ffffff" }
+    { label: statistics.provisional ? "Avg ~" : "Avg", value: statistics.average, color: statistics.provisional ? "#ffd36b" : "#ffffff" }
   ].map((marker) => ({
     ...marker,
     y: barY + (1 - normalize(marker.value)) * barH,
