@@ -34,9 +34,10 @@ async function initialize(file) {
   const headerBytes = new Uint8Array(await file.slice(0, Math.min(file.size, 1024 * 1024)).arrayBuffer());
   const header = parseHeader(headerBytes);
   if (![0, 2, 3].includes(header.compression)) throw new Error("Streaming currently supports uncompressed and ZIP(S)-compressed EXR files only.");
-  if (!header.channels.some((channel) => channel.name === "R") || !header.channels.some((channel) => channel.name === "G") || !header.channels.some((channel) => channel.name === "B") || header.channels.some((channel) => ![1, 2].includes(channel.pixelType) || channel.xSampling !== 1 || channel.ySampling !== 1)) {
-    throw new Error("Streaming requires full-resolution RGB EXR channels using 16F or 32F samples.");
+  if (header.channels.length === 0 || header.channels.some((channel) => ![1, 2].includes(channel.pixelType) || channel.xSampling !== 1 || channel.ySampling !== 1)) {
+    throw new Error("Streaming requires full-resolution EXR channels using 16F or 32F samples.");
   }
+  const displayChannels = resolveDisplayChannels(header.channels);
   const width = header.xMax - header.xMin + 1;
   const height = header.yMax - header.yMin + 1;
   const blockLines = header.compression === 3 ? 16 : 1;
@@ -47,7 +48,8 @@ async function initialize(file) {
   for (let index = 0; index < blockCount; index += 1) offsets[index] = Number(table.getBigUint64(index * 8, true));
   state = {
     file, width, height, yMin: header.yMin, channels: header.channels, offsets, blockLines,
-    channelIndex: Object.fromEntries(header.channels.map((channel, index) => [channel.name, index]))
+    channelIndex: Object.fromEntries(header.channels.map((channel, index) => [channel.name, index])),
+    displayChannels
   };
   const preview = await getPreview(1024);
   return {
@@ -58,6 +60,14 @@ async function initialize(file) {
     previewHeight: preview.height,
     previewPixels: preview.pixels
   };
+}
+
+function resolveDisplayChannels(channels) {
+  const names = new Set(channels.map((channel) => channel.name));
+  if (names.has("R") && names.has("G") && names.has("B")) return ["R", "G", "B"];
+  if (names.has("X") && names.has("Y") && names.has("Z")) return ["X", "Y", "Z"];
+  if (channels.length === 1) return [channels[0].name, channels[0].name, channels[0].name];
+  throw new Error("Streaming supports RGB, XYZ, or single-channel EXR files only.");
 }
 
 function parseHeader(bytes) {
@@ -149,9 +159,9 @@ async function decodeBlockUncached(blockIndex) {
 }
 
 function copyPixel(row, x, target, offset) {
-  target[offset] = readChannel(row, "R", x);
-  target[offset + 1] = readChannel(row, "G", x);
-  target[offset + 2] = readChannel(row, "B", x);
+  target[offset] = readChannel(row, state.displayChannels[0], x);
+  target[offset + 1] = readChannel(row, state.displayChannels[1], x);
+  target[offset + 2] = readChannel(row, state.displayChannels[2], x);
   target[offset + 3] = state.channelIndex.A === undefined ? 1 : readChannel(row, "A", x);
 }
 

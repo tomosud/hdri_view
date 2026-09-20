@@ -2,7 +2,7 @@ import { createWorkerRasterSource } from "./raster-source.js?v=20260901-2";
 
 export function openExrRasterSource(file) {
   return new Promise((resolve, reject) => {
-    const worker = new Worker(new URL("./exr-worker.js?v=20260902-1", import.meta.url), { type: "module" });
+    const worker = new Worker(new URL("./exr-worker.js?v=20260920-1", import.meta.url), { type: "module" });
     const cleanup = () => {
       worker.removeEventListener("message", onMessage);
       worker.removeEventListener("error", onError);
