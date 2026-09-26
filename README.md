@@ -53,6 +53,11 @@ https://tomosud.github.io/hdri_view/
   Selection / ステータスバーが返す RGB 値に alpha を乗算します**（黒背景と合成された、
   実際に画面で見えている値に合わせるため）。alpha を掛けない素の値が欲しいときは **RGB** を選びます
 - **Save**: 表示中の画像を各フォーマットで保存（HDR/EXRはHDRI画像のみ）
+- **Export**: 初期状態では折りたたまれている変換書き出し設定。Current display / RAW pixels、
+  PNG / JPEG / HDR RGBE / OpenEXR、出力解像度と倍率、縦横比固定または縦横個別指定、
+  Box / Bilinear / Nearest 補間を選べる。解像度と倍率は相互に同期する。PNGはRGBをalphaで
+  変化させないstraight alpha、JPEGは最高画質、OpenEXRは16-bit half / 32-bit floatと
+  ZIP（16 scanline）/ 非圧縮に対応
 
 パネル下部には開いている画像の **Name / Size / Type / Range**（値域）も表示されます。
 

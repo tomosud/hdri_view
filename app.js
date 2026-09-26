@@ -70,6 +70,22 @@ const brightnessDouble = document.querySelector("#brightnessDouble");
 const channelButtons = document.querySelector("#channelButtons");
 const saveFormatSelect = document.querySelector("#saveFormatSelect");
 const saveImageButton = document.querySelector("#saveImageButton");
+const exportSettings = document.querySelector("#exportSettings");
+const exportSourceSelect = document.querySelector("#exportSourceSelect");
+const exportFormatSelect = document.querySelector("#exportFormatSelect");
+const exportExrOptions = document.querySelector("#exportExrOptions");
+const exportExrPrecisionSelect = document.querySelector("#exportExrPrecisionSelect");
+const exportExrCompressionSelect = document.querySelector("#exportExrCompressionSelect");
+const exportSeparateAxesInput = document.querySelector("#exportSeparateAxesInput");
+const exportWidthInput = document.querySelector("#exportWidthInput");
+const exportHeightInput = document.querySelector("#exportHeightInput");
+const exportScaleXInput = document.querySelector("#exportScaleXInput");
+const exportScaleYInput = document.querySelector("#exportScaleYInput");
+const exportScaleXLabel = document.querySelector("#exportScaleXLabel");
+const exportScaleYField = document.querySelector("#exportScaleYField");
+const exportResizeFilterSelect = document.querySelector("#exportResizeFilterSelect");
+const exportDescription = document.querySelector("#exportDescription");
+const exportImageButton = document.querySelector("#exportImageButton");
 const metaName = document.querySelector("#metaName");
 const metaSize = document.querySelector("#metaSize");
 const metaType = document.querySelector("#metaType");
@@ -130,6 +146,7 @@ let internalClipboard = null;
 const portableClipboardMatrixPixels = 512 * 512;
 const maxInternalClipboardPixels = 4096 * 2048;
 const maxLoadedPngPixels = 4096 * 4096;
+const maxExportPixels = 100_000_000;
 let clipboardReadJobId = 0;
 let topUiZ = 100000;
 let activePanelTab = "pickers";
@@ -264,6 +281,70 @@ saveImageButton.addEventListener("click", () => {
       fileHint.textContent = `Save failed: ${error?.message || error}`;
     });
   }
+});
+
+exportSettings.addEventListener("toggle", () => {
+  if (exportSettings.open) updateExportPanel(currentImage());
+});
+
+for (const select of [
+  exportSourceSelect,
+  exportFormatSelect,
+  exportExrPrecisionSelect,
+  exportExrCompressionSelect,
+  exportResizeFilterSelect
+]) {
+  select.addEventListener("change", () => {
+    const image = currentImage();
+    if (!image) return;
+    const settings = ensureExportSettings(image);
+    settings.source = exportSourceSelect.value;
+    settings.format = exportFormatSelect.value;
+    settings.exrPrecision = exportExrPrecisionSelect.value;
+    settings.exrCompression = exportExrCompressionSelect.value;
+    settings.resizeFilter = exportResizeFilterSelect.value;
+    updateExportPanel(image);
+    scheduleSessionSave();
+  });
+}
+
+exportSeparateAxesInput.addEventListener("change", () => {
+  const image = currentImage();
+  if (!image) return;
+  const settings = ensureExportSettings(image);
+  settings.separateAxes = exportSeparateAxesInput.checked;
+  if (!settings.separateAxes) {
+    settings.scaleY = settings.scaleX;
+    settings.height = scaledExportDimension(image.height, settings.scaleX);
+  }
+  updateExportPanel(image);
+  scheduleSessionSave();
+});
+
+exportWidthInput.addEventListener("input", () => updateExportDimension("width"));
+exportHeightInput.addEventListener("input", () => updateExportDimension("height"));
+exportScaleXInput.addEventListener("input", () => updateExportScale("x"));
+exportScaleYInput.addEventListener("input", () => updateExportScale("y"));
+
+for (const input of [exportWidthInput, exportHeightInput, exportScaleXInput, exportScaleYInput]) {
+  input.addEventListener("change", () => {
+    const image = currentImage();
+    if (image) updateExportPanel(image);
+  });
+}
+
+exportImageButton.addEventListener("click", () => {
+  const image = currentImage();
+  if (!image || exportImageButton.disabled) return;
+  exportImageButton.disabled = true;
+  exportImageButton.textContent = "Exporting…";
+  void exportImage(image).catch((error) => {
+    console.error("Export failed.", error);
+    fileHint.textContent = `Export failed: ${error?.message || error}`;
+  }).finally(() => {
+    exportImageButton.textContent = "Export";
+    updateExportPanel(currentImage());
+  });
 });
 
 selectionGraphResize.addEventListener("pointerdown", (event) => {
@@ -1719,6 +1800,20 @@ function createImageRecord(file, width, height, type, pixels, sourceFormat = "ra
       filter: "auto",
       outputMode: "auto",
       displayGamma: metadata.displayGamma ?? (metadata.hdr || sourceFormat === "hdr" || sourceFormat === "exr" ? 1 : 1 / 2.2)
+    },
+    exportSettings: {
+      source: "display",
+      format: metadata.hdr || sourceFormat === "hdr" || sourceFormat === "exr" ? "exr" : "png",
+      exrPrecision: "half",
+      exrCompression: "zip",
+      separateAxes: false,
+      width,
+      height,
+      scaleX: 100,
+      scaleY: 100,
+      resizeFilter: "box",
+      baseWidth: width,
+      baseHeight: height
     },
     view: {
       scale: 1,
@@ -3184,6 +3279,200 @@ async function saveImage(image, format) {
   }, mime, 0.95);
 }
 
+async function exportImage(image) {
+  const settings = { ...ensureExportSettings(image) };
+  const width = clampExportDimension(settings.width);
+  const height = clampExportDimension(settings.height);
+  if (width * height > maxExportPixels) {
+    throw new Error("Export size exceeds the 100 MP limit.");
+  }
+
+  fileHint.textContent = `${image.name}: preparing ${width} × ${height} export…`;
+  const sourcePixels = image.pixels || await materializeImagePixels(image);
+  const resized = width === image.width && height === image.height
+    ? sourcePixels
+    : resampleExportPixels(sourcePixels, image.width, image.height, width, height, settings.resizeFilter);
+  const pixels = settings.source === "display"
+    ? exportDisplayPixels(image, resized, settings.format)
+    : exportRawPixels(image, resized, settings.format);
+  const basename = `${stripExtension(image.name)}_${width}x${height}`;
+
+  if (settings.format === "png") {
+    const encoded = await encodeStraightAlphaPng(width, height, pixels);
+    downloadBytes(encoded, `${basename}.png`, "image/png");
+  } else if (settings.format === "jpeg") {
+    const blob = await encodeMaximumQualityJpeg(width, height, pixels);
+    downloadBlob(blob, `${basename}.jpg`);
+  } else if (settings.format === "hdr") {
+    downloadBytes(encodeExportHdr(width, height, pixels), `${basename}.hdr`, "image/vnd.radiance");
+  } else if (settings.format === "exr") {
+    const encoded = await encodeExportExr(width, height, pixels, {
+      precision: settings.exrPrecision,
+      compression: settings.exrCompression
+    });
+    downloadBytes(encoded, `${basename}.exr`, "image/aces");
+  } else {
+    throw new Error(`Unsupported export format: ${settings.format}`);
+  }
+  fileHint.textContent = `Exported ${basename}.${settings.format === "jpeg" ? "jpg" : settings.format}`;
+}
+
+function resampleExportPixels(source, sourceWidth, sourceHeight, width, height, filter) {
+  if (filter === "nearest") {
+    const output = new Float32Array(width * height * 4);
+    for (let y = 0; y < height; y += 1) {
+      const sourceY = Math.min(sourceHeight - 1, Math.floor((y + 0.5) * sourceHeight / height));
+      for (let x = 0; x < width; x += 1) {
+        const sourceX = Math.min(sourceWidth - 1, Math.floor((x + 0.5) * sourceWidth / width));
+        const sourceIndex = (sourceY * sourceWidth + sourceX) * 4;
+        output.set(source.subarray(sourceIndex, sourceIndex + 4), (y * width + x) * 4);
+      }
+    }
+    return output;
+  }
+  if (filter === "bilinear") {
+    return resampleLinearPixels(source, sourceWidth, sourceHeight, width, height);
+  }
+  return resampleBoxPixels(source, sourceWidth, sourceHeight, width, height);
+}
+
+function resampleBoxPixels(source, sourceWidth, sourceHeight, width, height) {
+  const output = new Float32Array(width * height * 4);
+  const scaleX = sourceWidth / width;
+  const scaleY = sourceHeight / height;
+  for (let y = 0; y < height; y += 1) {
+    const top = y * scaleY;
+    const bottom = (y + 1) * scaleY;
+    const firstY = Math.floor(top);
+    const lastY = Math.min(sourceHeight - 1, Math.ceil(bottom) - 1);
+    for (let x = 0; x < width; x += 1) {
+      const left = x * scaleX;
+      const right = (x + 1) * scaleX;
+      const firstX = Math.floor(left);
+      const lastX = Math.min(sourceWidth - 1, Math.ceil(right) - 1);
+      const target = (y * width + x) * 4;
+      let totalWeight = 0;
+      for (let sourceY = firstY; sourceY <= lastY; sourceY += 1) {
+        const weightY = Math.max(0, Math.min(bottom, sourceY + 1) - Math.max(top, sourceY));
+        for (let sourceX = firstX; sourceX <= lastX; sourceX += 1) {
+          const weightX = Math.max(0, Math.min(right, sourceX + 1) - Math.max(left, sourceX));
+          const weight = weightX * weightY;
+          const sourceIndex = (sourceY * sourceWidth + sourceX) * 4;
+          output[target] += source[sourceIndex] * weight;
+          output[target + 1] += source[sourceIndex + 1] * weight;
+          output[target + 2] += source[sourceIndex + 2] * weight;
+          output[target + 3] += source[sourceIndex + 3] * weight;
+          totalWeight += weight;
+        }
+      }
+      if (totalWeight > 0) {
+        output[target] /= totalWeight;
+        output[target + 1] /= totalWeight;
+        output[target + 2] /= totalWeight;
+        output[target + 3] /= totalWeight;
+      }
+    }
+  }
+  return output;
+}
+
+function exportRawPixels(image, source, format) {
+  if (format === "hdr" || format === "exr") return source;
+  const needsToneMap = isHdrImage(image) || image.range.rgbMax > 1 || image.range.rgbMin < 0;
+  if (!needsToneMap) return source;
+  const output = new Float32Array(source.length);
+  const referenceWhite = image.valueUnit === "nit" ? HDR_REFERENCE_WHITE_NITS : 1;
+  for (let i = 0; i < source.length; i += 4) {
+    const rgb = toneMapExportRgb(source[i], source[i + 1], source[i + 2], referenceWhite);
+    output[i] = rgb[0];
+    output[i + 1] = rgb[1];
+    output[i + 2] = rgb[2];
+    output[i + 3] = source[i + 3];
+  }
+  return output;
+}
+
+function exportDisplayPixels(image, source, format) {
+  const output = new Float32Array(source.length);
+  const display = displayConversion(image);
+  const hdrTarget = format === "hdr" || format === "exr";
+  const outputHdr = hdrTarget && image.displayInfo?.actualMode === "hdr";
+  for (let i = 0; i < source.length; i += 4) {
+    const transformed = exportDisplayPixel(
+      source[i], source[i + 1], source[i + 2], source[i + 3],
+      display, outputHdr
+    );
+    output.set(transformed, i);
+  }
+  return output;
+}
+
+function exportDisplayPixel(r, g, b, a, display, outputHdr) {
+  const mode = display.mode;
+  const alpha = clamp01(Number.isFinite(a) ? a : 0);
+  if (mode === "a") {
+    const value = exportNormalizedScalar(alpha, display);
+    const shown = applyExportGamma(value, display.displayGamma);
+    const inverted = display.invert ? 1 - shown : shown;
+    return [inverted, inverted, inverted, 1];
+  }
+  if (mode === "r") {
+    g = r;
+    b = r;
+  } else if (mode === "g") {
+    r = g;
+    b = g;
+  } else if (mode === "b") {
+    r = b;
+    g = b;
+  }
+
+  let rgb;
+  if (display.logNormalize) {
+    rgb = [r, g, b].map((value) => exportNormalizedLog(value * display.brightness, display));
+    rgb = rgb.map((value) => outputHdr ? Math.max(value, 0) : clamp01(value));
+  } else if (display.autoLevel) {
+    rgb = [r, g, b].map((value) => (value - display.levelOffset) * display.levelScale * display.brightness);
+    rgb = rgb.map((value) => outputHdr ? Math.max(value, 0) : clamp01(value));
+  } else if (outputHdr) {
+    const scale = display.absoluteNits ? display.brightness / HDR_REFERENCE_WHITE_NITS : display.brightness;
+    rgb = [r * scale, g * scale, b * scale];
+  } else if (display.absoluteNits) {
+    rgb = toneMapExportRgb(r, g, b, HDR_REFERENCE_WHITE_NITS, display.brightness);
+  } else {
+    rgb = [r * display.brightness, g * display.brightness, b * display.brightness];
+  }
+  rgb = rgb.map((value) => applyExportGamma(value, display.displayGamma));
+  if (display.invert) rgb = rgb.map((value) => 1 - value);
+  if (!outputHdr) rgb = rgb.map(clamp01);
+  return [rgb[0], rgb[1], rgb[2], mode === "rgba" ? alpha : 1];
+}
+
+function exportNormalizedLog(value, display) {
+  return (Math.log2(Math.max(value, 0) + display.logEpsilon) - display.logMin) / display.logRange;
+}
+
+function exportNormalizedScalar(value, display) {
+  if (display.logNormalize) return clamp01(exportNormalizedLog(value * display.brightness, display));
+  if (display.autoLevel) return clamp01((value - display.levelOffset) * display.levelScale * display.brightness);
+  return clamp01(value * display.brightness);
+}
+
+function applyExportGamma(value, gamma) {
+  return Math.pow(Math.max(Number.isFinite(value) ? value : 0, 0), gamma);
+}
+
+function toneMapExportRgb(red, green, blue, referenceWhite, brightness = 1) {
+  red = Number.isFinite(red) ? red : 0;
+  green = Number.isFinite(green) ? green : 0;
+  blue = Number.isFinite(blue) ? blue : 0;
+  const luminance = Math.max(0, 0.2126 * red + 0.7152 * green + 0.0722 * blue);
+  if (luminance <= 1e-9) return [0, 0, 0];
+  const mappedLuminance = acesToneMap(luminance / referenceWhite * Math.max(0, brightness));
+  const scale = mappedLuminance / luminance;
+  return fitLinearSrgbGamut(red * scale, green * scale, blue * scale, mappedLuminance);
+}
+
 async function materializeImagePixels(image) {
   fileHint.textContent = `${image.name}: preparing full-resolution pixels...`;
   const pixels = await image.rasterSource?.materialize?.();
@@ -3305,6 +3594,271 @@ function encodeExr(image, pixels = image.pixels) {
   return out.bytes();
 }
 
+function encodeExportHdr(width, height, pixels) {
+  const header = `#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y ${height} +X ${width}\n`;
+  const headerBytes = new TextEncoder().encode(header);
+  const encodedPixels = new Uint8Array(width * height * 4);
+  for (let i = 0, j = 0; i < pixels.length; i += 4, j += 4) {
+    const rgbe = linearRgbToRgbe(pixels[i], pixels[i + 1], pixels[i + 2]);
+    encodedPixels[j] = rgbe[0];
+    encodedPixels[j + 1] = rgbe[1];
+    encodedPixels[j + 2] = rgbe[2];
+    encodedPixels[j + 3] = rgbe[3];
+  }
+  return concatByteArrays([headerBytes, encodedPixels]);
+}
+
+async function encodeExportExr(width, height, pixels, { precision = "half", compression = "zip" } = {}) {
+  const pixelType = precision === "float" ? 2 : 1;
+  const bytesPerSample = pixelType === 2 ? 4 : 2;
+  const compressionCode = compression === "none" ? 0 : 3;
+  const blockLines = compressionCode === 3 ? 16 : 1;
+  const header = new ByteWriter();
+  header.u32(20000630);
+  header.u32(2);
+  writeExrAttribute(header, "channels", "chlist", (writer) => {
+    for (const channel of ["A", "B", "G", "R"]) {
+      writer.cstring(channel);
+      writer.i32(pixelType);
+      writer.u8(0);
+      writer.u8(0);
+      writer.u8(0);
+      writer.u8(0);
+      writer.i32(1);
+      writer.i32(1);
+    }
+    writer.u8(0);
+  });
+  writeExrAttribute(header, "compression", "compression", (writer) => writer.u8(compressionCode));
+  writeExrAttribute(header, "dataWindow", "box2i", (writer) => {
+    writer.i32(0);
+    writer.i32(0);
+    writer.i32(width - 1);
+    writer.i32(height - 1);
+  });
+  writeExrAttribute(header, "displayWindow", "box2i", (writer) => {
+    writer.i32(0);
+    writer.i32(0);
+    writer.i32(width - 1);
+    writer.i32(height - 1);
+  });
+  writeExrAttribute(header, "lineOrder", "lineOrder", (writer) => writer.u8(0));
+  writeExrAttribute(header, "pixelAspectRatio", "float", (writer) => writer.f32(1));
+  writeExrAttribute(header, "screenWindowCenter", "v2f", (writer) => {
+    writer.f32(0);
+    writer.f32(0);
+  });
+  writeExrAttribute(header, "screenWindowWidth", "float", (writer) => writer.f32(1));
+  header.u8(0);
+
+  const chunks = [];
+  for (let startY = 0; startY < height; startY += blockLines) {
+    const lines = Math.min(blockLines, height - startY);
+    const raw = encodeExrScanlineBlock(width, startY, lines, pixels, pixelType, bytesPerSample);
+    const data = compressionCode === 3 ? await compressExrZipBlock(raw) : raw;
+    const chunk = new ByteWriter(8 + data.length);
+    chunk.i32(startY);
+    chunk.u32(data.length);
+    chunk.bytes(data);
+    chunks.push(chunk.bytes());
+  }
+
+  const headerBytes = header.bytes();
+  const offsetTableSize = chunks.length * 8;
+  const totalSize = headerBytes.length + offsetTableSize + chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const out = new ByteWriter(totalSize);
+  out.bytes(headerBytes);
+  let offset = headerBytes.length + offsetTableSize;
+  for (const chunk of chunks) {
+    out.u64(offset);
+    offset += chunk.length;
+  }
+  for (const chunk of chunks) out.bytes(chunk);
+  return out.bytes();
+}
+
+function encodeExrScanlineBlock(width, startY, lines, pixels, pixelType, bytesPerSample) {
+  const raw = new Uint8Array(width * lines * 4 * bytesPerSample);
+  const view = new DataView(raw.buffer);
+  let offset = 0;
+  for (let line = 0; line < lines; line += 1) {
+    const y = startY + line;
+    for (const channelIndex of [3, 2, 1, 0]) {
+      for (let x = 0; x < width; x += 1) {
+        const value = pixels[(y * width + x) * 4 + channelIndex];
+        if (pixelType === 1) {
+          view.setUint16(offset, floatToHalf(value), true);
+        } else {
+          view.setFloat32(offset, Number.isFinite(value) ? value : 0, true);
+        }
+        offset += bytesPerSample;
+      }
+    }
+  }
+  return raw;
+}
+
+async function compressExrZipBlock(raw) {
+  const reordered = new Uint8Array(raw.length);
+  let first = 0;
+  let second = Math.floor((raw.length + 1) / 2);
+  for (let i = 0; i < raw.length; i += 2) {
+    reordered[first++] = raw[i];
+    if (i + 1 < raw.length) reordered[second++] = raw[i + 1];
+  }
+  const predicted = new Uint8Array(reordered.length);
+  if (reordered.length) predicted[0] = reordered[0];
+  for (let i = 1; i < reordered.length; i += 1) {
+    predicted[i] = (reordered[i] - reordered[i - 1] + 128) & 255;
+  }
+  const compressed = await deflateBytes(predicted);
+  return compressed.length < raw.length ? compressed : raw;
+}
+
+function floatToHalf(value) {
+  if (Number.isNaN(value)) return 0x7e00;
+  if (value === Infinity) return 0x7c00;
+  if (value === -Infinity) return 0xfc00;
+  floatToHalfView.setFloat32(0, value, false);
+  const bits = floatToHalfView.getUint32(0, false);
+  const sign = (bits >>> 16) & 0x8000;
+  let exponent = ((bits >>> 23) & 0xff) - 127 + 15;
+  let mantissa = bits & 0x7fffff;
+  if (exponent >= 31) return sign | 0x7c00;
+  if (exponent <= 0) {
+    if (exponent < -10) return sign;
+    mantissa = (mantissa | 0x800000) + (1 << (13 - exponent));
+    return sign | (mantissa >>> (14 - exponent));
+  }
+  mantissa += 0x1000;
+  if (mantissa & 0x800000) {
+    mantissa = 0;
+    exponent += 1;
+    if (exponent >= 31) return sign | 0x7c00;
+  }
+  return sign | (exponent << 10) | (mantissa >>> 13);
+}
+
+const floatToHalfView = new DataView(new ArrayBuffer(4));
+
+async function encodeStraightAlphaPng(width, height, pixels) {
+  const rowBytes = width * 4 + 1;
+  const raw = new Uint8Array(rowBytes * height);
+  let previousRow = new Uint8Array(width * 4);
+  for (let y = 0; y < height; y += 1) {
+    const row = y * rowBytes;
+    const currentRow = new Uint8Array(width * 4);
+    raw[row] = 4;
+    for (let x = 0; x < width; x += 1) {
+      const source = (y * width + x) * 4;
+      const target = x * 4;
+      currentRow[target] = linearToSrgbByte(pixels[source]);
+      currentRow[target + 1] = linearToSrgbByte(pixels[source + 1]);
+      currentRow[target + 2] = linearToSrgbByte(pixels[source + 2]);
+      currentRow[target + 3] = clampByte(clamp01(pixels[source + 3]) * 255);
+    }
+    for (let index = 0; index < currentRow.length; index += 1) {
+      const left = index >= 4 ? currentRow[index - 4] : 0;
+      const up = previousRow[index];
+      const upperLeft = index >= 4 ? previousRow[index - 4] : 0;
+      raw[row + 1 + index] = (currentRow[index] - pngPaethPredictor(left, up, upperLeft)) & 255;
+    }
+    previousRow = currentRow;
+  }
+  const ihdr = new Uint8Array(13);
+  const ihdrView = new DataView(ihdr.buffer);
+  ihdrView.setUint32(0, width, false);
+  ihdrView.setUint32(4, height, false);
+  ihdr[8] = 8;
+  ihdr[9] = 6;
+  const compressed = await deflateBytes(raw);
+  return concatByteArrays([
+    new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]),
+    pngChunk("IHDR", ihdr),
+    pngChunk("sRGB", new Uint8Array([0])),
+    pngChunk("IDAT", compressed),
+    pngChunk("IEND", new Uint8Array())
+  ]);
+}
+
+async function encodeMaximumQualityJpeg(width, height, pixels) {
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  const imageData = context.createImageData(width, height);
+  for (let source = 0; source < pixels.length; source += 4) {
+    imageData.data[source] = linearToSrgbByte(pixels[source]);
+    imageData.data[source + 1] = linearToSrgbByte(pixels[source + 1]);
+    imageData.data[source + 2] = linearToSrgbByte(pixels[source + 2]);
+    imageData.data[source + 3] = 255;
+  }
+  context.putImageData(imageData, 0, 0);
+  return await new Promise((resolve, reject) => {
+    canvas.toBlob(
+      (blob) => blob ? resolve(blob) : reject(new Error("JPEG encoding failed.")),
+      "image/jpeg",
+      1
+    );
+  });
+}
+
+async function deflateBytes(bytes) {
+  if (typeof CompressionStream === "undefined") {
+    throw new Error("This browser does not support DEFLATE compression.");
+  }
+  const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream("deflate"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+function pngChunk(type, data) {
+  const typeBytes = new TextEncoder().encode(type);
+  const output = new Uint8Array(12 + data.length);
+  const view = new DataView(output.buffer);
+  view.setUint32(0, data.length, false);
+  output.set(typeBytes, 4);
+  output.set(data, 8);
+  view.setUint32(8 + data.length, crc32(output.subarray(4, 8 + data.length)), false);
+  return output;
+}
+
+function crc32(bytes) {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc = crc32Table[(crc ^ byte) & 255] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function pngPaethPredictor(left, up, upperLeft) {
+  const estimate = left + up - upperLeft;
+  const leftDistance = Math.abs(estimate - left);
+  const upDistance = Math.abs(estimate - up);
+  const upperLeftDistance = Math.abs(estimate - upperLeft);
+  if (leftDistance <= upDistance && leftDistance <= upperLeftDistance) return left;
+  if (upDistance <= upperLeftDistance) return up;
+  return upperLeft;
+}
+
+const crc32Table = new Uint32Array(256);
+for (let index = 0; index < crc32Table.length; index += 1) {
+  let value = index;
+  for (let bit = 0; bit < 8; bit += 1) {
+    value = (value >>> 1) ^ (value & 1 ? 0xedb88320 : 0);
+  }
+  crc32Table[index] = value >>> 0;
+}
+
+function concatByteArrays(arrays) {
+  const output = new Uint8Array(arrays.reduce((sum, array) => sum + array.length, 0));
+  let offset = 0;
+  for (const array of arrays) {
+    output.set(array, offset);
+    offset += array.length;
+  }
+  return output;
+}
+
 function writeExrAttribute(writer, name, type, writeValue) {
   const value = new ByteWriter();
   writeValue(value);
@@ -3317,6 +3871,10 @@ function writeExrAttribute(writer, name, type, writeValue) {
 
 function downloadBytes(bytes, filename, mime) {
   const blob = new Blob([bytes], { type: mime });
+  downloadBlob(blob, filename);
+}
+
+function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;
@@ -3357,6 +3915,12 @@ class ByteWriter {
     this.ensure(1);
     this.view.setUint8(this.offset, value);
     this.offset += 1;
+  }
+
+  u16(value) {
+    this.ensure(2);
+    this.view.setUint16(this.offset, value, true);
+    this.offset += 2;
   }
 
   i32(value) {
@@ -3535,6 +4099,7 @@ function imageSessionState(image) {
     fullRange: image.fullRange,
     source: imageSourceSessionState(image),
     settings: { ...image.settings },
+    exportSettings: { ...ensureExportSettings(image) },
     view: { ...image.view },
     pickers: image.pickers.map((picker) => ({ ...picker })),
     selection: image.selection ? { ...image.selection } : null,
@@ -3714,6 +4279,10 @@ function applySavedImageState(image, savedImage) {
   image.settings = {
     ...image.settings,
     ...(savedImage.settings || {})
+  };
+  image.exportSettings = {
+    ...image.exportSettings,
+    ...(savedImage.exportSettings || {})
   };
   image.view = {
     ...image.view,
@@ -5639,11 +6208,165 @@ function getDisplayNormalizationRange(image) {
   };
 }
 
+function ensureExportSettings(image) {
+  const defaults = {
+    source: "display",
+    format: isHdrImage(image) ? "exr" : "png",
+    exrPrecision: "half",
+    exrCompression: "zip",
+    separateAxes: false,
+    width: image.width,
+    height: image.height,
+    scaleX: 100,
+    scaleY: 100,
+    resizeFilter: "box",
+    baseWidth: image.width,
+    baseHeight: image.height
+  };
+  image.exportSettings = { ...defaults, ...(image.exportSettings || {}) };
+  const settings = image.exportSettings;
+  if (settings.baseWidth !== image.width || settings.baseHeight !== image.height) {
+    settings.width = image.width;
+    settings.height = image.height;
+    settings.scaleX = 100;
+    settings.scaleY = 100;
+    settings.baseWidth = image.width;
+    settings.baseHeight = image.height;
+  }
+  settings.width = clampExportDimension(settings.width);
+  settings.height = clampExportDimension(settings.height);
+  settings.scaleX = exportScaleForDimension(settings.width, image.width);
+  settings.scaleY = exportScaleForDimension(settings.height, image.height);
+  if (!settings.separateAxes) {
+    settings.scaleY = settings.scaleX;
+    settings.height = scaledExportDimension(image.height, settings.scaleX);
+  }
+  return settings;
+}
+
+function updateExportDimension(axis) {
+  const image = currentImage();
+  if (!image) return;
+  const settings = ensureExportSettings(image);
+  const input = axis === "width" ? exportWidthInput : exportHeightInput;
+  const parsed = Number(input.value);
+  if (!Number.isFinite(parsed) || parsed < 1) return;
+  if (axis === "width") {
+    settings.width = clampExportDimension(parsed);
+    settings.scaleX = exportScaleForDimension(settings.width, image.width);
+    if (!settings.separateAxes) {
+      settings.scaleY = settings.scaleX;
+      settings.height = scaledExportDimension(image.height, settings.scaleX);
+    }
+  } else {
+    settings.height = clampExportDimension(parsed);
+    settings.scaleY = exportScaleForDimension(settings.height, image.height);
+    if (!settings.separateAxes) {
+      settings.scaleX = settings.scaleY;
+      settings.width = scaledExportDimension(image.width, settings.scaleY);
+    }
+  }
+  writeExportSizeInputs(settings);
+  updateExportDescription(image, settings);
+  scheduleSessionSave();
+}
+
+function updateExportScale(axis) {
+  const image = currentImage();
+  if (!image) return;
+  const settings = ensureExportSettings(image);
+  const input = axis === "x" ? exportScaleXInput : exportScaleYInput;
+  const parsed = Number(input.value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return;
+  const scale = Math.min(6400, Math.max(0.01, parsed));
+  if (axis === "x") {
+    settings.scaleX = scale;
+    settings.width = scaledExportDimension(image.width, scale);
+    if (!settings.separateAxes) {
+      settings.scaleY = scale;
+      settings.height = scaledExportDimension(image.height, scale);
+    }
+  } else {
+    settings.scaleY = scale;
+    settings.height = scaledExportDimension(image.height, scale);
+  }
+  writeExportSizeInputs(settings);
+  updateExportDescription(image, settings);
+  scheduleSessionSave();
+}
+
+function updateExportPanel(image) {
+  exportImageButton.disabled = !image;
+  if (!image) {
+    for (const input of [exportWidthInput, exportHeightInput, exportScaleXInput, exportScaleYInput]) input.value = "";
+    exportDescription.textContent = "Select an image window.";
+    return;
+  }
+  const settings = ensureExportSettings(image);
+  exportSourceSelect.value = settings.source;
+  exportFormatSelect.value = settings.format;
+  exportExrPrecisionSelect.value = settings.exrPrecision;
+  exportExrCompressionSelect.value = settings.exrCompression;
+  exportResizeFilterSelect.value = settings.resizeFilter;
+  exportSeparateAxesInput.checked = settings.separateAxes;
+  exportExrOptions.classList.toggle("hidden", settings.format !== "exr");
+  exportScaleYField.classList.toggle("hidden", !settings.separateAxes);
+  exportScaleXLabel.textContent = settings.separateAxes ? "Scale X" : "Scale";
+  writeExportSizeInputs(settings);
+  updateExportDescription(image, settings);
+}
+
+function writeExportSizeInputs(settings) {
+  exportWidthInput.value = String(settings.width);
+  exportHeightInput.value = String(settings.height);
+  exportScaleXInput.value = formatExportScale(settings.scaleX);
+  exportScaleYInput.value = formatExportScale(settings.scaleY);
+}
+
+function updateExportDescription(image, settings) {
+  const pixels = settings.width * settings.height;
+  const sizeWarning = pixels > maxExportPixels ? " Size exceeds the 100 MP export limit." : "";
+  let formatDescription;
+  if (settings.format === "png") {
+    formatDescription = "8-bit sRGB PNG · straight alpha (RGB is not changed by A).";
+  } else if (settings.format === "jpeg") {
+    formatDescription = "8-bit sRGB JPEG · maximum encoder quality · alpha omitted.";
+  } else if (settings.format === "hdr") {
+    formatDescription = "Radiance RGBE · HDR RGB · alpha omitted.";
+  } else {
+    const precision = settings.exrPrecision === "half" ? "16-bit half" : "32-bit float";
+    const compression = settings.exrCompression === "zip" ? "ZIP (16 lines)" : "uncompressed";
+    formatDescription = `OpenEXR ${precision} · ${compression} · float RGBA.`;
+  }
+  const sourceDescription = settings.source === "display"
+    ? " View controls are baked into the pixels."
+    : " RAW ignores view controls; SDR targets receive only required HDR-to-SDR conversion.";
+  exportDescription.textContent = `${settings.width} × ${settings.height} · ${formatDescription}${sourceDescription}${sizeWarning}`;
+  exportImageButton.disabled = !image || pixels > maxExportPixels;
+}
+
+function clampExportDimension(value) {
+  return Math.min(65535, Math.max(1, Math.round(Number(value) || 1)));
+}
+
+function scaledExportDimension(sourceSize, scale) {
+  return clampExportDimension(sourceSize * scale / 100);
+}
+
+function exportScaleForDimension(size, sourceSize) {
+  return Math.min(6400, Math.max(0.01, size / Math.max(1, sourceSize) * 100));
+}
+
+function formatExportScale(value) {
+  return Number(Number(value).toFixed(4)).toString();
+}
+
 function updateSettingsPanel() {
   const image = currentImage();
   updateLogDisplayButton();
   emptySettings.classList.toggle("hidden", Boolean(image));
   settingsForm.classList.toggle("hidden", !image);
+  updateExportPanel(image);
   if (!image) {
     outputStatus.textContent = webGpuInitializationError
       ? webGpuInitializationError.message

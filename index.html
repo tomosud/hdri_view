@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>HDRI Value Viewer</title>
   <link rel="icon" href="data:,">
-  <link rel="stylesheet" href="./style.css?v=20260821-1">
+  <link rel="stylesheet" href="./style.css?v=20260926-1">
   <script type="importmap">
     {
       "imports": {
@@ -142,6 +142,80 @@
               </div>
             </div>
 
+            <details id="exportSettings" class="export-settings">
+              <summary>Export</summary>
+              <div class="export-settings-body">
+                <label class="field compact-field">
+                  <span>Source</span>
+                  <select id="exportSourceSelect">
+                    <option value="display">Current display</option>
+                    <option value="raw">RAW pixels</option>
+                  </select>
+                </label>
+                <label class="field compact-field">
+                  <span>Format</span>
+                  <select id="exportFormatSelect">
+                    <option value="png">PNG</option>
+                    <option value="jpeg">JPEG</option>
+                    <option value="hdr">HDR RGBE</option>
+                    <option value="exr">OpenEXR</option>
+                  </select>
+                </label>
+                <div id="exportExrOptions" class="export-sub-options hidden">
+                  <label class="field compact-field">
+                    <span>Precision</span>
+                    <select id="exportExrPrecisionSelect">
+                      <option value="half">16-bit half</option>
+                      <option value="float">32-bit float</option>
+                    </select>
+                  </label>
+                  <label class="field compact-field">
+                    <span>Compress</span>
+                    <select id="exportExrCompressionSelect">
+                      <option value="zip">ZIP (16 lines)</option>
+                      <option value="none">None</option>
+                    </select>
+                  </label>
+                </div>
+                <label class="check-field export-separate-field">
+                  <input id="exportSeparateAxesInput" type="checkbox">
+                  <span>Set width / height separately</span>
+                </label>
+                <div class="export-size-grid">
+                  <label class="export-size-field">
+                    <span>Width</span>
+                    <input id="exportWidthInput" type="number" min="1" max="65535" step="1" inputmode="numeric">
+                    <small>px</small>
+                  </label>
+                  <label class="export-size-field">
+                    <span>Height</span>
+                    <input id="exportHeightInput" type="number" min="1" max="65535" step="1" inputmode="numeric">
+                    <small>px</small>
+                  </label>
+                  <label class="export-size-field">
+                    <span id="exportScaleXLabel">Scale</span>
+                    <input id="exportScaleXInput" type="number" min="0.01" max="6400" step="0.01" inputmode="decimal">
+                    <small>%</small>
+                  </label>
+                  <label id="exportScaleYField" class="export-size-field hidden">
+                    <span>Scale Y</span>
+                    <input id="exportScaleYInput" type="number" min="0.01" max="6400" step="0.01" inputmode="decimal">
+                    <small>%</small>
+                  </label>
+                </div>
+                <label class="field compact-field">
+                  <span>Resize</span>
+                  <select id="exportResizeFilterSelect">
+                    <option value="box">Box</option>
+                    <option value="bilinear">Bilinear</option>
+                    <option value="nearest">Nearest</option>
+                  </select>
+                </label>
+                <div id="exportDescription" class="export-description"></div>
+                <button id="exportImageButton" class="export-button" type="button">Export</button>
+              </div>
+            </details>
+
             <div class="meta">
               <div><span>Name</span><strong id="metaName"></strong></div>
               <div><span>Size</span><strong id="metaSize"></strong></div>
@@ -228,6 +302,6 @@
     </footer>
   </div>
 
-  <script type="module" src="./app.js?v=20260920-1"></script>
+  <script type="module" src="./app.js?v=20260926-1"></script>
 </body>
 </html>
