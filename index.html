@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>HDRI Value Viewer</title>
   <link rel="icon" href="data:,">
-  <link rel="stylesheet" href="./style.css?v=20260926-1">
+  <link rel="stylesheet" href="./style.css?v=20260927-1">
   <script type="importmap">
     {
       "imports": {
@@ -23,7 +23,7 @@
         <input id="fileInput" type="file" multiple accept="image/*,.jp2,.j2k,.j2c,.tif,.tiff,.hdr,.pic,.exr,.dcm,application/dicom">
         Open
       </label>
-      <button id="newImageButton" class="tool-button" type="button" title="Generate a new image from GLSL code only">New Image</button>
+      <button id="newImageButton" class="tool-button" type="button" title="Create a GLSL node">New GLSL</button>
       <div id="fileHint" class="file-hint">Drop images on the black view</div>
       <a class="github-link" href="https://github.com/tomosud/hdri_view" target="_blank" rel="noopener noreferrer">GitHub</a>
     </header>
@@ -39,6 +39,7 @@
           <canvas id="selectionGraphCanvas" class="selection-graph-canvas"></canvas>
           <div id="selectionGraphResize" class="graph-resize-handle"></div>
         </aside>
+        <svg id="connectionLayer" class="connection-layer" aria-hidden="true"></svg>
         <div id="windowLayer" class="window-layer"></div>
         <div id="dropPrompt" class="drop-prompt">
           <div>Drop images here</div>
@@ -244,7 +245,10 @@
                 <input id="glslWidth" type="number" min="1" max="4096" step="1" value="1024" aria-label="Output width">
                 <span>x</span>
                 <input id="glslHeight" type="number" min="1" max="4096" step="1" value="1024" aria-label="Output height">
-                <button id="glslMatchInput" class="tool-button" type="button">Match input</button>
+                <select id="glslResolutionMode" aria-label="Output resolution mode">
+                  <option value="follow-input">Follow input</option>
+                  <option value="custom">Custom</option>
+                </select>
               </div>
             </div>
             <div class="glsl-field">
@@ -305,6 +309,6 @@
     </footer>
   </div>
 
-  <script type="module" src="./app.js?v=20260926-4"></script>
+  <script type="module" src="./app.js?v=20260927-1"></script>
 </body>
 </html>

@@ -151,6 +151,34 @@ textarea {
   pointer-events: none;
 }
 
+.connection-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.node-connection {
+  fill: none;
+  stroke: #36df21;
+  stroke-linecap: round;
+  stroke-width: 4;
+  vector-effect: non-scaling-stroke;
+}
+
+.node-connection.preview {
+  opacity: 0.75;
+  stroke-dasharray: 7 5;
+}
+
+.node-connection.invalid {
+  stroke: #ff5c64;
+}
+
 .selection-graph-panel {
   position: absolute;
   left: 12px;
@@ -290,10 +318,64 @@ textarea {
   min-height: 160px;
   border: 1px solid #343a43;
   border-radius: 7px;
-  overflow: hidden;
+  overflow: visible;
   background: #050505;
   box-shadow: 0 16px 36px rgba(0, 0, 0, 0.42);
   pointer-events: auto;
+}
+
+.node-port {
+  position: absolute;
+  top: 14px;
+  z-index: 6;
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  border: 2px solid #10220c;
+  border-radius: 50%;
+  background: #31df17;
+  box-shadow: 0 0 0 1px rgba(69, 255, 39, 0.55);
+  cursor: crosshair;
+  transform: translateY(-50%);
+  touch-action: none;
+}
+
+.node-port:hover,
+.node-port.connect-target {
+  background: #83ff6f;
+  box-shadow: 0 0 0 3px rgba(69, 255, 39, 0.28);
+}
+
+.node-port-input {
+  left: -8px;
+}
+
+.node-port-output {
+  right: -8px;
+}
+
+.node-kind-badge {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 6px;
+  border: 1px solid #33404d;
+  border-radius: 4px;
+  color: #9fb0c2;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  line-height: 1;
+}
+
+.node-kind-badge.glsl {
+  border-color: #17649a;
+  background: #12304a;
+  color: var(--accent-strong);
+}
+
+.node-kind-badge.source {
+  color: #b8c3cf;
 }
 
 .image-window.active {
@@ -312,6 +394,7 @@ textarea {
   background: #15191f;
   cursor: grab;
   user-select: none;
+  border-radius: 6px 6px 0 0;
 }
 
 .window-close {
@@ -374,7 +457,7 @@ textarea {
   grid-row: 1;
 }
 
-.pq-display .window-mode-tabs {
+.pq-display .node-kind-badge {
   grid-column: 2;
   grid-row: 1;
 }
@@ -394,6 +477,7 @@ textarea {
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+  border-radius: 0 0 6px 6px;
   background: conic-gradient(
     #0d1014 25%,
     #090b0e 0 50%,
@@ -1157,43 +1241,6 @@ button:hover {
 
 .statusbar div:last-child {
   text-align: right;
-}
-
-.window-mode-tabs {
-  display: inline-flex;
-  align-items: center;
-  overflow: hidden;
-  border: 1px solid #33404d;
-  border-radius: 4px;
-}
-
-.window-mode-tab {
-  height: 20px;
-  padding: 0 6px;
-  border: 0;
-  border-right: 1px solid #33404d;
-  border-radius: 0;
-  background: transparent;
-  color: #9fb0c2;
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  line-height: 1;
-  text-transform: uppercase;
-}
-
-.window-mode-tab:last-child {
-  border-right: 0;
-}
-
-.window-mode-tab:hover,
-.window-mode-tab.active {
-  background: #12304a;
-  color: var(--accent-strong);
-}
-
-.window-mode-tab.active {
-  box-shadow: inset 0 -2px var(--accent);
 }
 
 .glsl-panel {

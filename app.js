@@ -36,7 +36,7 @@ const glslCloseButton = document.querySelector("#glslCloseButton");
 const glslInputLabel = document.querySelector("#glslInputLabel");
 const glslWidthInput = document.querySelector("#glslWidth");
 const glslHeightInput = document.querySelector("#glslHeight");
-const glslMatchInputButton = document.querySelector("#glslMatchInput");
+const glslResolutionMode = document.querySelector("#glslResolutionMode");
 const glslPresetSelect = document.querySelector("#glslPreset");
 const glslCodeInput = document.querySelector("#glslCode");
 const glslStatus = document.querySelector("#glslStatus");
@@ -53,6 +53,7 @@ const displayGammaInput = document.querySelector("#displayGammaInput");
 const displayGamma1 = document.querySelector("#displayGamma1");
 const displayGamma22 = document.querySelector("#displayGamma22");
 const displayGamma04545 = document.querySelector("#displayGamma04545");
+const connectionLayer = document.querySelector("#connectionLayer");
 const windowLayer = document.querySelector("#windowLayer");
 const dropPrompt = document.querySelector("#dropPrompt");
 const inspector = document.querySelector("#inspector");
@@ -121,7 +122,7 @@ const maxPickers = 20;
 const selectionMatrixPreviewRows = 8;
 const selectionMatrixPreviewColumns = 12;
 const sessionDbName = "hdri-value-viewer";
-const sessionDbVersion = 1;
+const sessionDbVersion = 2;
 const sessionStoreName = "session";
 const sessionKey = "current";
 const pickerColors = [
@@ -143,6 +144,8 @@ let hoveredPickerId = null;
 let hoveredPickerUiPending = false;
 let hoveredPickerUiScroll = false;
 let internalClipboard = null;
+let internalNodeClipboard = null;
+let nextSourceAssetId = 1;
 const portableClipboardMatrixPixels = 512 * 512;
 const maxInternalClipboardPixels = 4096 * 2048;
 const maxLoadedPngPixels = 4096 * 4096;
@@ -420,6 +423,12 @@ document.addEventListener("paste", (event) => {
   }
   const pasteJobId = ++clipboardReadJobId;
   const payload = clipboardPastePayload(event.clipboardData);
+  const nodeCandidate = decodeInternalNodeClipboard(payload);
+  if (nodeCandidate) {
+    event.preventDefault();
+    duplicateNodeFromClipboard(nodeCandidate);
+    return;
+  }
   const candidate = decodeClipboardPaste(payload);
   if (candidate) {
     event.preventDefault();
@@ -439,11 +448,9 @@ document.addEventListener("copy", (event) => {
     return;
   }
   const image = currentImage();
-  if (!image?.selection) {
-    return;
-  }
+  if (!image) return;
   event.preventDefault();
-  void copySelection(image, image.selection, event.clipboardData);
+  copyNodeToClipboard(image, event.clipboardData);
 });
 
 document.addEventListener("keydown", (event) => {
@@ -509,13 +516,16 @@ function clipboardImageFiles(clipboardData) {
 
 function clipboardPastePayload(clipboardData) {
   let text = "";
+  let nodeToken = "";
   try {
     text = clipboardData?.getData("text/plain") || "";
+    nodeToken = clipboardData?.getData("application/x-hdri-viewer-node") || "";
   } catch {
     // Some browsers expose image files but deny text access. The file candidate still works.
   }
   return {
     text,
+    nodeToken,
     files: clipboardImageFiles(clipboardData),
     types: Array.from(clipboardData?.types || [])
   };
@@ -641,11 +651,18 @@ async function pasteFromAsyncClipboard(jobId) {
     if (jobId !== clipboardReadJobId) {
       return;
     }
-    const candidate = decodeClipboardPaste({
+    const payload = {
       text,
+      nodeToken: "",
       files,
       types: items.flatMap((item) => item.types)
-    });
+    };
+    const nodeCandidate = decodeInternalNodeClipboard(payload);
+    if (nodeCandidate) {
+      duplicateNodeFromClipboard(nodeCandidate);
+      return;
+    }
+    const candidate = decodeClipboardPaste(payload);
     if (candidate) {
       await applyClipboardPasteCandidate(candidate);
     } else {
@@ -860,6 +877,7 @@ new ResizeObserver(() => {
   }
   requestRender();
   requestSelectionGraphDraw();
+  requestConnectionDraw();
 }).observe(viewport);
 
 document.addEventListener("pointermove", (event) => {
@@ -868,7 +886,9 @@ document.addEventListener("pointermove", (event) => {
   }
   const dx = event.clientX - activeDrag.startX;
   const dy = event.clientY - activeDrag.startY;
-  if (activeDrag.kind === "move") {
+  if (activeDrag.kind === "connect") {
+    updateConnectionDrag(event);
+  } else if (activeDrag.kind === "move") {
     const next = clampImageWindowPosition(activeDrag.image, activeDrag.x + dx, activeDrag.y + dy);
     activeDrag.image.window.x = next.x;
     activeDrag.image.window.y = next.y;
@@ -923,7 +943,9 @@ document.addEventListener("pointermove", (event) => {
 
 document.addEventListener("pointerup", (event) => {
   const completedDragKind = activeDrag?.kind;
-  if (activeDrag?.kind === "selectRect") {
+  if (activeDrag?.kind === "connect") {
+    finishConnectionDrag(event);
+  } else if (activeDrag?.kind === "selectRect") {
     const image = activeDrag.image;
     const rect = image.selection;
     try {
@@ -967,6 +989,12 @@ document.addEventListener("pointerup", (event) => {
 });
 
 document.addEventListener("pointercancel", () => {
+  if (activeDrag?.kind === "connect") {
+    activeDrag.targetPort?.classList.remove("connect-target");
+    activeDrag = null;
+    requestConnectionDraw();
+    return;
+  }
   if (activeDrag?.kind !== "selectRect") return;
   activeDrag = null;
   setSelectionDragIndicator(false);
@@ -1832,10 +1860,179 @@ function createImageRecord(file, width, height, type, pixels, sourceFormat = "ra
     },
     elements: null,
     displayDirty: true,
-    mode: "original",
-    original: null,
+    outputRevision: 0,
+    nodeKind: sourceFormat === "glsl" ? "glsl" : "source",
+    inputNodeId: null,
+    resolutionMode: sourceFormat === "glsl" ? "custom" : null,
+    sourceAsset: null,
     glsl: null
   };
+}
+
+function ensureSourceAsset(image) {
+  if (!image || image.nodeKind !== "source") return null;
+  if (!image.sourceAsset) {
+    image.sourceAsset = {
+      id: nextSourceAssetId++,
+      refs: 1,
+      pixels: image.pixels,
+      rasterSource: image.rasterSource,
+      disposed: false
+    };
+  }
+  return image.sourceAsset;
+}
+
+function retainSourceAsset(asset) {
+  if (!asset || asset.disposed) return null;
+  asset.refs += 1;
+  return asset;
+}
+
+function releaseSourceAsset(asset) {
+  if (!asset || asset.disposed) return;
+  asset.refs -= 1;
+  if (asset.refs <= 0) {
+    asset.disposed = true;
+    asset.rasterSource?.dispose?.();
+  }
+}
+
+function nodeClipboardSnapshot(image) {
+  const common = {
+    name: image.name,
+    settings: { ...image.settings },
+    exportSettings: { ...image.exportSettings },
+    view: { ...image.view },
+    window: { ...image.window }
+  };
+  if (image.nodeKind === "source") {
+    const asset = retainSourceAsset(ensureSourceAsset(image));
+    return {
+      ...common,
+      nodeKind: "source",
+      asset,
+      width: image.width,
+      height: image.height,
+      sourceWidth: image.sourceWidth,
+      sourceHeight: image.sourceHeight,
+      downsample: image.downsample,
+      type: image.type,
+      sourceFormat: image.sourceFormat,
+      format: image.format,
+      bitDepth: image.bitDepth,
+      hdr: image.hdr,
+      valueUnit: image.valueUnit,
+      colorPrimaries: image.colorPrimaries,
+      transfer: image.transfer,
+      matrix: image.matrix,
+      fullRange: image.fullRange,
+      displayRange: image.displayRange,
+      displayInvert: image.displayInvert,
+      integerEncoding: image.integerEncoding,
+      range: image.range,
+      overview: image.overview,
+      source: image.source
+    };
+  }
+  return {
+    ...common,
+    nodeKind: "glsl",
+    inputNodeId: image.inputNodeId,
+    resolutionMode: image.resolutionMode,
+    width: image.glsl.requestedWidth || image.glsl.width,
+    height: image.glsl.requestedHeight || image.glsl.height,
+    code: image.glsl.code,
+    renderedCode: image.glsl.renderedCode || image.glsl.code
+  };
+}
+
+function copyNodeToClipboard(image, clipboardData) {
+  if (internalNodeClipboard?.snapshot?.nodeKind === "source") {
+    releaseSourceAsset(internalNodeClipboard.snapshot.asset);
+  }
+  const token = crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`;
+  internalNodeClipboard = { token, snapshot: nodeClipboardSnapshot(image) };
+  try {
+    clipboardData?.setData("application/x-hdri-viewer-node", token);
+  } catch {
+    // Some browsers only allow standard clipboard types.
+  }
+  try {
+    clipboardData?.setData("text/plain", `HDRI Viewer Node: ${token}`);
+  } catch {
+    // The in-page clipboard reference still supports paste in this tab.
+  }
+  fileHint.textContent = `Copied ${image.nodeKind === "glsl" ? "GLSL" : "SOURCE"} node ${image.name}`;
+}
+
+function decodeInternalNodeClipboard(payload) {
+  if (!internalNodeClipboard) return null;
+  const textToken = /^HDRI Viewer Node:\s*(.+)$/.exec(payload.text || "")?.[1] || "";
+  const token = payload.nodeToken || textToken;
+  if (token === internalNodeClipboard.token) return internalNodeClipboard.snapshot;
+  const clipboardIsEmpty = !payload.text && payload.files.length === 0 && payload.types.length === 0;
+  const asyncReadUnavailable = typeof navigator.clipboard?.read !== "function";
+  return clipboardIsEmpty && asyncReadUnavailable ? internalNodeClipboard.snapshot : null;
+}
+
+function duplicateSourceNode(snapshot) {
+  const asset = retainSourceAsset(snapshot.asset);
+  if (!asset) {
+    fileHint.textContent = "Paste failed: the shared source is no longer available.";
+    return null;
+  }
+  const image = createImageRecord(
+    { name: `${snapshot.name} copy` },
+    snapshot.width,
+    snapshot.height,
+    snapshot.type,
+    asset.pixels,
+    snapshot.sourceFormat,
+    {
+      rasterSource: asset.rasterSource,
+      range: snapshot.range,
+      sourceWidth: snapshot.sourceWidth,
+      sourceHeight: snapshot.sourceHeight,
+      downsample: snapshot.downsample,
+      format: snapshot.format,
+      bitDepth: snapshot.bitDepth,
+      hdr: snapshot.hdr,
+      valueUnit: snapshot.valueUnit,
+      colorPrimaries: snapshot.colorPrimaries,
+      transfer: snapshot.transfer,
+      matrix: snapshot.matrix,
+      fullRange: snapshot.fullRange,
+      displayRange: snapshot.displayRange,
+      displayInvert: snapshot.displayInvert,
+      integerEncoding: snapshot.integerEncoding,
+      overview: snapshot.overview
+    }
+  );
+  image.source = snapshot.source;
+  image.sourceAsset = asset;
+  image.settings = { ...snapshot.settings };
+  image.exportSettings = { ...snapshot.exportSettings };
+  image.view = { ...snapshot.view };
+  const pastedWindow = { ...snapshot.window, x: snapshot.window.x + 28, y: snapshot.window.y + 28, z: ++topZ };
+  images.push(image);
+  createImageWindow(image, null, 0);
+  image.window = pastedWindow;
+  applyWindowGeometry(image);
+  selectImage(image);
+  requestRender();
+  requestConnectionDraw();
+  scheduleSessionSave();
+  return image;
+}
+
+function duplicateNodeFromClipboard(snapshot) {
+  const image = snapshot.nodeKind === "source"
+    ? duplicateSourceNode(snapshot)
+    : duplicateGlslNode(snapshot);
+  if (!image) return;
+  dropPrompt.classList.add("hidden");
+  fileHint.textContent = `Pasted ${image.nodeKind === "glsl" ? "GLSL" : "SOURCE"} node ${image.name}`;
 }
 
 function createImageWindow(image, dropPoint, placementIndex) {
@@ -1866,25 +2063,30 @@ function createImageWindow(image, dropPoint, placementIndex) {
   size.className = "window-size";
   size.textContent = imageInfoLabel(image);
   size.title = size.textContent;
-  const modeTabs = document.createElement("div");
-  modeTabs.className = "window-mode-tabs";
-  const originalButton = document.createElement("button");
-  originalButton.className = "window-mode-tab";
-  originalButton.type = "button";
-  originalButton.textContent = "Original";
-  originalButton.title = "Show the original image";
-  const glslButton = document.createElement("button");
-  glslButton.className = "window-mode-tab";
-  glslButton.type = "button";
-  glslButton.textContent = "GLSL";
-  glslButton.title = "Show and edit the GLSL result";
-  modeTabs.append(originalButton, glslButton);
+  const nodeBadge = document.createElement("span");
+  nodeBadge.className = `node-kind-badge ${image.nodeKind}`;
+  nodeBadge.textContent = image.nodeKind === "glsl" ? "GLSL" : "SOURCE";
   const closeButton = document.createElement("button");
   closeButton.className = "window-close";
   closeButton.type = "button";
   closeButton.ariaLabel = "Close image window";
   closeButton.textContent = "x";
-  titlebar.append(title, size, modeTabs, closeButton);
+  titlebar.append(title, size, nodeBadge, closeButton);
+
+  const inputPort = image.nodeKind === "glsl" ? document.createElement("button") : null;
+  if (inputPort) {
+    inputPort.className = "node-port node-port-input";
+    inputPort.type = "button";
+    inputPort.dataset.nodeId = String(image.id);
+    inputPort.title = "GLSL input. Double-click to disconnect.";
+    inputPort.ariaLabel = "GLSL input";
+  }
+  const outputPort = document.createElement("button");
+  outputPort.className = "node-port node-port-output";
+  outputPort.type = "button";
+  outputPort.dataset.nodeId = String(image.id);
+  outputPort.title = "Drag to a GLSL input";
+  outputPort.ariaLabel = "Node output";
 
   const body = document.createElement("div");
   body.className = "window-body";
@@ -1905,6 +2107,8 @@ function createImageWindow(image, dropPoint, placementIndex) {
 
   body.append(canvas, overlay, ...resizeHandles);
   frame.append(titlebar, body);
+  if (inputPort) frame.append(inputPort);
+  frame.append(outputPort);
   windowLayer.append(frame);
 
   image.elements = {
@@ -1916,15 +2120,15 @@ function createImageWindow(image, dropPoint, placementIndex) {
     resizeHandles,
     closeButton,
     size,
-    modeTabs,
-    originalButton,
-    glslButton
+    nodeBadge,
+    inputPort,
+    outputPort
   };
 
   frame.addEventListener("pointerdown", () => selectImage(image));
 
   titlebar.addEventListener("pointerdown", (event) => {
-    if (event.target.closest(".window-close, .window-mode-tabs")) {
+    if (event.target.closest(".window-close, .node-kind-badge, .node-port")) {
       return;
     }
     if (event.button !== 0) {
@@ -1943,16 +2147,22 @@ function createImageWindow(image, dropPoint, placementIndex) {
     titlebar.setPointerCapture(event.pointerId);
   });
 
-  modeTabs.addEventListener("pointerdown", (event) => event.stopPropagation());
-  originalButton.addEventListener("click", (event) => {
+  nodeBadge.addEventListener("pointerdown", (event) => event.stopPropagation());
+  nodeBadge.addEventListener("click", (event) => {
     event.stopPropagation();
     selectImage(image);
-    switchImageMode(image, "original");
+    if (image.nodeKind === "glsl") bindGlslEditor(image, true);
   });
-  glslButton.addEventListener("click", (event) => {
+
+  outputPort.addEventListener("pointerdown", (event) => beginConnectionDrag(image, event));
+  inputPort?.addEventListener("pointerdown", (event) => {
     event.stopPropagation();
     selectImage(image);
-    openGlslEditor(image);
+  });
+  inputPort?.addEventListener("dblclick", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    disconnectGlslInput(image);
   });
 
   closeButton.addEventListener("pointerdown", (event) => event.stopPropagation());
@@ -2095,8 +2305,166 @@ function createImageWindow(image, dropPoint, placementIndex) {
     zoomAt(image, x, y, image.view.scale * factor);
   });
 
-  updateImageModeTabs(image);
   applyWindowGeometry(image);
+  requestConnectionDraw();
+}
+
+let connectionRafPending = false;
+
+function requestConnectionDraw() {
+  if (connectionRafPending) return;
+  connectionRafPending = true;
+  requestAnimationFrame(() => {
+    connectionRafPending = false;
+    drawNodeConnections();
+  });
+}
+
+function nodePortPoint(port) {
+  const viewportRect = viewport.getBoundingClientRect();
+  const rect = port?.getBoundingClientRect();
+  if (!rect) return null;
+  return {
+    x: rect.left + rect.width / 2 - viewportRect.left,
+    y: rect.top + rect.height / 2 - viewportRect.top
+  };
+}
+
+function connectionPath(from, to) {
+  const bend = Math.max(48, Math.abs(to.x - from.x) * 0.5);
+  return `M ${from.x} ${from.y} C ${from.x + bend} ${from.y}, ${to.x - bend} ${to.y}, ${to.x} ${to.y}`;
+}
+
+function appendConnectionPath(from, to, className = "node-connection") {
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("class", className);
+  path.setAttribute("d", connectionPath(from, to));
+  connectionLayer.append(path);
+}
+
+function drawNodeConnections() {
+  const viewportRect = viewport.getBoundingClientRect();
+  connectionLayer.setAttribute("viewBox", `0 0 ${Math.max(1, viewportRect.width)} ${Math.max(1, viewportRect.height)}`);
+  connectionLayer.replaceChildren();
+
+  for (const target of images) {
+    if (target.nodeKind !== "glsl" || target.inputNodeId == null) continue;
+    const source = images.find((image) => image.id === target.inputNodeId);
+    const from = nodePortPoint(source?.elements?.outputPort);
+    const to = nodePortPoint(target.elements?.inputPort);
+    if (from && to) appendConnectionPath(from, to);
+  }
+
+  if (activeDrag?.kind === "connect") {
+    const from = nodePortPoint(activeDrag.source.elements?.outputPort);
+    const viewportX = activeDrag.clientX - viewportRect.left;
+    const viewportY = activeDrag.clientY - viewportRect.top;
+    if (from) {
+      appendConnectionPath(
+        from,
+        { x: viewportX, y: viewportY },
+        `node-connection preview${activeDrag.valid === false ? " invalid" : ""}`
+      );
+    }
+  }
+}
+
+function connectionTargetAt(clientX, clientY) {
+  return document.elementFromPoint(clientX, clientY)?.closest?.(".node-port-input") || null;
+}
+
+function nodeDependsOn(node, ancestorId) {
+  const visited = new Set();
+  let current = node;
+  while (current?.nodeKind === "glsl" && current.inputNodeId != null && !visited.has(current.id)) {
+    if (current.inputNodeId === ancestorId) return true;
+    visited.add(current.id);
+    current = images.find((image) => image.id === current.inputNodeId) || null;
+  }
+  return false;
+}
+
+function canConnectNodes(source, target) {
+  return Boolean(
+    source
+    && target?.nodeKind === "glsl"
+    && source.id !== target.id
+    && !nodeDependsOn(source, target.id)
+  );
+}
+
+function beginConnectionDrag(source, event) {
+  if (event.button !== 0) return;
+  event.preventDefault();
+  event.stopPropagation();
+  selectImage(source);
+  activeDrag = {
+    kind: "connect",
+    source,
+    startX: event.clientX,
+    startY: event.clientY,
+    clientX: event.clientX,
+    clientY: event.clientY,
+    valid: true,
+    targetPort: null
+  };
+  source.elements.outputPort.setPointerCapture(event.pointerId);
+  requestConnectionDraw();
+}
+
+function updateConnectionDrag(event) {
+  const drag = activeDrag;
+  if (drag?.kind !== "connect") return;
+  drag.clientX = event.clientX;
+  drag.clientY = event.clientY;
+  drag.targetPort?.classList.remove("connect-target");
+  drag.targetPort = connectionTargetAt(event.clientX, event.clientY);
+  const target = drag.targetPort
+    ? images.find((image) => image.id === Number(drag.targetPort.dataset.nodeId))
+    : null;
+  drag.valid = !target || canConnectNodes(drag.source, target);
+  drag.targetPort?.classList.toggle("connect-target", drag.valid);
+  requestConnectionDraw();
+}
+
+function finishConnectionDrag(event) {
+  const drag = activeDrag;
+  if (drag?.kind !== "connect") return false;
+  updateConnectionDrag(event);
+  const target = drag.targetPort
+    ? images.find((image) => image.id === Number(drag.targetPort.dataset.nodeId))
+    : null;
+  drag.targetPort?.classList.remove("connect-target");
+  if (target && canConnectNodes(drag.source, target)) {
+    connectNodes(drag.source, target);
+  } else if (target) {
+    fileHint.textContent = "Connection rejected: GLSL nodes cannot form a cycle.";
+  }
+  requestConnectionDraw();
+  return true;
+}
+
+function connectNodes(source, target) {
+  if (!canConnectNodes(source, target)) return false;
+  target.inputNodeId = source.id;
+  target.resolutionMode = "follow-input";
+  evaluateGlslBranch(target);
+  if (glslTargetId === target.id) bindGlslEditor(target);
+  fileHint.textContent = `Connected ${source.name} → ${target.name}`;
+  requestConnectionDraw();
+  scheduleSessionSave();
+  return true;
+}
+
+function disconnectGlslInput(target) {
+  if (target?.nodeKind !== "glsl" || target.inputNodeId == null) return;
+  target.inputNodeId = null;
+  target.resolutionMode = "custom";
+  if (glslTargetId === target.id) bindGlslEditor(target);
+  evaluateGlslBranch(target);
+  fileHint.textContent = `Disconnected input from ${target.name}`;
+  requestConnectionDraw();
+  scheduleSessionSave();
 }
 
 function selectImage(image, forceRefresh = false) {
@@ -2107,6 +2475,7 @@ function selectImage(image, forceRefresh = false) {
     image.elements?.frame.style.setProperty("z-index", String(image.window.z));
   }
   if (!selectionChanged && !forceRefresh) {
+    if (image.nodeKind === "glsl" && glslPanel.classList.contains("hidden")) bindGlslEditor(image);
     return;
   }
   for (const item of images) {
@@ -2118,7 +2487,7 @@ function selectImage(image, forceRefresh = false) {
   requestSelectionGraphDraw();
   updateViewState();
   syncGlslEditorForSelection();
-  syncGlslShareUrl(image);
+  if (image.id === selectedId) syncGlslShareUrl(image);
   scheduleSessionSave();
 }
 
@@ -2146,6 +2515,7 @@ function applyWindowGeometry(image) {
   frame.style.width = `${image.window.width}px`;
   frame.style.height = `${image.window.height}px`;
   frame.style.zIndex = String(image.window.z);
+  requestConnectionDraw();
 }
 
 function resizeImageWindow(drag, dx, dy) {
@@ -2257,6 +2627,7 @@ function closeImage(image) {
   if (index === -1) {
     return;
   }
+  const disconnected = images.filter((item) => item.nodeKind === "glsl" && item.inputNodeId === image.id);
   if (image.pickers.some((picker) => picker.id === selectedPickerId)) {
     selectedPickerId = null;
   }
@@ -2267,13 +2638,18 @@ function closeImage(image) {
     webGpuRenderer.disposeCanvas(image.elements.canvas);
   }
   image.elements?.frame.remove();
-  const rasterSources = new Set([
-    image.rasterSource,
-    image.original?.rasterSource,
-    image.glsl?.rasterSource
-  ]);
-  rasterSources.forEach((source) => source?.dispose?.());
+  if (image.nodeKind === "source") {
+    if (image.sourceAsset) releaseSourceAsset(image.sourceAsset);
+    else image.rasterSource?.dispose?.();
+  } else {
+    image.rasterSource?.dispose?.();
+  }
   images.splice(index, 1);
+  for (const target of disconnected) {
+    target.inputNodeId = null;
+    target.resolutionMode = "custom";
+    evaluateGlslBranch(target);
+  }
   if (glslTargetId === image.id) {
     closeGlslEditor();
   }
@@ -2288,14 +2664,14 @@ function closeImage(image) {
   requestSelectionGraphDraw();
   syncGlslEditorForSelection();
   requestRender();
+  requestConnectionDraw();
   scheduleSessionSave();
 }
 
 // ---- GLSL エディタ ----
 //
-// 画像ウィンドウは Original / GLSL の表示データを内部に持ち、既存機能が読む
-// pixels / width / height だけをタブ切替時に差し替える。New Image は GLSL のみ。
-// エディタは選択中かつ GLSL 表示中のウィンドウにだけ自動で束縛する。
+// SOURCE はデコード済みLinear画素だけを出力し、GLSL は接続元の出力を処理する。
+// エディタは選択中のGLSLノードにだけ自動で束縛する。
 
 const glslRunDelay = 300;
 let glslTargetId = null;
@@ -2306,39 +2682,14 @@ function glslTargetImage() {
   return images.find((image) => image.id === glslTargetId) || null;
 }
 
-function imageVariant(image) {
-  return {
-    width: image.width,
-    height: image.height,
-    sourceWidth: image.sourceWidth,
-    sourceHeight: image.sourceHeight,
-    downsample: image.downsample,
-    type: image.type,
-    sourceFormat: image.sourceFormat,
-    format: image.format,
-    bitDepth: image.bitDepth,
-    hdr: image.hdr,
-    valueUnit: image.valueUnit,
-    colorPrimaries: image.colorPrimaries,
-    transfer: image.transfer,
-    matrix: image.matrix,
-    fullRange: image.fullRange,
-    displayRange: image.displayRange,
-    displayInvert: image.displayInvert,
-    integerEncoding: image.integerEncoding,
-    name: image.name,
-    pixels: image.pixels,
-    rasterSource: image.rasterSource,
-    range: image.range
-  };
-}
-
-function glslVariant(code, pixels, width, height) {
+function glslVariant(code, pixels, width, height, rasterSource = createMemoryRasterSource(pixels, width, height)) {
   return {
     code,
     renderedCode: code,
     width,
     height,
+    requestedWidth: width,
+    requestedHeight: height,
     sourceWidth: width,
     sourceHeight: height,
     downsample: 1,
@@ -2356,19 +2707,21 @@ function glslVariant(code, pixels, width, height) {
     displayInvert: false,
     integerEncoding: null,
     pixels,
-    rasterSource: createMemoryRasterSource(pixels, width, height),
+    rasterSource,
     range: computeRange(pixels)
   };
 }
 
 function glslInputPayload(image) {
-  const input = image?.original;
+  const input = image?.nodeKind === "glsl" && image.inputNodeId != null
+    ? images.find((candidate) => candidate.id === image.inputNodeId) || null
+    : null;
   if (!input) {
     return null;
   }
   const dimensions = fitLongEdge(input.width, input.height, 4096);
   if (input.pixels && dimensions.width === input.width && dimensions.height === input.height) {
-    return { pixels: input.pixels, width: input.width, height: input.height, key: `${image.id}:original` };
+    return { pixels: input.pixels, width: input.width, height: input.height, key: `${input.id}:${input.outputRevision || 0}` };
   }
   const cached = image.glslInputPreview;
   if (
@@ -2397,7 +2750,7 @@ function glslInputPayload(image) {
     pixels,
     width: dimensions.width,
     height: dimensions.height,
-    key: `${image.id}:original-preview-${dimensions.width}x${dimensions.height}`
+    key: `${input.id}:${input.outputRevision || 0}:preview-${dimensions.width}x${dimensions.height}`
   };
   image.glslInputPreview = { sourceIdentity: input.rasterSource, width: dimensions.width, height: dimensions.height, payload };
   return payload;
@@ -2440,78 +2793,6 @@ function resampleLinearPixels(source, sourceWidth, sourceHeight, width, height) 
   return output;
 }
 
-function applyImageVariant(image, mode) {
-  const variant = mode === "glsl" ? image.glsl : image.original;
-  if (!variant) {
-    return false;
-  }
-  const sizeChanged = image.width !== variant.width || image.height !== variant.height;
-  image.mode = mode;
-  image.width = variant.width;
-  image.height = variant.height;
-  image.sourceWidth = variant.sourceWidth;
-  image.sourceHeight = variant.sourceHeight;
-  image.downsample = variant.downsample;
-  image.type = variant.type;
-  image.sourceFormat = variant.sourceFormat;
-  image.format = variant.format;
-  image.bitDepth = variant.bitDepth;
-  image.hdr = Boolean(variant.hdr);
-  image.valueUnit = variant.valueUnit || "relative";
-  image.colorPrimaries = variant.colorPrimaries || null;
-  image.transfer = variant.transfer || null;
-  image.matrix = variant.matrix || null;
-  image.fullRange = variant.fullRange ?? null;
-  image.displayRange = variant.displayRange || null;
-  image.displayInvert = Boolean(variant.displayInvert);
-  image.integerEncoding = variant.integerEncoding || null;
-  image.pixels = variant.pixels;
-  image.rasterSource = variant.rasterSource;
-  image.range = variant.range;
-  image.displayDirty = true;
-
-  if (sizeChanged) {
-    image.pickers = image.pickers.filter((picker) => picker.x < image.width && picker.y < image.height);
-    image.selection = image.selection ? clampSavedRect(image.selection, image.width, image.height) : null;
-    if (image.view.fit) {
-      fitImageToWindow(image, false);
-    }
-  }
-  selectionDetailsCache.delete(image);
-  cancelSelectionDetailsWork();
-  cancelSelectionMatrixCopy();
-  updateImageModeTabs(image);
-  updateImageWindowSize(image);
-  updateSettingsPanel();
-  updatePickerPanel();
-  updateSelectionPanel();
-  requestSelectionGraphDraw();
-  requestRender();
-  scheduleSessionSave();
-  return true;
-}
-
-function switchImageMode(image, mode) {
-  if (image.mode !== mode) {
-    if (!applyImageVariant(image, mode)) {
-      return;
-    }
-  }
-  syncGlslEditorForSelection(mode === "glsl");
-  syncGlslShareUrl(image);
-}
-
-function updateImageModeTabs(image) {
-  const elements = image.elements;
-  if (!elements) {
-    return;
-  }
-  const generatedOnly = Boolean(image.glsl && !image.original);
-  elements.originalButton.hidden = generatedOnly;
-  elements.originalButton.classList.toggle("active", image.mode === "original");
-  elements.glslButton.classList.toggle("active", image.mode === "glsl");
-}
-
 function updateImageWindowSize(image) {
   if (image.elements?.size) {
     const label = imageInfoLabel(image);
@@ -2543,8 +2824,8 @@ function openGlslEditor(sourceImage) {
     return;
   }
 
-  if (sourceImage?.glsl) {
-    switchImageMode(sourceImage, "glsl");
+  if (sourceImage?.nodeKind === "glsl") {
+    bindGlslEditor(sourceImage, true);
     return;
   }
 
@@ -2552,41 +2833,55 @@ function openGlslEditor(sourceImage) {
   let width = 1024;
   let height = 1024;
 
-  // 元画像は参照だけを保持するため、タブを増やしても画素配列は複製しない。
-  if (sourceImage) {
-    sourceImage.original = imageVariant(sourceImage);
-    const preview = glslInputPayload(sourceImage);
+  const inputNodeId = sourceImage?.id ?? null;
+  const inputTarget = { nodeKind: "glsl", inputNodeId };
+  if (inputNodeId != null) {
+    const preview = glslInputPayload(inputTarget);
     width = preview.width;
     height = preview.height;
   }
 
   let pixels;
   try {
-    pixels = runGlslShader({ code, input: glslInputPayload(sourceImage), width, height });
+    pixels = runGlslShader({ code, input: glslInputPayload(inputTarget), width, height });
   } catch (error) {
-    if (sourceImage) {
-      sourceImage.original = null;
-    }
     fileHint.textContent = `GLSL failed: ${error.message}`;
     return;
   }
 
-  if (sourceImage) {
-    sourceImage.glsl = glslVariant(code, pixels, width, height);
-    applyImageVariant(sourceImage, "glsl");
-    bindGlslEditor(sourceImage, true);
-    return;
-  }
-
-  addGeneratedGlslImage({ code, renderedCode: code, pixels, width, height, focusEditor: true });
+  addGeneratedGlslImage({
+    code,
+    renderedCode: code,
+    pixels,
+    width,
+    height,
+    focusEditor: true,
+    inputNodeId,
+    resolutionMode: inputNodeId == null ? "custom" : "follow-input",
+    sourceImage
+  });
 }
 
-function addGeneratedGlslImage({ code, renderedCode, pixels, width, height, focusEditor, errorMessage = "" }) {
+function addGeneratedGlslImage({
+  code,
+  renderedCode,
+  pixels,
+  width,
+  height,
+  focusEditor,
+  errorMessage = "",
+  inputNodeId = null,
+  resolutionMode = "custom",
+  sourceImage = null,
+  name = null
+}) {
   glslGeneratedCount += 1;
-  const image = createImageRecord({ name: `glsl${glslGeneratedCount}` }, width, height, "glsl/linear", pixels, "glsl");
+  const image = createImageRecord({ name: name || `glsl${glslGeneratedCount}` }, width, height, "glsl/linear", pixels, "glsl");
   image.source = { kind: "glsl-generated" };
-  image.mode = "glsl";
-  image.glsl = glslVariant(code, pixels, width, height);
+  image.nodeKind = "glsl";
+  image.inputNodeId = inputNodeId;
+  image.resolutionMode = resolutionMode;
+  image.glsl = glslVariant(code, pixels, width, height, image.rasterSource);
   image.glsl.renderedCode = renderedCode;
   if (errorMessage) {
     image.glsl.statusKind = "error";
@@ -2595,6 +2890,11 @@ function addGeneratedGlslImage({ code, renderedCode, pixels, width, height, focu
 
   images.push(image);
   createImageWindow(image, null, 0);
+  if (sourceImage) {
+    image.window.x = sourceImage.window.x + sourceImage.window.width + 70;
+    image.window.y = sourceImage.window.y;
+    applyWindowGeometry(image);
+  }
   selectImage(image);
   fitImageToWindow(image, false);
   dropPrompt.classList.add("hidden");
@@ -2604,6 +2904,40 @@ function addGeneratedGlslImage({ code, renderedCode, pixels, width, height, focu
   if (focusEditor) {
     glslCodeInput.focus();
   }
+  return image;
+}
+
+function duplicateGlslNode(snapshot) {
+  const inputNodeId = images.some((image) => image.id === snapshot.inputNodeId) ? snapshot.inputNodeId : null;
+  const resolutionMode = inputNodeId == null ? "custom" : snapshot.resolutionMode;
+  const inputTarget = { nodeKind: "glsl", inputNodeId };
+  const input = glslInputPayload(inputTarget);
+  const width = resolutionMode === "follow-input" && input ? input.width : snapshot.width;
+  const height = resolutionMode === "follow-input" && input ? input.height : snapshot.height;
+  let pixels;
+  try {
+    pixels = runGlslShader({ code: snapshot.renderedCode, input, width, height });
+  } catch (error) {
+    fileHint.textContent = `Paste failed: ${error?.message || error}`;
+    return null;
+  }
+  const image = addGeneratedGlslImage({
+    code: snapshot.code,
+    renderedCode: snapshot.renderedCode,
+    pixels,
+    width,
+    height,
+    focusEditor: false,
+    inputNodeId,
+    resolutionMode,
+    name: `${snapshot.name} copy`
+  });
+  image.settings = { ...snapshot.settings };
+  image.exportSettings = { ...snapshot.exportSettings };
+  image.view = { ...snapshot.view };
+  image.window = { ...snapshot.window, x: snapshot.window.x + 28, y: snapshot.window.y + 28, z: ++topZ };
+  applyWindowGeometry(image);
+  selectImage(image, true);
   return image;
 }
 
@@ -2676,7 +3010,7 @@ function openSharedGlslImage({ code, width, height }) {
 }
 
 function isShareableGlslImage(image) {
-  return Boolean(image?.glsl && !image.original && image.source?.kind === "glsl-generated");
+  return Boolean(image?.nodeKind === "glsl" && image.inputNodeId == null && image.source?.kind === "glsl-generated");
 }
 
 function replaceUrlHash(hash) {
@@ -2716,8 +3050,26 @@ function bindGlslEditor(image, focusEditor = false) {
   glslTargetId = image.id;
   glslTitleText.textContent = `GLSL - ${image.name}`;
   glslCodeInput.value = image.glsl.code;
-  glslWidthInput.value = String(image.glsl.width);
-  glslHeightInput.value = String(image.glsl.height);
+  let requestedWidth = image.glsl.requestedWidth || image.glsl.width;
+  let requestedHeight = image.glsl.requestedHeight || image.glsl.height;
+  if (image.inputNodeId != null && image.resolutionMode === "follow-input") {
+    try {
+      const input = glslInputPayload(image);
+      if (input) {
+        requestedWidth = input.width;
+        requestedHeight = input.height;
+      }
+    } catch {
+      // Keep the last successful dimensions while the input is unavailable.
+    }
+  }
+  glslWidthInput.value = String(requestedWidth);
+  glslHeightInput.value = String(requestedHeight);
+  glslResolutionMode.value = image.inputNodeId == null ? "custom" : image.resolutionMode;
+  const followsInput = image.inputNodeId != null && image.resolutionMode === "follow-input";
+  glslWidthInput.disabled = followsInput;
+  glslHeightInput.disabled = followsInput;
+  glslResolutionMode.querySelector('option[value="follow-input"]').disabled = image.inputNodeId == null;
   glslPresetSelect.value = "";
   updateGlslInputLabel(image);
   glslPanel.classList.remove("hidden");
@@ -2736,23 +3088,23 @@ function closeGlslEditor() {
 }
 
 function updateGlslInputLabel(image) {
-  const input = image.original;
+  const input = image.inputNodeId == null
+    ? null
+    : images.find((candidate) => candidate.id === image.inputNodeId) || null;
   if (input) {
     const preview = glslInputPayload(image);
     const label = preview.width === input.width && preview.height === input.height
       ? `${preview.width}x${preview.height}`
       : `${preview.width}x${preview.height} preview`;
     glslInputLabel.textContent = `${input.name} (${label})`;
-    glslMatchInputButton.disabled = false;
     return;
   }
-  glslMatchInputButton.disabled = true;
   glslInputLabel.textContent = "none (generate)";
 }
 
 function syncGlslEditorForSelection(focusEditor = false) {
   const image = currentImage();
-  const shouldShow = Boolean(image && image.mode === "glsl" && image.glsl);
+  const shouldShow = Boolean(image?.nodeKind === "glsl" && image.glsl);
   if (!shouldShow) {
     closeGlslEditor();
     return;
@@ -2779,7 +3131,7 @@ function cancelGlslRun() {
 
 function scheduleGlslRun() {
   const target = glslTargetImage();
-  if (!target || target.mode !== "glsl") {
+  if (!target || target.nodeKind !== "glsl") {
     return;
   }
   cancelGlslRun();
@@ -2802,34 +3154,60 @@ function runGlslNow() {
     return;
   }
 
-  const code = glslCodeInput.value;
-  const width = glslSizeValue(glslWidthInput, target.glsl.width);
-  const height = glslSizeValue(glslHeightInput, target.glsl.height);
+  target.glsl.code = glslCodeInput.value;
+  if (target.resolutionMode === "custom") {
+    target.glsl.requestedWidth = glslSizeValue(glslWidthInput, target.glsl.requestedWidth || target.glsl.width);
+    target.glsl.requestedHeight = glslSizeValue(glslHeightInput, target.glsl.requestedHeight || target.glsl.height);
+  }
+  evaluateGlslBranch(target, true);
+}
 
-  // シェーダ実行だけでなく反映処理まで含めて捕まえる。ここで抜けると
-  // ステータスが "Compiling..." のまま戻らなくなるため、必ずどちらかの結果を出す。
+function evaluateGlslNode(image, reportStatus = false) {
   try {
+    const input = glslInputPayload(image);
+    const width = image.resolutionMode === "follow-input" && input
+      ? input.width
+      : image.glsl.requestedWidth || image.glsl.width;
+    const height = image.resolutionMode === "follow-input" && input
+      ? input.height
+      : image.glsl.requestedHeight || image.glsl.height;
     const shaderStarted = performance.now();
-    const pixels = runGlslShader({ code, input: glslInputPayload(target), width, height });
+    const pixels = runGlslShader({ code: image.glsl.code, input, width, height });
     const shaderMs = performance.now() - shaderStarted;
-
     const applyStarted = performance.now();
-    applyGlslResult(target, pixels, width, height, code);
+    applyGlslResult(image, pixels, width, height, image.glsl.code);
     const applyMs = performance.now() - applyStarted;
-
-    setGlslStatus(
-      "ok",
-      `Updated ${width} x ${height} - shader ${Math.round(shaderMs)} ms, display ${Math.round(applyMs)} ms`
-    );
+    if (reportStatus || glslTargetId === image.id) {
+      setGlslStatus(
+        "ok",
+        `Updated ${width} x ${height} - shader ${Math.round(shaderMs)} ms, display ${Math.round(applyMs)} ms`
+      );
+    }
+    return true;
   } catch (error) {
-    // 失敗しても直前に成功した出力を残す（編集中に画像が壊れないようにする）
     console.error("GLSL run failed.", error);
     const message = error?.log || error?.message || String(error);
-    target.glsl.statusKind = "error";
-    target.glsl.status = message;
-    setGlslStatus("error", message);
+    image.glsl.statusKind = "error";
+    image.glsl.status = message;
+    if (reportStatus || glslTargetId === image.id) setGlslStatus("error", message);
     scheduleSessionSave();
+    return false;
   }
+}
+
+function evaluateGlslBranch(root, reportRootStatus = false) {
+  const queue = [root];
+  const visited = new Set();
+  while (queue.length > 0) {
+    const node = queue.shift();
+    if (!node || node.nodeKind !== "glsl" || visited.has(node.id)) continue;
+    visited.add(node.id);
+    if (!evaluateGlslNode(node, reportRootStatus && node.id === root.id)) continue;
+    for (const child of images) {
+      if (child.nodeKind === "glsl" && child.inputNodeId === node.id) queue.push(child);
+    }
+  }
+  requestConnectionDraw();
 }
 
 function applyGlslResult(image, pixels, width, height, code) {
@@ -2855,6 +3233,8 @@ function applyGlslResult(image, pixels, width, height, code) {
     pixels,
     width,
     height,
+    requestedWidth: width,
+    requestedHeight: height,
     sourceWidth: width,
     sourceHeight: height,
     downsample: 1,
@@ -2867,6 +3247,8 @@ function applyGlslResult(image, pixels, width, height, code) {
     statusKind: "ok",
     status: "Ready."
   };
+  image.outputRevision += 1;
+  image.glslInputPreview = null;
   image.displayDirty = true;
 
   if (sizeChanged) {
@@ -2886,7 +3268,7 @@ function applyGlslResult(image, pixels, width, height, code) {
   updateSelectionPanel();
   requestSelectionGraphDraw();
   requestRender();
-  syncGlslShareUrl(image);
+  if (image.id === selectedId) syncGlslShareUrl(image);
   scheduleSessionSave();
 }
 
@@ -2957,6 +3339,27 @@ function initGlslEditor() {
     syncGlslShareUrl(glslTargetImage());
     scheduleGlslRun();
   });
+  glslResolutionMode.addEventListener("change", () => {
+    const target = glslTargetImage();
+    if (!target?.glsl) return;
+    const hasInput = target.inputNodeId != null;
+    target.resolutionMode = hasInput && glslResolutionMode.value === "follow-input"
+      ? "follow-input"
+      : "custom";
+    if (target.resolutionMode === "follow-input") {
+      const input = glslInputPayload(target);
+      if (input) {
+        target.glsl.requestedWidth = input.width;
+        target.glsl.requestedHeight = input.height;
+        glslWidthInput.value = String(input.width);
+        glslHeightInput.value = String(input.height);
+      }
+    }
+    glslWidthInput.disabled = target.resolutionMode === "follow-input";
+    glslHeightInput.disabled = target.resolutionMode === "follow-input";
+    scheduleGlslRun();
+    scheduleSessionSave();
+  });
 
   glslPresetSelect.addEventListener("change", () => {
     // "Custom" の value は空文字。Number("") は 0 になってしまうので数値として扱わない。
@@ -2971,18 +3374,6 @@ function initGlslEditor() {
       target.glsl.code = preset.code;
     }
     syncGlslShareUrl(target);
-    scheduleGlslRun();
-  });
-
-  glslMatchInputButton.addEventListener("click", () => {
-    const target = glslTargetImage();
-    const input = target?.original;
-    if (!input) {
-      return;
-    }
-    const preview = glslInputPayload(target);
-    glslWidthInput.value = String(preview.width);
-    glslHeightInput.value = String(preview.height);
     scheduleGlslRun();
   });
 
@@ -4007,7 +4398,7 @@ async function restoreSavedSession() {
     const db = await openSessionDb();
     const session = await idbGet(db, sessionStoreName, sessionKey);
     db.close();
-    if (!session || session.version !== 1) {
+    if (!session || session.version !== 2) {
       return;
     }
 
@@ -4015,22 +4406,44 @@ async function restoreSavedSession() {
 
     let restoredCount = 0;
     let skippedCount = 0;
-    for (const savedImage of session.images || []) {
-      try {
-        const image = await restoreImageFromSession(savedImage);
-        if (!image) {
-          skippedCount += 1;
+    const restoredById = new Map();
+    let pending = [...(session.images || [])];
+    while (pending.length > 0) {
+      let progressed = false;
+      const nextPending = [];
+      for (const savedImage of pending) {
+        const dependencyId = savedImage.nodeKind === "glsl"
+          ? savedImage.inputNodeId
+          : savedImage.source?.kind === "shared" ? savedImage.source.ownerNodeId : null;
+        if (dependencyId != null && !restoredById.has(dependencyId)) {
+          nextPending.push(savedImage);
           continue;
         }
-        images.push(image);
-        createImageWindow(image, null, restoredCount);
-        applySavedImageState(image, savedImage);
-        applyWindowGeometry(image);
-        restoredCount += 1;
-      } catch (error) {
-        skippedCount += 1;
-        console.warn("Saved image restore skipped.", error);
+        try {
+          const image = await restoreImageFromSession(savedImage, restoredById);
+          if (!image) {
+            skippedCount += 1;
+            progressed = true;
+            continue;
+          }
+          applySavedImageState(image, savedImage);
+          images.push(image);
+          restoredById.set(savedImage.id, image);
+          createImageWindow(image, null, restoredCount);
+          applyWindowGeometry(image);
+          restoredCount += 1;
+          progressed = true;
+        } catch (error) {
+          skippedCount += 1;
+          progressed = true;
+          console.warn("Saved node restore skipped.", error);
+        }
       }
+      if (!progressed) {
+        skippedCount += nextPending.length;
+        break;
+      }
+      pending = nextPending;
     }
 
     nextId = Math.max(nextId, ...images.map((image) => image.id + 1), session.nextId || 1);
@@ -4053,6 +4466,7 @@ async function restoreSavedSession() {
     updatePickerPanel();
     updatePickerCursor();
     requestRender();
+    requestConnectionDraw();
 
     if (restoredCount > 0 || skippedCount > 0) {
       fileHint.textContent = skippedCount > 0
@@ -4067,8 +4481,9 @@ async function restoreSavedSession() {
 }
 
 function buildSessionRecord() {
+  const assetOwners = new Map();
   return {
-    version: 1,
+    version: 2,
     savedAt: Date.now(),
     selectedId,
     nextId,
@@ -4086,11 +4501,11 @@ function buildSessionRecord() {
       graph: panelSessionState(selectionGraphPanel),
       glsl: panelSessionState(glslPanel)
     },
-    images: images.map(imageSessionState)
+    images: images.map((image) => imageSessionState(image, assetOwners))
   };
 }
 
-function imageSessionState(image) {
+function imageSessionState(image, assetOwners) {
   return {
     id: image.id,
     name: image.name,
@@ -4106,32 +4521,34 @@ function imageSessionState(image) {
     transfer: image.transfer,
     matrix: image.matrix,
     fullRange: image.fullRange,
-    source: imageSourceSessionState(image),
+    nodeKind: image.nodeKind,
+    inputNodeId: image.nodeKind === "glsl" ? image.inputNodeId : null,
+    resolutionMode: image.nodeKind === "glsl" ? image.resolutionMode : null,
+    source: imageSourceSessionState(image, assetOwners),
     settings: { ...image.settings },
     exportSettings: { ...ensureExportSettings(image) },
     view: { ...image.view },
     pickers: image.pickers.map((picker) => ({ ...picker })),
     selection: image.selection ? { ...image.selection } : null,
     window: { ...image.window },
-    // 巨大な出力画素は保存せず、復元時に最後に成功したコードから再生成する。
     glsl: image.glsl ? {
       code: image.glsl.code,
       renderedCode: image.glsl.renderedCode || image.glsl.code,
-      width: image.glsl.width,
-      height: image.glsl.height,
-      mode: image.mode,
-      generator: !image.original
+      width: image.glsl.requestedWidth || image.glsl.width,
+      height: image.glsl.requestedHeight || image.glsl.height
     } : null
   };
 }
 
-function imageSourceSessionState(image) {
+function imageSourceSessionState(image, assetOwners) {
+  if (image.nodeKind === "glsl") return { kind: "glsl-node" };
+  const asset = ensureSourceAsset(image);
+  const ownerNodeId = assetOwners.get(asset);
+  if (ownerNodeId != null) return { kind: "shared", ownerNodeId };
+  assetOwners.set(asset, image.id);
   const source = image.source || { kind: "external" };
-  if (source.kind === "glsl-generated") {
-    return { kind: "glsl-generated" };
-  }
   if (source.kind === "embedded") {
-    const stored = image.original || image;
+    const stored = image;
     return {
       kind: "embedded",
       width: stored.width,
@@ -4215,13 +4632,21 @@ function applyPanelSessionState(panel, state) {
   }
 }
 
-async function restoreImageFromSession(savedImage) {
+async function restoreImageFromSession(savedImage, restoredById) {
   const source = savedImage.source || {};
-  if (source.kind === "glsl-generated" && savedImage.glsl && typeof savedImage.glsl.code === "string") {
-    const width = Math.max(1, Math.floor(Number(savedImage.glsl.width) || 1024));
-    const height = Math.max(1, Math.floor(Number(savedImage.glsl.height) || 1024));
+  if (savedImage.nodeKind === "glsl" && savedImage.glsl && typeof savedImage.glsl.code === "string") {
+    const inputNodeId = savedImage.inputNodeId ?? null;
+    const inputTarget = { nodeKind: "glsl", inputNodeId };
+    const input = glslInputPayload(inputTarget);
+    const resolutionMode = input && savedImage.resolutionMode === "follow-input" ? "follow-input" : "custom";
+    const width = resolutionMode === "follow-input"
+      ? input.width
+      : Math.max(1, Math.floor(Number(savedImage.glsl.width) || 1024));
+    const height = resolutionMode === "follow-input"
+      ? input.height
+      : Math.max(1, Math.floor(Number(savedImage.glsl.height) || 1024));
     const renderedCode = savedImage.glsl.renderedCode || savedImage.glsl.code;
-    const pixels = runGlslShader({ code: renderedCode, input: null, width, height });
+    const pixels = runGlslShader({ code: renderedCode, input, width, height });
     const image = createImageRecord(
       { name: savedImage.name || "glsl image" },
       width,
@@ -4231,6 +4656,47 @@ async function restoreImageFromSession(savedImage) {
       "glsl"
     );
     image.source = { kind: "glsl-generated" };
+    image.nodeKind = "glsl";
+    image.inputNodeId = inputNodeId;
+    image.resolutionMode = resolutionMode;
+    image.glsl = glslVariant(renderedCode, pixels, width, height, image.rasterSource);
+    image.glsl.code = savedImage.glsl.code;
+    image.glsl.renderedCode = renderedCode;
+    return image;
+  }
+  if (source.kind === "shared") {
+    const owner = restoredById.get(source.ownerNodeId);
+    const asset = retainSourceAsset(ensureSourceAsset(owner));
+    if (!owner || !asset) return null;
+    const image = createImageRecord(
+      { name: savedImage.name || `${owner.name} copy` },
+      owner.width,
+      owner.height,
+      owner.type,
+      asset.pixels,
+      owner.sourceFormat,
+      {
+        rasterSource: asset.rasterSource,
+        range: owner.range,
+        sourceWidth: owner.sourceWidth,
+        sourceHeight: owner.sourceHeight,
+        downsample: owner.downsample,
+        format: owner.format,
+        bitDepth: owner.bitDepth,
+        hdr: owner.hdr,
+        valueUnit: owner.valueUnit,
+        colorPrimaries: owner.colorPrimaries,
+        transfer: owner.transfer,
+        matrix: owner.matrix,
+        fullRange: owner.fullRange,
+        displayRange: owner.displayRange,
+        displayInvert: owner.displayInvert,
+        integerEncoding: owner.integerEncoding,
+        overview: owner.overview
+      }
+    );
+    image.source = owner.source;
+    image.sourceAsset = asset;
     return image;
   }
   if (source.kind === "embedded" && source.pixels instanceof ArrayBuffer) {
@@ -4301,33 +4767,6 @@ function applySavedImageState(image, savedImage) {
     ? savedImage.pickers.filter((picker) => Number.isInteger(picker.x) && Number.isInteger(picker.y)).map((picker) => ({ ...picker }))
     : [];
   const savedSelection = savedImage.selection ? { ...savedImage.selection } : null;
-  if (savedImage.glsl && typeof savedImage.glsl.code === "string") {
-    const generator = typeof savedImage.glsl.generator === "boolean"
-      ? savedImage.glsl.generator
-      : savedImage.source?.kind === "embedded" && savedImage.sourceFormat === "glsl";
-    const width = Math.max(1, Math.floor(Number(savedImage.glsl.width) || image.width));
-    const height = Math.max(1, Math.floor(Number(savedImage.glsl.height) || image.height));
-    const renderedCode = savedImage.glsl.renderedCode || savedImage.glsl.code;
-    try {
-      if (generator) {
-        image.original = null;
-        image.glsl = glslVariant(renderedCode, image.pixels, image.width, image.height);
-      } else {
-        image.original = imageVariant(image);
-        const pixels = runGlslShader({ code: renderedCode, input: glslInputPayload(image), width, height });
-        image.glsl = glslVariant(renderedCode, pixels, width, height);
-      }
-      image.glsl.code = savedImage.glsl.code;
-      image.glsl.renderedCode = renderedCode;
-      const mode = generator || savedImage.glsl.mode === "glsl" ? "glsl" : "original";
-      applyImageVariant(image, mode);
-    } catch (error) {
-      console.warn("Saved GLSL state restore skipped.", error);
-      image.glsl = null;
-      image.original = null;
-      image.mode = "original";
-    }
-  }
   image.pickers = savedPickers.filter((picker) => picker.x < image.width && picker.y < image.height);
   image.selection = savedSelection ? clampSavedRect(savedSelection, image.width, image.height) : null;
   image.window = {
@@ -4338,7 +4777,6 @@ function applySavedImageState(image, savedImage) {
     image.elements.frame.dataset.id = String(image.id);
     image.elements.frame.querySelector(".window-title").textContent = image.name;
     updateImageWindowSize(image);
-    updateImageModeTabs(image);
   }
   image.displayDirty = true;
 }
@@ -4359,7 +4797,11 @@ function openSessionDb() {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(sessionDbName, sessionDbVersion);
     request.onupgradeneeded = () => {
-      request.result.createObjectStore(sessionStoreName);
+      if (request.result.objectStoreNames.contains(sessionStoreName)) {
+        request.transaction.objectStore(sessionStoreName).clear();
+      } else {
+        request.result.createObjectStore(sessionStoreName);
+      }
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
