@@ -645,6 +645,11 @@ document.addEventListener("copy", (event) => {
 });
 
 document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && activeDrag?.kind === "connect") {
+    event.preventDefault();
+    cancelConnectionDrag();
+    return;
+  }
   if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey) {
     return;
   }
@@ -667,15 +672,36 @@ document.addEventListener("keydown", (event) => {
     return;
   }
   event.preventDefault();
+  if (event.repeat) return;
   if (event.shiftKey) {
     fitWorkspaceToNodes();
     return;
   }
   const image = currentImage();
   if (image) {
-    fitImageToWindow(image);
+    if (image.view.fit) {
+      fitWindowToImageAspect(image);
+    } else {
+      fitImageToWindow(image);
+    }
   } else {
     fitWorkspaceToNodes();
+  }
+});
+
+document.addEventListener("contextmenu", (event) => {
+  if (activeDrag?.kind !== "connect") return;
+  event.preventDefault();
+  cancelConnectionDrag();
+});
+
+window.addEventListener("blur", () => {
+  if (activeDrag?.kind === "connect") cancelConnectionDrag({ showStatus: false });
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden && activeDrag?.kind === "connect") {
+    cancelConnectionDrag({ showStatus: false });
   }
 });
 
@@ -1222,9 +1248,7 @@ document.addEventListener("pointercancel", () => {
     return;
   }
   if (activeDrag?.kind === "connect") {
-    activeDrag.targetPort?.classList.remove("connect-target");
-    activeDrag = null;
-    requestConnectionDraw();
+    cancelConnectionDrag({ showStatus: false });
     return;
   }
   if (activeDrag?.kind !== "selectRect") return;
@@ -2330,7 +2354,7 @@ function createImageWindow(image, dropPoint, placementIndex) {
   outputPort.className = "node-port node-port-output";
   outputPort.type = "button";
   outputPort.dataset.nodeId = String(image.id);
-  outputPort.title = "Drag to a GLSL input";
+  outputPort.title = "Drag to a GLSL input, or to empty space to create a pass-through GLSL node";
   outputPort.ariaLabel = "Node output";
   const overviewLabel = document.createElement("div");
   overviewLabel.className = "node-overview-label";
@@ -2406,6 +2430,11 @@ function createImageWindow(image, dropPoint, placementIndex) {
   });
 
   outputPort.addEventListener("pointerdown", (event) => beginConnectionDrag(image, event));
+  outputPort.addEventListener("lostpointercapture", (event) => {
+    if (activeDrag?.kind === "connect" && activeDrag.pointerId === event.pointerId) {
+      cancelConnectionDrag({ showStatus: false, releaseCapture: false });
+    }
+  });
   inputPort?.addEventListener("pointerdown", (event) => {
     event.stopPropagation();
     selectImage(image);
@@ -2630,6 +2659,64 @@ function connectionTargetAt(clientX, clientY) {
   return document.elementFromPoint(clientX, clientY)?.closest?.(".node-port-input") || null;
 }
 
+function isEmptyConnectionDrop(clientX, clientY) {
+  const rect = viewport.getBoundingClientRect();
+  if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) {
+    return false;
+  }
+  const element = document.elementFromPoint(clientX, clientY);
+  return Boolean(element && !element.closest(".image-window, .node-connection-hit, aside"));
+}
+
+function createConnectionGhost() {
+  const ghost = document.createElement("div");
+  ghost.className = "connection-node-ghost";
+  ghost.setAttribute("aria-hidden", "true");
+  const kind = document.createElement("span");
+  kind.className = "connection-node-ghost-kind";
+  kind.textContent = "GLSL";
+  const label = document.createElement("strong");
+  label.textContent = "Pass";
+  const hint = document.createElement("span");
+  hint.className = "connection-node-ghost-hint";
+  hint.textContent = "Release to create";
+  ghost.append(kind, label, hint);
+  windowLayer.append(ghost);
+  return ghost;
+}
+
+function updateConnectionGhost(drag) {
+  if (!drag?.ghost) return;
+  const point = screenToWorld(drag.clientX, drag.clientY);
+  drag.ghost.style.left = `${point.x}px`;
+  drag.ghost.style.top = `${point.y}px`;
+  drag.ghost.classList.toggle("visible", drag.createOnDrop);
+}
+
+function clearConnectionDragUi(drag) {
+  drag?.targetPort?.classList.remove("connect-target");
+  drag?.source?.elements?.outputPort?.classList.remove("connect-source");
+  drag?.ghost?.remove();
+  viewport.classList.remove("connection-dragging");
+}
+
+function cancelConnectionDrag({ showStatus = true, releaseCapture = true } = {}) {
+  const drag = activeDrag;
+  if (drag?.kind !== "connect") return false;
+  activeDrag = null;
+  clearConnectionDragUi(drag);
+  if (releaseCapture) {
+    try {
+      drag.source.elements.outputPort.releasePointerCapture(drag.pointerId);
+    } catch {
+      // Pointer capture may already be released by the browser.
+    }
+  }
+  if (showStatus) fileHint.textContent = "Connection cancelled";
+  requestConnectionDraw();
+  return true;
+}
+
 function nodeDependsOn(node, ancestorId) {
   const visited = new Set();
   let current = node;
@@ -2662,9 +2749,14 @@ function beginConnectionDrag(source, event) {
     startY: event.clientY,
     clientX: event.clientX,
     clientY: event.clientY,
+    pointerId: event.pointerId,
     valid: true,
-    targetPort: null
+    targetPort: null,
+    createOnDrop: false,
+    ghost: createConnectionGhost()
   };
+  viewport.classList.add("connection-dragging");
+  source.elements.outputPort.classList.add("connect-source");
   source.elements.outputPort.setPointerCapture(event.pointerId);
   requestConnectionDraw();
 }
@@ -2681,6 +2773,11 @@ function updateConnectionDrag(event) {
     : null;
   drag.valid = !target || canConnectNodes(drag.source, target);
   drag.targetPort?.classList.toggle("connect-target", drag.valid);
+  const distance = Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY);
+  drag.createOnDrop = !drag.targetPort
+    && distance > 24
+    && isEmptyConnectionDrop(event.clientX, event.clientY);
+  updateConnectionGhost(drag);
   requestConnectionDraw();
 }
 
@@ -2691,11 +2788,15 @@ function finishConnectionDrag(event) {
   const target = drag.targetPort
     ? images.find((image) => image.id === Number(drag.targetPort.dataset.nodeId))
     : null;
-  drag.targetPort?.classList.remove("connect-target");
+  const createOnDrop = drag.createOnDrop;
+  const dropPoint = createOnDrop ? screenToWorld(event.clientX, event.clientY) : null;
+  clearConnectionDragUi(drag);
   if (target && canConnectNodes(drag.source, target)) {
     connectNodes(drag.source, target);
   } else if (target) {
     fileHint.textContent = "Connection rejected: GLSL nodes cannot form a cycle.";
+  } else if (createOnDrop) {
+    createPassThroughGlslNode(drag.source, dropPoint);
   }
   requestConnectionDraw();
   return true;
@@ -3147,6 +3248,46 @@ function openGlslEditor(sourceImage) {
     resolutionMode: inputNodeId == null ? "custom" : "follow-input",
     sourceImage
   });
+}
+
+function createPassThroughGlslNode(sourceImage, dropPoint) {
+  const support = getGlslSupport();
+  if (!support.ok) {
+    fileHint.textContent = `GLSL unavailable: ${support.reason}`;
+    return null;
+  }
+
+  const code = DEFAULT_FILTER_CODE;
+  const inputNodeId = sourceImage.id;
+  const inputTarget = { nodeKind: "glsl", inputNodeId };
+  let input;
+  let pixels;
+  try {
+    input = glslInputPayload(inputTarget);
+    if (!input) throw new Error("The source node has no readable output.");
+    pixels = runGlslShader({ code, input, width: input.width, height: input.height });
+  } catch (error) {
+    fileHint.textContent = `GLSL failed: ${error?.message || error}`;
+    return null;
+  }
+
+  const image = addGeneratedGlslImage({
+    code,
+    renderedCode: code,
+    pixels,
+    width: input.width,
+    height: input.height,
+    focusEditor: false,
+    inputNodeId,
+    resolutionMode: "follow-input"
+  });
+  fitWindowToImageAspect(image);
+  image.window.x = dropPoint.x + 1;
+  image.window.y = dropPoint.y - 14;
+  applyWindowGeometry(image);
+  fileHint.textContent = `Created pass-through GLSL node from ${sourceImage.name}`;
+  scheduleSessionSave();
+  return image;
 }
 
 function addGeneratedGlslImage({
@@ -7545,6 +7686,48 @@ function fitImageToWindow(image, renderAfter = true) {
     requestRender();
     scheduleSessionSave();
   }
+}
+
+function fitWindowToImageAspect(image) {
+  if (!image?.width || !image?.height) return;
+  const canvasSize = canvasCssSize(image);
+  const chromeWidth = Math.max(0, image.window.width - canvasSize.width);
+  const chromeHeight = Math.max(0, image.window.height - canvasSize.height);
+  const aspect = image.width / image.height;
+  let bodyWidth;
+  let bodyHeight;
+
+  const widthFitScale = canvasSize.width / image.width;
+  const heightFitScale = canvasSize.height / image.height;
+  if (widthFitScale <= heightFitScale) {
+    bodyWidth = canvasSize.width;
+    bodyHeight = bodyWidth / aspect;
+  } else {
+    bodyHeight = canvasSize.height;
+    bodyWidth = bodyHeight * aspect;
+  }
+
+  const minimumScale = Math.max(
+    (minWindowWidth - chromeWidth) / bodyWidth,
+    (minWindowHeight - chromeHeight) / bodyHeight,
+    0
+  );
+  const maximumScale = Math.min(
+    (maxWindowWidth - chromeWidth) / bodyWidth,
+    (maxWindowHeight - chromeHeight) / bodyHeight
+  );
+  const scale = Math.min(Math.max(1, minimumScale), maximumScale);
+  bodyWidth *= scale;
+  bodyHeight *= scale;
+
+  const centerX = image.window.x + image.window.width / 2;
+  const centerY = image.window.y + image.window.height / 2;
+  image.window.width = bodyWidth + chromeWidth;
+  image.window.height = bodyHeight + chromeHeight;
+  image.window.x = centerX - image.window.width / 2;
+  image.window.y = centerY - image.window.height / 2;
+  applyWindowGeometry(image);
+  fitImageToWindow(image);
 }
 
 function endImagePan(image, event) {
