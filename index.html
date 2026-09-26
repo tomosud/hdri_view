@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>HDRI Value Viewer</title>
   <link rel="icon" href="data:,">
-  <link rel="stylesheet" href="./style.css?v=20260927-1">
+  <link rel="stylesheet" href="./style.css?v=20260927-5">
   <script type="importmap">
     {
       "imports": {
@@ -24,12 +24,13 @@
         Open
       </label>
       <button id="newImageButton" class="tool-button" type="button" title="Create a GLSL node">New GLSL</button>
+      <button id="resetUiButton" class="tool-button" type="button" title="Restore floating panels to their default positions and sizes">Reset UI</button>
       <div id="fileHint" class="file-hint">Drop images on the black view</div>
       <a class="github-link" href="https://github.com/tomosud/hdri_view" target="_blank" rel="noopener noreferrer">GitHub</a>
     </header>
 
     <main class="workspace">
-      <section id="viewport" class="viewport" aria-label="Image viewport">
+      <section id="viewport" class="viewport" aria-label="Image viewport" title="Middle-drag an image to pan it · Middle-drag elsewhere to pan the graph · Wheel empty space to zoom · F fits the selected image · Shift+F fits all nodes">
         <aside id="selectionGraphPanel" class="selection-graph-panel hidden" aria-label="Selection value graph">
           <div class="graph-titlebar">
             <span>Selection Graph</span>
@@ -39,8 +40,11 @@
           <canvas id="selectionGraphCanvas" class="selection-graph-canvas"></canvas>
           <div id="selectionGraphResize" class="graph-resize-handle"></div>
         </aside>
-        <svg id="connectionLayer" class="connection-layer" aria-hidden="true"></svg>
-        <div id="windowLayer" class="window-layer"></div>
+        <div id="worldScene" class="world-scene">
+          <div id="workspaceBoundary" class="workspace-boundary" aria-hidden="true"></div>
+          <svg id="connectionLayer" class="connection-layer" aria-hidden="true"></svg>
+          <div id="windowLayer" class="window-layer"></div>
+        </div>
         <div id="dropPrompt" class="drop-prompt">
           <div>Drop images here</div>
           <span>PNG / JPEG / WebP / AVIF / GIF / BMP / JP2 / TIFF / DICOM / HDR / EXR</span>
@@ -309,6 +313,6 @@
     </footer>
   </div>
 
-  <script type="module" src="./app.js?v=20260927-1"></script>
+  <script type="module" src="./app.js?v=20260927-5"></script>
 </body>
 </html>

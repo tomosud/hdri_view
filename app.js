@@ -30,6 +30,7 @@ import { createWebGpuRenderer, HDR_REFERENCE_WHITE_NITS } from "./webgpu-rendere
 const fileInput = document.querySelector("#fileInput");
 const fileHint = document.querySelector("#fileHint");
 const newImageButton = document.querySelector("#newImageButton");
+const resetUiButton = document.querySelector("#resetUiButton");
 const glslPanel = document.querySelector("#glslPanel");
 const glslTitleText = document.querySelector("#glslTitleText");
 const glslCloseButton = document.querySelector("#glslCloseButton");
@@ -53,6 +54,8 @@ const displayGammaInput = document.querySelector("#displayGammaInput");
 const displayGamma1 = document.querySelector("#displayGamma1");
 const displayGamma22 = document.querySelector("#displayGamma22");
 const displayGamma04545 = document.querySelector("#displayGamma04545");
+const worldScene = document.querySelector("#worldScene");
+const workspaceBoundary = document.querySelector("#workspaceBoundary");
 const connectionLayer = document.querySelector("#connectionLayer");
 const windowLayer = document.querySelector("#windowLayer");
 const dropPrompt = document.querySelector("#dropPrompt");
@@ -115,6 +118,15 @@ const downloadSelectionCsvButton = document.querySelector("#downloadSelectionCsv
 const images = [];
 const minWindowWidth = 220;
 const minWindowHeight = 160;
+const maxWindowWidth = 8192;
+const maxWindowHeight = 8192;
+const workspaceWorldMin = -16384;
+const workspaceWorldMax = 16384;
+const workspaceWorldSize = workspaceWorldMax - workspaceWorldMin;
+const maxWorkspaceScale = 4;
+const defaultMinWorkspaceScale = 0.05;
+const workspaceFitPadding = 40;
+const workspaceEdgeReveal = 64;
 const minGraphWidth = 180;
 const minGraphHeight = 140;
 const minGlslPanelHeight = 300;
@@ -122,9 +134,11 @@ const maxPickers = 20;
 const selectionMatrixPreviewRows = 8;
 const selectionMatrixPreviewColumns = 12;
 const sessionDbName = "hdri-value-viewer";
-const sessionDbVersion = 2;
+const sessionDbVersion = 3;
 const sessionStoreName = "session";
 const sessionKey = "current";
+const nodeLayoutStoreName = "node-layout";
+const nodeLayoutKey = "current";
 const pickerColors = [
   "#ff365e", "#35d0ff", "#ffe156", "#69f28d", "#c77dff",
   "#ff9f1c", "#2ec4b6", "#f15bb5", "#b8f35a", "#4d96ff",
@@ -133,6 +147,7 @@ const pickerColors = [
 ];
 
 let selectedId = null;
+let selectedConnectionTargetId = null;
 let nextId = 1;
 let topZ = 10;
 let activeDrag = null;
@@ -175,6 +190,147 @@ let selectionMatrixCopyJobId = 0;
 let selectionMatrixCopyInFlight = null;
 let webGpuRenderer = null;
 let webGpuInitializationError = null;
+const workspaceView = {
+  panX: 0,
+  panY: 0,
+  scale: 1
+};
+
+function workspaceMinimumScale() {
+  const width = Math.max(1, viewport.clientWidth - workspaceFitPadding * 2);
+  const height = Math.max(1, viewport.clientHeight - workspaceFitPadding * 2);
+  return Math.max(
+    0.000001,
+    Math.min(defaultMinWorkspaceScale, width / workspaceWorldSize, height / workspaceWorldSize)
+  );
+}
+
+function clampWorkspaceScale(scale) {
+  return clamp(
+    finiteOrDefault(scale, 1),
+    workspaceMinimumScale(),
+    maxWorkspaceScale
+  );
+}
+
+function clampWorkspacePan(panX, panY, scale = workspaceView.scale) {
+  const width = Math.max(1, viewport.clientWidth);
+  const height = Math.max(1, viewport.clientHeight);
+  const scaledWorldSize = workspaceWorldSize * scale;
+  const clampAxis = (pan, viewportSize) => {
+    if (scaledWorldSize <= Math.max(1, viewportSize - workspaceEdgeReveal * 2)) {
+      return (viewportSize - scaledWorldSize) / 2 - workspaceWorldMin * scale;
+    }
+    const minimum = viewportSize - workspaceEdgeReveal - workspaceWorldMax * scale;
+    const maximum = workspaceEdgeReveal - workspaceWorldMin * scale;
+    return clamp(pan, minimum, maximum);
+  };
+  return {
+    panX: clampAxis(finiteOrDefault(panX, 0), width),
+    panY: clampAxis(finiteOrDefault(panY, 0), height)
+  };
+}
+
+function applyWorkspaceTransform({ render = false, save = false } = {}) {
+  workspaceView.scale = clampWorkspaceScale(workspaceView.scale);
+  const pan = clampWorkspacePan(workspaceView.panX, workspaceView.panY, workspaceView.scale);
+  workspaceView.panX = pan.panX;
+  workspaceView.panY = pan.panY;
+  worldScene.style.transform = "translate3d(" + workspaceView.panX + "px, " + workspaceView.panY + "px, 0) scale(" + workspaceView.scale + ")";
+  worldScene.style.setProperty("--workspace-inverse-scale", String(1 / workspaceView.scale));
+  worldScene.classList.toggle("workspace-compact", workspaceView.scale < 0.42);
+  worldScene.classList.toggle("workspace-overview", workspaceView.scale < 0.16);
+  workspaceBoundary.style.left = workspaceWorldMin + "px";
+  workspaceBoundary.style.top = workspaceWorldMin + "px";
+  workspaceBoundary.style.width = workspaceWorldSize + "px";
+  workspaceBoundary.style.height = workspaceWorldSize + "px";
+  workspaceBoundary.style.borderWidth = 2 / workspaceView.scale + "px";
+  const visibleMin = viewportPointToWorld(0, 0);
+  const visibleMax = viewportPointToWorld(viewport.clientWidth, viewport.clientHeight);
+  const boundaryRevealDistance = 1200;
+  const boundaryIsNear = visibleMin.x <= workspaceWorldMin + boundaryRevealDistance
+    || visibleMin.y <= workspaceWorldMin + boundaryRevealDistance
+    || visibleMax.x >= workspaceWorldMax - boundaryRevealDistance
+    || visibleMax.y >= workspaceWorldMax - boundaryRevealDistance;
+  workspaceBoundary.classList.toggle("visible", boundaryIsNear);
+  viewport.classList.add("workspace-pan-ready");
+  updateViewState();
+  if (render) requestRender();
+  if (save) scheduleSessionSave();
+}
+
+function screenToWorld(clientX, clientY) {
+  const rect = viewport.getBoundingClientRect();
+  return {
+    x: (clientX - rect.left - workspaceView.panX) / workspaceView.scale,
+    y: (clientY - rect.top - workspaceView.panY) / workspaceView.scale
+  };
+}
+
+function viewportPointToWorld(x, y) {
+  return {
+    x: (x - workspaceView.panX) / workspaceView.scale,
+    y: (y - workspaceView.panY) / workspaceView.scale
+  };
+}
+
+function workspaceViewportCenter() {
+  return viewportPointToWorld(viewport.clientWidth / 2, viewport.clientHeight / 2);
+}
+
+function zoomWorkspaceAt(clientX, clientY, nextScale) {
+  const rect = viewport.getBoundingClientRect();
+  const screenX = clientX - rect.left;
+  const screenY = clientY - rect.top;
+  const anchor = viewportPointToWorld(screenX, screenY);
+  const scale = clampWorkspaceScale(nextScale);
+  workspaceView.scale = scale;
+  workspaceView.panX = screenX - anchor.x * scale;
+  workspaceView.panY = screenY - anchor.y * scale;
+  applyWorkspaceTransform({ render: true, save: true });
+}
+
+function workspaceNodeBounds() {
+  if (!images.length) return null;
+  return images.reduce((bounds, image) => ({
+    minX: Math.min(bounds.minX, image.window.x),
+    minY: Math.min(bounds.minY, image.window.y),
+    maxX: Math.max(bounds.maxX, image.window.x + image.window.width),
+    maxY: Math.max(bounds.maxY, image.window.y + image.window.height)
+  }), {
+    minX: Infinity,
+    minY: Infinity,
+    maxX: -Infinity,
+    maxY: -Infinity
+  });
+}
+
+function fitWorkspaceToNodes() {
+  const bounds = workspaceNodeBounds();
+  if (!bounds) {
+    workspaceView.scale = 1;
+    workspaceView.panX = 0;
+    workspaceView.panY = 0;
+    applyWorkspaceTransform({ render: true, save: true });
+    return;
+  }
+  const width = Math.max(1, bounds.maxX - bounds.minX);
+  const height = Math.max(1, bounds.maxY - bounds.minY);
+  const availableWidth = Math.max(1, viewport.clientWidth - workspaceFitPadding * 2);
+  const availableHeight = Math.max(1, viewport.clientHeight - workspaceFitPadding * 2);
+  const scale = clampWorkspaceScale(Math.min(availableWidth / width, availableHeight / height, 1));
+  workspaceView.scale = scale;
+  workspaceView.panX = viewport.clientWidth / 2 - (bounds.minX + bounds.maxX) * 0.5 * scale;
+  workspaceView.panY = viewport.clientHeight / 2 - (bounds.minY + bounds.maxY) * 0.5 * scale;
+  applyWorkspaceTransform({ render: true, save: true });
+}
+
+function constrainImageWindow(image) {
+  image.window.width = clamp(image.window.width, minWindowWidth, maxWindowWidth);
+  image.window.height = clamp(image.window.height, minWindowHeight, maxWindowHeight);
+  image.window.x = clamp(image.window.x, workspaceWorldMin, workspaceWorldMax - image.window.width);
+  image.window.y = clamp(image.window.y, workspaceWorldMin, workspaceWorldMax - image.window.height);
+}
 
 fileInput.addEventListener("click", (event) => {
   if (!window.showOpenFilePicker) {
@@ -404,18 +560,53 @@ viewport.addEventListener("dragleave", (event) => {
 viewport.addEventListener("drop", (event) => {
   event.preventDefault();
   viewport.classList.remove("drag-over");
-  const rect = viewport.getBoundingClientRect();
-  void openDroppedFiles(event, {
-    x: event.clientX - rect.left,
-    y: event.clientY - rect.top
-  });
+  void openDroppedFiles(event, screenToWorld(event.clientX, event.clientY));
 });
 
 viewport.addEventListener("pointerdown", (event) => {
-  if (event.target === viewport || event.target === windowLayer) {
-    clearActiveSelection();
+  const overPanel = event.target.closest?.(".inspector, .picker-panel, .selection-graph-panel, .glsl-panel");
+  const overWorldObject = event.target.closest?.(".image-window, .node-connection-hit");
+  const overImageCanvas = event.target.closest?.(".image-canvas");
+  if ((event.button !== 0 && event.button !== 1)
+    || (event.button === 0 && (overPanel || overWorldObject))
+    || (event.button === 1 && (overPanel || overImageCanvas))) {
+    return;
+  }
+  event.preventDefault();
+  if (event.button === 1) event.stopPropagation();
+  activeDrag = {
+    kind: "workspacePan",
+    button: event.button,
+    pointerId: event.pointerId,
+    startX: event.clientX,
+    startY: event.clientY,
+    panX: workspaceView.panX,
+    panY: workspaceView.panY,
+    moved: false
+  };
+  viewport.classList.add("workspace-panning");
+  viewport.setPointerCapture(event.pointerId);
+}, { capture: true });
+
+viewport.addEventListener("auxclick", (event) => {
+  if (event.button === 1 && !event.target.closest?.(".inspector, .picker-panel, .selection-graph-panel, .glsl-panel")) {
+    event.preventDefault();
   }
 });
+
+viewport.addEventListener("wheel", (event) => {
+  if (event.target.closest?.(".image-window, .inspector, .picker-panel, .selection-graph-panel, .glsl-panel")) {
+    return;
+  }
+  event.preventDefault();
+  const delta = event.deltaMode === WheelEvent.DOM_DELTA_LINE
+    ? event.deltaY * 16
+    : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
+      ? event.deltaY * viewport.clientHeight
+      : event.deltaY;
+  const factor = Math.pow(2, -delta / 420);
+  zoomWorkspaceAt(event.clientX, event.clientY, workspaceView.scale * factor);
+}, { passive: false });
 
 document.addEventListener("paste", (event) => {
   if (shouldKeepNativeClipboardEvent(event)) {
@@ -454,19 +645,38 @@ document.addEventListener("copy", (event) => {
 });
 
 document.addEventListener("keydown", (event) => {
-  if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey || event.key.toLowerCase() !== "f") {
+  if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey) {
     return;
   }
   const target = event.target;
   if (target instanceof Element && target.closest("input, textarea, select, [contenteditable='true']")) {
     return;
   }
-  const image = currentImage();
-  if (!image) {
+  if (event.key === "Delete" && selectedConnectionTargetId != null) {
+    const connectionTarget = images.find((image) => image.id === selectedConnectionTargetId);
+    if (connectionTarget?.inputNodeId != null) {
+      event.preventDefault();
+      disconnectGlslInput(connectionTarget);
+    } else {
+      selectedConnectionTargetId = null;
+      requestConnectionDraw();
+    }
+    return;
+  }
+  if (event.key.toLowerCase() !== "f") {
     return;
   }
   event.preventDefault();
-  fitImageToWindow(image);
+  if (event.shiftKey) {
+    fitWorkspaceToNodes();
+    return;
+  }
+  const image = currentImage();
+  if (image) {
+    fitImageToWindow(image);
+  } else {
+    fitWorkspaceToNodes();
+  }
 });
 
 function shouldKeepNativeClipboardEvent(event) {
@@ -875,6 +1085,10 @@ new ResizeObserver(() => {
       fitImageToWindow(image, false);
     }
   }
+  applyWorkspaceTransform();
+  for (const panel of [inspector, pickerPanel, selectionGraphPanel, glslPanel]) {
+    ensureFloatingPanelAccessible(panel);
+  }
   requestRender();
   requestSelectionGraphDraw();
   requestConnectionDraw();
@@ -886,17 +1100,22 @@ document.addEventListener("pointermove", (event) => {
   }
   const dx = event.clientX - activeDrag.startX;
   const dy = event.clientY - activeDrag.startY;
-  if (activeDrag.kind === "connect") {
+  if (activeDrag.kind === "workspacePan") {
+    activeDrag.moved ||= Math.abs(dx) > 3 || Math.abs(dy) > 3;
+    workspaceView.panX = activeDrag.panX + dx;
+    workspaceView.panY = activeDrag.panY + dy;
+    applyWorkspaceTransform();
+  } else if (activeDrag.kind === "connect") {
     updateConnectionDrag(event);
   } else if (activeDrag.kind === "move") {
-    const next = clampImageWindowPosition(activeDrag.image, activeDrag.x + dx, activeDrag.y + dy);
-    activeDrag.image.window.x = next.x;
-    activeDrag.image.window.y = next.y;
+    activeDrag.image.window.x = activeDrag.x + dx / workspaceView.scale;
+    activeDrag.image.window.y = activeDrag.y + dy / workspaceView.scale;
     applyWindowGeometry(activeDrag.image);
   } else if (activeDrag.kind === "resize") {
-    resizeImageWindow(activeDrag, dx, dy);
+    resizeImageWindow(activeDrag, dx / workspaceView.scale, dy / workspaceView.scale);
     activeDrag.image.view.fit = false;
     applyWindowGeometry(activeDrag.image);
+    centerResizeAnchor(activeDrag);
     requestRender();
   } else if (activeDrag.kind === "uiMove") {
     const next = clampPanelPosition(activeDrag.panel, activeDrag.x + dx, activeDrag.y + dy);
@@ -943,7 +1162,15 @@ document.addEventListener("pointermove", (event) => {
 
 document.addEventListener("pointerup", (event) => {
   const completedDragKind = activeDrag?.kind;
-  if (activeDrag?.kind === "connect") {
+  if (activeDrag?.kind === "workspacePan") {
+    if (!activeDrag.moved && activeDrag.button === 0) clearActiveSelection();
+    viewport.classList.remove("workspace-panning");
+    try {
+      viewport.releasePointerCapture(activeDrag.pointerId);
+    } catch {
+      // Pointer capture may already be released by the browser.
+    }
+  } else if (activeDrag?.kind === "connect") {
     finishConnectionDrag(event);
   } else if (activeDrag?.kind === "selectRect") {
     const image = activeDrag.image;
@@ -989,6 +1216,11 @@ document.addEventListener("pointerup", (event) => {
 });
 
 document.addEventListener("pointercancel", () => {
+  if (activeDrag?.kind === "workspacePan") {
+    activeDrag = null;
+    viewport.classList.remove("workspace-panning");
+    return;
+  }
   if (activeDrag?.kind === "connect") {
     activeDrag.targetPort?.classList.remove("connect-target");
     activeDrag = null;
@@ -1006,6 +1238,7 @@ document.addEventListener("pointercancel", () => {
 makeFloatingPanelDraggable(inspector);
 makeFloatingPanelDraggable(pickerPanel);
 makeFloatingPanelDraggable(selectionGraphPanel);
+resetUiButton.addEventListener("click", resetFloatingPanelLayout);
 initGlslEditor();
 updatePickerPanel();
 applyValueModeTheme();
@@ -1013,6 +1246,7 @@ updateLogDisplayButton();
 requestRender();
 requestSelectionGraphDraw();
 queueMicrotask(initializeApp);
+applyWorkspaceTransform();
 
 async function openFilesWithPicker() {
   try {
@@ -2037,16 +2271,27 @@ function duplicateNodeFromClipboard(snapshot) {
 
 function createImageWindow(image, dropPoint, placementIndex) {
   const viewportRect = viewport.getBoundingClientRect();
-  const preferredWidth = Math.min(Math.max(320, image.width + 2), Math.max(320, viewportRect.width * 0.46));
+  const visibleWorldWidth = viewportRect.width * 0.46 / workspaceView.scale;
+  const preferredWidth = Math.min(
+    Math.max(320, image.width + 2),
+    clamp(visibleWorldWidth, 320, 720)
+  );
   const bodyHeight = preferredWidth * (image.height / image.width);
-  const preferredHeight = Math.min(Math.max(220, bodyHeight + 30), Math.max(220, viewportRect.height * 0.46));
-  const baseX = dropPoint ? dropPoint.x - preferredWidth / 2 : 32 + placementIndex * 36 + images.length * 18;
-  const baseY = dropPoint ? dropPoint.y - 18 : 32 + placementIndex * 30 + images.length * 18;
+  const visibleWorldHeight = viewportRect.height * 0.46 / workspaceView.scale;
+  const preferredHeight = Math.min(
+    Math.max(220, bodyHeight + 30),
+    clamp(visibleWorldHeight, 220, 560)
+  );
+  const center = workspaceViewportCenter();
+  const cascade = placementIndex * 36 + Math.max(0, images.length - 1) * 18;
+  const baseX = dropPoint ? dropPoint.x - preferredWidth / 2 : center.x - preferredWidth / 2 + cascade;
+  const baseY = dropPoint ? dropPoint.y - 18 : center.y - preferredHeight / 2 + cascade;
 
   image.window.width = preferredWidth;
   image.window.height = preferredHeight;
-  image.window.x = clamp(baseX, 8, Math.max(8, viewportRect.width - preferredWidth - 8));
-  image.window.y = clamp(baseY, 8, Math.max(8, viewportRect.height - preferredHeight - 8));
+  image.window.x = baseX;
+  image.window.y = baseY;
+  constrainImageWindow(image);
   image.window.z = ++topZ;
 
   const frame = document.createElement("section");
@@ -2087,6 +2332,9 @@ function createImageWindow(image, dropPoint, placementIndex) {
   outputPort.dataset.nodeId = String(image.id);
   outputPort.title = "Drag to a GLSL input";
   outputPort.ariaLabel = "Node output";
+  const overviewLabel = document.createElement("div");
+  overviewLabel.className = "node-overview-label";
+  overviewLabel.textContent = image.name;
 
   const body = document.createElement("div");
   body.className = "window-body";
@@ -2108,7 +2356,7 @@ function createImageWindow(image, dropPoint, placementIndex) {
   body.append(canvas, overlay, ...resizeHandles);
   frame.append(titlebar, body);
   if (inputPort) frame.append(inputPort);
-  frame.append(outputPort);
+  frame.append(outputPort, overviewLabel);
   windowLayer.append(frame);
 
   image.elements = {
@@ -2121,11 +2369,14 @@ function createImageWindow(image, dropPoint, placementIndex) {
     closeButton,
     size,
     nodeBadge,
+    overviewLabel,
     inputPort,
     outputPort
   };
 
-  frame.addEventListener("pointerdown", () => selectImage(image));
+  frame.addEventListener("pointerdown", (event) => {
+    if (event.button === 0) selectImage(image);
+  });
 
   titlebar.addEventListener("pointerdown", (event) => {
     if (event.target.closest(".window-close, .node-kind-badge, .node-port")) {
@@ -2190,13 +2441,13 @@ function createImageWindow(image, dropPoint, placementIndex) {
         x: image.window.x,
         y: image.window.y,
         width: image.window.width,
-        height: image.window.height
+        height: image.window.height,
+        centerImageX: (canvas.clientWidth / 2 - image.view.offsetX) / image.view.scale,
+        centerImageY: (canvas.clientHeight / 2 - image.view.offsetY) / image.view.scale
       };
       resizeHandle.setPointerCapture(event.pointerId);
     });
   }
-
-  canvas.addEventListener("contextmenu", (event) => event.preventDefault());
 
   canvas.addEventListener("pointerdown", (event) => {
     selectImage(image);
@@ -2247,7 +2498,7 @@ function createImageWindow(image, dropPoint, placementIndex) {
       requestRender();
       return;
     }
-    if (event.button !== 2 && event.button !== 1) {
+    if (event.button !== 1) {
       return;
     }
     event.preventDefault();
@@ -2274,8 +2525,8 @@ function createImageWindow(image, dropPoint, placementIndex) {
       }
     }
     if (image.pan) {
-      image.view.offsetX = image.pan.offsetX + event.clientX - image.pan.x;
-      image.view.offsetY = image.pan.offsetY + event.clientY - image.pan.y;
+      image.view.offsetX = image.pan.offsetX + (event.clientX - image.pan.x) / workspaceView.scale;
+      image.view.offsetY = image.pan.offsetY + (event.clientY - image.pan.y) / workspaceView.scale;
       requestRender();
     }
     updatePixelReadout(image, event);
@@ -2298,9 +2549,7 @@ function createImageWindow(image, dropPoint, placementIndex) {
   canvas.addEventListener("wheel", (event) => {
     event.preventDefault();
     selectImage(image);
-    const rect = canvas.getBoundingClientRect();
-    const x = event.clientX - rect.left;
-    const y = event.clientY - rect.top;
+    const { x, y } = canvasPointFromEvent(image, event);
     const factor = Math.pow(2, -event.deltaY / 420);
     zoomAt(image, x, y, image.view.scale * factor);
   });
@@ -2321,13 +2570,9 @@ function requestConnectionDraw() {
 }
 
 function nodePortPoint(port) {
-  const viewportRect = viewport.getBoundingClientRect();
   const rect = port?.getBoundingClientRect();
   if (!rect) return null;
-  return {
-    x: rect.left + rect.width / 2 - viewportRect.left,
-    y: rect.top + rect.height / 2 - viewportRect.top
-  };
+  return screenToWorld(rect.left + rect.width / 2, rect.top + rect.height / 2);
 }
 
 function connectionPath(from, to) {
@@ -2335,16 +2580,29 @@ function connectionPath(from, to) {
   return `M ${from.x} ${from.y} C ${from.x + bend} ${from.y}, ${to.x - bend} ${to.y}, ${to.x} ${to.y}`;
 }
 
-function appendConnectionPath(from, to, className = "node-connection") {
+function appendConnectionPath(from, to, className = "node-connection", target = null) {
+  const pathData = connectionPath(from, to);
+  if (target) {
+    const hitPath = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    hitPath.setAttribute("class", "node-connection-hit");
+    hitPath.setAttribute("d", pathData);
+    hitPath.dataset.targetId = String(target.id);
+    hitPath.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      event.stopPropagation();
+      selectConnection(target);
+    });
+    connectionLayer.append(hitPath);
+  }
   const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
-  path.setAttribute("class", className);
-  path.setAttribute("d", connectionPath(from, to));
+  const selectedClass = target?.id === selectedConnectionTargetId ? " selected" : "";
+  path.setAttribute("class", className + selectedClass);
+  path.setAttribute("d", pathData);
   connectionLayer.append(path);
 }
 
 function drawNodeConnections() {
-  const viewportRect = viewport.getBoundingClientRect();
-  connectionLayer.setAttribute("viewBox", `0 0 ${Math.max(1, viewportRect.width)} ${Math.max(1, viewportRect.height)}`);
   connectionLayer.replaceChildren();
 
   for (const target of images) {
@@ -2352,17 +2610,16 @@ function drawNodeConnections() {
     const source = images.find((image) => image.id === target.inputNodeId);
     const from = nodePortPoint(source?.elements?.outputPort);
     const to = nodePortPoint(target.elements?.inputPort);
-    if (from && to) appendConnectionPath(from, to);
+    if (from && to) appendConnectionPath(from, to, "node-connection", target);
   }
 
   if (activeDrag?.kind === "connect") {
     const from = nodePortPoint(activeDrag.source.elements?.outputPort);
-    const viewportX = activeDrag.clientX - viewportRect.left;
-    const viewportY = activeDrag.clientY - viewportRect.top;
+    const pointer = screenToWorld(activeDrag.clientX, activeDrag.clientY);
     if (from) {
       appendConnectionPath(
         from,
-        { x: viewportX, y: viewportY },
+        pointer,
         `node-connection preview${activeDrag.valid === false ? " invalid" : ""}`
       );
     }
@@ -2460,6 +2717,7 @@ function disconnectGlslInput(target) {
   if (target?.nodeKind !== "glsl" || target.inputNodeId == null) return;
   target.inputNodeId = null;
   target.resolutionMode = "custom";
+  if (selectedConnectionTargetId === target.id) selectedConnectionTargetId = null;
   if (glslTargetId === target.id) bindGlslEditor(target);
   evaluateGlslBranch(target);
   fileHint.textContent = `Disconnected input from ${target.name}`;
@@ -2467,7 +2725,20 @@ function disconnectGlslInput(target) {
   scheduleSessionSave();
 }
 
+function selectConnection(target) {
+  if (target?.nodeKind !== "glsl" || target.inputNodeId == null) return;
+  clearActiveSelection({ keepConnection: true });
+  selectedConnectionTargetId = target.id;
+  const source = images.find((image) => image.id === target.inputNodeId);
+  fileHint.textContent = "Connection " + (source?.name || "?") + " → " + target.name + " selected · Delete to disconnect";
+  requestConnectionDraw();
+}
+
 function selectImage(image, forceRefresh = false) {
+  if (selectedConnectionTargetId != null) {
+    selectedConnectionTargetId = null;
+    requestConnectionDraw();
+  }
   const selectionChanged = selectedId !== image.id;
   selectedId = image.id;
   if (image.window.z !== topZ) {
@@ -2491,7 +2762,9 @@ function selectImage(image, forceRefresh = false) {
   scheduleSessionSave();
 }
 
-function clearActiveSelection() {
+function clearActiveSelection({ keepConnection = false } = {}) {
+  const connectionChanged = !keepConnection && selectedConnectionTargetId != null;
+  if (!keepConnection) selectedConnectionTargetId = null;
   selectedId = null;
   syncGlslEditorForSelection();
   syncGlslShareUrl(null);
@@ -2501,15 +2774,14 @@ function clearActiveSelection() {
   updateSettingsPanel();
   updateSelectionPanel();
   requestSelectionGraphDraw();
+  if (connectionChanged) requestConnectionDraw();
   updateViewState();
   scheduleSessionSave();
 }
 
 function applyWindowGeometry(image) {
   const { frame } = image.elements;
-  const next = clampImageWindowPosition(image, image.window.x, image.window.y);
-  image.window.x = next.x;
-  image.window.y = next.y;
+  constrainImageWindow(image);
   frame.style.left = `${image.window.x}px`;
   frame.style.top = `${image.window.y}px`;
   frame.style.width = `${image.window.width}px`;
@@ -2519,7 +2791,6 @@ function applyWindowGeometry(image) {
 }
 
 function resizeImageWindow(drag, dx, dy) {
-  const viewportRect = viewport.getBoundingClientRect();
   const direction = drag.direction || "se";
   const right = drag.x + drag.width;
   let x = drag.x;
@@ -2527,15 +2798,15 @@ function resizeImageWindow(drag, dx, dy) {
   let height = drag.height;
 
   if (direction.includes("w")) {
-    x = clamp(drag.x + dx, 8, right - minWindowWidth);
+    x = clamp(drag.x + dx, Math.max(workspaceWorldMin, right - maxWindowWidth), right - minWindowWidth);
     width = right - x;
   } else if (direction.includes("e")) {
-    const maxWidth = Math.max(minWindowWidth, viewportRect.width - drag.x - 8);
+    const maxWidth = Math.min(maxWindowWidth, workspaceWorldMax - drag.x);
     width = clamp(drag.width + dx, minWindowWidth, maxWidth);
   }
 
   if (direction.includes("s")) {
-    const maxHeight = Math.max(minWindowHeight, viewportRect.height - drag.y - 8);
+    const maxHeight = Math.min(maxWindowHeight, workspaceWorldMax - drag.y);
     height = clamp(drag.height + dy, minWindowHeight, maxHeight);
   }
 
@@ -2544,12 +2815,10 @@ function resizeImageWindow(drag, dx, dy) {
   drag.image.window.height = height;
 }
 
-function clampImageWindowPosition(image, x, y) {
-  const viewportRect = viewport.getBoundingClientRect();
-  return {
-    x: clamp(x, 8, Math.max(8, viewportRect.width - image.window.width - 8)),
-    y: clamp(y, 8, Math.max(8, viewportRect.height - image.window.height - 8))
-  };
+function centerResizeAnchor(drag) {
+  const size = canvasCssSize(drag.image);
+  drag.image.view.offsetX = size.width / 2 - drag.centerImageX * drag.image.view.scale;
+  drag.image.view.offsetY = size.height / 2 - drag.centerImageY * drag.image.view.scale;
 }
 
 function makeFloatingPanelDraggable(panel) {
@@ -2589,10 +2858,13 @@ function makeFloatingPanelDraggable(panel) {
 
 function clampPanelPosition(panel, x, y) {
   const viewportRect = viewport.getBoundingClientRect();
-  const panelRect = panel.getBoundingClientRect();
+  const title = panel.querySelector(".panel-title, .graph-titlebar");
+  const panelWidth = Math.max(1, panel.offsetWidth);
+  const titleHeight = Math.max(1, title?.offsetHeight || 28);
+  const visibleTitleWidth = Math.min(72, panelWidth);
   return {
-    x: clamp(x, 8, Math.max(8, viewportRect.width - panelRect.width - 8)),
-    y: clamp(y, 8, Math.max(8, viewportRect.height - panelRect.height - 8))
+    x: clamp(x, 8 + visibleTitleWidth - panelWidth, viewportRect.width - visibleTitleWidth - 8),
+    y: clamp(y, 0, Math.max(0, viewportRect.height - titleHeight - 2))
   };
 }
 
@@ -2622,6 +2894,18 @@ function ensureFloatingPanelAccessible(panel) {
   }
 }
 
+function resetFloatingPanelLayout() {
+  for (const panel of [inspector, pickerPanel, selectionGraphPanel, glslPanel]) {
+    for (const property of ["left", "top", "right", "bottom", "width", "height", "z-index"]) {
+      panel.style.removeProperty(property);
+    }
+    ensureFloatingPanelAccessible(panel);
+  }
+  fileHint.textContent = "Floating UI layout reset";
+  requestSelectionGraphDraw();
+  scheduleSessionSave();
+}
+
 function closeImage(image) {
   const index = images.findIndex((item) => item.id === image.id);
   if (index === -1) {
@@ -2649,6 +2933,9 @@ function closeImage(image) {
     target.inputNodeId = null;
     target.resolutionMode = "custom";
     evaluateGlslBranch(target);
+  }
+  if (selectedConnectionTargetId === image.id || disconnected.some((target) => target.id === selectedConnectionTargetId)) {
+    selectedConnectionTargetId = null;
   }
   if (glslTargetId === image.id) {
     closeGlslEditor();
@@ -3554,10 +3841,10 @@ async function cropPixels(image, rect) {
 function pickerAtEvent(image, event, radius = 14) {
   if (activePanelTab !== "pickers" || !image.pickers.length || !image.elements?.canvas) return null;
   const rect = image.elements.canvas.getBoundingClientRect();
-  const viewX = event.clientX - rect.left;
-  const viewY = event.clientY - rect.top;
+  const { x: viewX, y: viewY } = canvasPointFromEvent(image, event);
+  const localRadius = radius * image.elements.canvas.clientWidth / Math.max(1, rect.width);
   let closest = null;
-  let closestDistance = radius * radius;
+  let closestDistance = localRadius * localRadius;
   for (let index = image.pickers.length - 1; index >= 0; index -= 1) {
     const picker = image.pickers[index];
     const x = image.view.offsetX + (picker.x + 0.5) * image.view.scale;
@@ -4381,7 +4668,10 @@ function scheduleSessionSave() {
 async function saveCurrentSession() {
   try {
     const db = await openSessionDb();
-    await idbPut(db, sessionStoreName, buildSessionRecord(), sessionKey);
+    await idbPutMany(db, [
+      { storeName: sessionStoreName, key: sessionKey, value: buildSessionRecord() },
+      { storeName: nodeLayoutStoreName, key: nodeLayoutKey, value: buildNodeLayoutRecord() }
+    ]);
     db.close();
   } catch (error) {
     console.warn("Session save skipped.", error);
@@ -4396,9 +4686,12 @@ async function restoreSavedSession() {
   restoringSession = true;
   try {
     const db = await openSessionDb();
-    const session = await idbGet(db, sessionStoreName, sessionKey);
+    const [session, nodeLayout] = await Promise.all([
+      idbGet(db, sessionStoreName, sessionKey),
+      idbGet(db, nodeLayoutStoreName, nodeLayoutKey)
+    ]);
     db.close();
-    if (!session || session.version !== 2) {
+    if (!session || (session.version !== 2 && session.version !== 3)) {
       return;
     }
 
@@ -4426,10 +4719,12 @@ async function restoreSavedSession() {
             progressed = true;
             continue;
           }
-          applySavedImageState(image, savedImage);
+          applySavedImageState(image, savedImage, nodeLayoutForSavedImage(nodeLayout, savedImage));
+          const restoredWindow = { ...image.window };
           images.push(image);
           restoredById.set(savedImage.id, image);
           createImageWindow(image, null, restoredCount);
+          image.window = restoredWindow;
           applyWindowGeometry(image);
           restoredCount += 1;
           progressed = true;
@@ -4483,7 +4778,7 @@ async function restoreSavedSession() {
 function buildSessionRecord() {
   const assetOwners = new Map();
   return {
-    version: 2,
+    version: 3,
     savedAt: Date.now(),
     selectedId,
     nextId,
@@ -4494,6 +4789,7 @@ function buildSessionRecord() {
     pickerValueMode: pickerValueMode.value,
     pickerCopyMode: pickerCopyMode.value,
     graphView: { ...graphView },
+    workspaceView: { ...workspaceView },
     logDisplayMode,
     panels: {
       inspector: panelSessionState(inspector),
@@ -4503,6 +4799,37 @@ function buildSessionRecord() {
     },
     images: images.map((image) => imageSessionState(image, assetOwners))
   };
+}
+
+function buildNodeLayoutRecord() {
+  return {
+    version: 1,
+    savedAt: Date.now(),
+    workspaceView: { ...workspaceView },
+    nodes: images.map((image) => ({
+      id: image.id,
+      name: image.name,
+      nodeKind: image.nodeKind,
+      window: {
+        x: image.window.x,
+        y: image.window.y,
+        width: image.window.width,
+        height: image.window.height,
+        z: image.window.z
+      }
+    }))
+  };
+}
+
+function nodeLayoutForSavedImage(nodeLayout, savedImage) {
+  if (!nodeLayout || nodeLayout.version !== 1 || !Array.isArray(nodeLayout.nodes)) {
+    return null;
+  }
+  const exact = nodeLayout.nodes.find((node) => node.id === savedImage.id);
+  if (exact && exact.nodeKind === savedImage.nodeKind) {
+    return exact.window || null;
+  }
+  return null;
 }
 
 function imageSessionState(image, assetOwners) {
@@ -4597,6 +4924,12 @@ function panelSessionState(panel) {
 }
 
 function applyAppSessionState(session) {
+  if (session.workspaceView) {
+    workspaceView.panX = finiteOrDefault(session.workspaceView.panX, workspaceView.panX);
+    workspaceView.panY = finiteOrDefault(session.workspaceView.panY, workspaceView.panY);
+    workspaceView.scale = finiteOrDefault(session.workspaceView.scale, workspaceView.scale);
+    applyWorkspaceTransform();
+  }
   if (typeof session.pickerValueMode === "string") {
     pickerValueMode.value = session.pickerValueMode === "srgb255" ? "code" : session.pickerValueMode;
     applyValueModeTheme();
@@ -4744,7 +5077,7 @@ async function restoreImageFromSession(savedImage, restoredById) {
   return null;
 }
 
-function applySavedImageState(image, savedImage) {
+function applySavedImageState(image, savedImage, savedWindow = null) {
   image.id = Number.isInteger(savedImage.id) ? savedImage.id : image.id;
   image.name = savedImage.name || image.name;
   const generatedNameMatch = /^glsl(\d+)$/.exec(image.name);
@@ -4771,11 +5104,13 @@ function applySavedImageState(image, savedImage) {
   image.selection = savedSelection ? clampSavedRect(savedSelection, image.width, image.height) : null;
   image.window = {
     ...image.window,
-    ...(savedImage.window || {})
+    ...(savedImage.window || {}),
+    ...(savedWindow || {})
   };
   if (image.elements) {
     image.elements.frame.dataset.id = String(image.id);
     image.elements.frame.querySelector(".window-title").textContent = image.name;
+    image.elements.overviewLabel.textContent = image.name;
     updateImageWindowSize(image);
   }
   image.displayDirty = true;
@@ -4797,10 +5132,11 @@ function openSessionDb() {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(sessionDbName, sessionDbVersion);
     request.onupgradeneeded = () => {
-      if (request.result.objectStoreNames.contains(sessionStoreName)) {
-        request.transaction.objectStore(sessionStoreName).clear();
-      } else {
+      if (!request.result.objectStoreNames.contains(sessionStoreName)) {
         request.result.createObjectStore(sessionStoreName);
+      }
+      if (!request.result.objectStoreNames.contains(nodeLayoutStoreName)) {
+        request.result.createObjectStore(nodeLayoutStoreName);
       }
     };
     request.onsuccess = () => resolve(request.result);
@@ -4816,10 +5152,13 @@ function idbGet(db, storeName, key) {
   });
 }
 
-function idbPut(db, storeName, value, key) {
+function idbPutMany(db, entries) {
   return new Promise((resolve, reject) => {
-    const transaction = db.transaction(storeName, "readwrite");
-    transaction.objectStore(storeName).put(value, key);
+    const storeNames = [...new Set(entries.map((entry) => entry.storeName))];
+    const transaction = db.transaction(storeNames, "readwrite");
+    for (const entry of entries) {
+      transaction.objectStore(entry.storeName).put(entry.value, entry.key);
+    }
     transaction.oncomplete = () => resolve();
     transaction.onerror = () => reject(transaction.error);
   });
@@ -7249,9 +7588,7 @@ function updatePixelReadout(image, event) {
 }
 
 function pixelFromEvent(image, event, clampToImage = false) {
-  const rect = image.elements.canvas.getBoundingClientRect();
-  const viewX = event.clientX - rect.left;
-  const viewY = event.clientY - rect.top;
+  const { x: viewX, y: viewY } = canvasPointFromEvent(image, event);
   const x = Math.floor((viewX - image.view.offsetX) / image.view.scale);
   const y = Math.floor((viewY - image.view.offsetY) / image.view.scale);
 
@@ -7267,6 +7604,17 @@ function pixelFromEvent(image, event, clampToImage = false) {
   return { x, y };
 }
 
+function canvasPointFromEvent(image, event) {
+  const canvas = image.elements.canvas;
+  const rect = canvas.getBoundingClientRect();
+  const width = Math.max(1, canvas.clientWidth);
+  const height = Math.max(1, canvas.clientHeight);
+  return {
+    x: (event.clientX - rect.left) * width / Math.max(1, rect.width),
+    y: (event.clientY - rect.top) * height / Math.max(1, rect.height)
+  };
+}
+
 function clearPixelReadout() {
   pixelPosition.textContent = "x: -, y: -";
   linearValue.textContent = "Linear: -";
@@ -7276,10 +7624,10 @@ function clearPixelReadout() {
 function updateViewState() {
   const image = currentImage();
   if (!image) {
-    viewState.textContent = "-";
+    viewState.textContent = "Workspace " + Math.round(workspaceView.scale * 100) + "%";
     return;
   }
-  viewState.textContent = `${Math.round(image.view.scale * 100)}%`;
+  viewState.textContent = "Image " + Math.round(image.view.scale * 100) + "% · Workspace " + Math.round(workspaceView.scale * 100) + "%";
 }
 
 function currentImage() {
@@ -7287,16 +7635,16 @@ function currentImage() {
 }
 
 function canvasCssSize(image) {
-  const rect = image.elements?.canvas.getBoundingClientRect();
-  if (!rect) {
+  const canvas = image.elements?.canvas;
+  if (!canvas) {
     return {
       width: Math.max(1, image.window.width),
       height: Math.max(1, image.window.height - 28)
     };
   }
   return {
-    width: Math.max(1, rect.width),
-    height: Math.max(1, rect.height)
+    width: Math.max(1, canvas.clientWidth),
+    height: Math.max(1, canvas.clientHeight)
   };
 }
 

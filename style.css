@@ -137,6 +137,15 @@ textarea {
   height: 100%;
   overflow: hidden;
   background: #000;
+  cursor: default;
+}
+
+.viewport.workspace-pan-ready {
+  cursor: grab;
+}
+
+.viewport.workspace-panning {
+  cursor: grabbing;
 }
 
 .viewport.drag-over {
@@ -144,22 +153,56 @@ textarea {
   outline-offset: -2px;
 }
 
+.world-scene {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  pointer-events: none;
+  transform-origin: 0 0;
+  will-change: transform;
+}
+
 .window-layer {
   position: absolute;
   inset: 0;
-  z-index: 10;
+  z-index: 2;
   pointer-events: none;
 }
 
 .connection-layer {
   position: absolute;
-  inset: 0;
-  z-index: 5;
+  top: 0;
+  left: 0;
+  z-index: 1;
   display: block;
-  width: 100%;
-  height: 100%;
+  width: 1px;
+  height: 1px;
   overflow: visible;
   pointer-events: none;
+}
+
+.workspace-boundary {
+  position: absolute;
+  z-index: 0;
+  border: 3px dashed rgba(81, 183, 255, 0.34);
+  box-shadow: inset 0 0 80px rgba(81, 183, 255, 0.08);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+
+.workspace-boundary.visible {
+  opacity: 1;
+}
+
+.node-connection-hit {
+  fill: none;
+  stroke: transparent;
+  stroke-linecap: round;
+  stroke-width: 18;
+  cursor: pointer;
+  pointer-events: stroke;
+  vector-effect: non-scaling-stroke;
 }
 
 .node-connection {
@@ -167,7 +210,14 @@ textarea {
   stroke: #36df21;
   stroke-linecap: round;
   stroke-width: 4;
+  pointer-events: none;
   vector-effect: non-scaling-stroke;
+}
+
+.node-connection.selected {
+  stroke: #8fd7ff;
+  stroke-width: 6;
+  filter: drop-shadow(0 0 4px rgba(81, 183, 255, 0.9));
 }
 
 .node-connection.preview {
@@ -381,6 +431,56 @@ textarea {
 .image-window.active {
   border-color: var(--accent);
   box-shadow: 0 0 0 1px rgba(81, 183, 255, 0.35), 0 20px 42px rgba(0, 0, 0, 0.5);
+}
+
+.node-overview-label {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  z-index: 8;
+  display: none;
+  max-width: 220px;
+  padding: 3px 7px;
+  overflow: hidden;
+  border: 1px solid rgba(123, 200, 255, 0.85);
+  border-radius: 4px;
+  background: rgba(8, 15, 22, 0.94);
+  color: #e8f5ff;
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: none;
+  transform: translate(-50%, -50%) scale(var(--workspace-inverse-scale, 1));
+  transform-origin: center;
+}
+
+.world-scene.workspace-overview .image-window.active .node-overview-label,
+.world-scene.workspace-overview .image-window:hover .node-overview-label {
+  display: block;
+}
+
+/* At graph-overview scales, keep the node silhouette and identity while
+   removing controls that are too small to use accurately. */
+.world-scene.workspace-compact .window-size,
+.world-scene.workspace-compact .window-close {
+  display: none;
+}
+
+.world-scene.workspace-compact .window-titlebar {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.world-scene.workspace-overview .window-title,
+.world-scene.workspace-overview .window-close {
+  display: none;
+}
+
+.world-scene.workspace-overview .window-titlebar {
+  grid-template-columns: 1fr;
+  justify-items: center;
+  padding: 0 4px;
 }
 
 .window-titlebar {
@@ -1217,7 +1317,7 @@ button:hover {
 
 .statusbar {
   display: grid;
-  grid-template-columns: 120px minmax(0, 1fr) minmax(180px, 1.2fr) minmax(0, 1fr) 76px;
+  grid-template-columns: 120px minmax(0, 1fr) minmax(180px, 1.2fr) minmax(0, 1fr) 160px;
   gap: 12px;
   padding: 0 10px;
   border-top: 1px solid var(--line);
