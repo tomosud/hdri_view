@@ -43,7 +43,7 @@ https://tomosud.github.io/hdri_view/
 
 画像ウィンドウを選択すると、右側の **VIEW SETTINGS** パネルで以下を調整できます。
 
-- **Zoom**: Fit / 100%〜3200% の固定倍率。画像ウィンドウを選択して `F` キーを押すと、画像をウィンドウ内へフィットして中央配置
+- **Zoom**: Fit / 10% / 25% / 50% / 100%〜3200% の固定倍率。画像ウィンドウを選択して `F` キーを押すと、画像をウィンドウ内へフィットして中央配置
 - **Filtering**: Auto / Nearest / Linear（拡大時の補間）
 - **Output**: Auto / SDR / HDR。AutoはブラウザのHDR表示能力に従い、SDRでは標準出力、HDRではfloatのextended出力を選ぶ。現在使われている出力形式は選択欄の下に表示される
 - **Display Gamma**: WebGPU Canvasへ渡す直前の表示指数。HDR画像は1.0、SDR画像は1/2.2（0.454545）を読み込み時の既定値にする。1.0 / 2.2 / 0.454545のプリセットまたは数値入力で画像ごとに変更できる
@@ -190,10 +190,16 @@ void mainImage(out vec4 outputColor, in vec2 uv, in vec4 inputColor) {
 値は linear float のままクランプされないので、`inputColor.rgb *= 2.0;` の結果を HDR / EXR として
 そのまま保存できます。出力は普通の画像ウィンドウなので Picker も Selection Graph も効きます。
 
-プリセットには、半径を変更できるループ式 Box Blur、Sobel Edge、Gradient、Radial HDR light、
-Cosine Stripes などがあります。Box Blur はコード先頭の `radius`、Cosine Stripes は
-`stripeCount` と `angle` を変更して調整できます。Box Blur は半径に対してサンプル数が二乗で
-増えるため、`radius` は 1〜4 程度を推奨します。
+プリセットは **Basic value operations / Channels and color / Spatial filters /
+Analysis and visualization / Generated images** に分類されています。Clamp、0〜1を2〜3へ写す
+Remap Range、Power 2.2、R/B Swizzle、Rec.709 YUV変換、Mosaic、ifを使うThreshold、
+Linear / Log2 HDR Heatmap、ループ式Blur / Maximum Filter、各種Generatorを収録しています。
+各プリセットには、処理内容、変更する定数、値域、alphaの扱いを英語コメントで記載しています。
+
+既定の **Passthrough** では、代入文の下がコメント形式のクイックリファレンスになっています。
+利用可能な引数・uniform・helper、GLSLの基本型、標準関数、swizzleと短いコード例を確認できます。
+コード欄は折り返さず、縦横にスクロールできます。Box Blurは半径に対してサンプル数が二乗で
+増えるため、radiusは1〜4程度を推奨します。
 
 コンパイルエラーは、自分が書いた行番号でパネル下部に表示されます。
 

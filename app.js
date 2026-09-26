@@ -23,7 +23,7 @@ import {
   GLSL_PRESETS,
   getGlslSupport,
   runGlslShader
-} from "./glsl-runtime.js?v=20260809-7";
+} from "./glsl-runtime.js?v=20260926-1";
 import { decodeGlslShareHash, encodeGlslShareHash } from "./glsl-share.js?v=20260809-3";
 import { createWebGpuRenderer, HDR_REFERENCE_WHITE_NITS } from "./webgpu-renderer.js?v=20260901-2";
 
@@ -2896,11 +2896,20 @@ function initGlslEditor() {
   placeholder.textContent = "Custom";
   placeholder.hidden = true;
   glslPresetSelect.append(placeholder);
+  const presetGroups = new Map();
   for (const [index, preset] of GLSL_PRESETS.entries()) {
+    const category = preset.category || "Other";
+    let group = presetGroups.get(category);
+    if (!group) {
+      group = document.createElement("optgroup");
+      group.label = category;
+      presetGroups.set(category, group);
+      glslPresetSelect.append(group);
+    }
     const option = document.createElement("option");
     option.value = String(index);
     option.textContent = preset.name;
-    glslPresetSelect.append(option);
+    group.append(option);
   }
   makeFloatingPanelDraggable(glslPanel);
 
@@ -6430,7 +6439,7 @@ function matchingZoomValue(image) {
   if (image.view.fit) {
     return "fit";
   }
-  const presets = [1, 2, 4, 8, 16, 32];
+  const presets = [0.1, 0.25, 0.5, 1, 2, 4, 8, 16, 32];
   const match = presets.find((value) => Math.abs(value - image.view.scale) < 0.0001);
   return match ? String(match) : "custom";
 }
