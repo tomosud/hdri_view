@@ -7,6 +7,7 @@ import { decodeTiff, openTiffRasterSource } from "./tiff-decoder.js?v=20260811-2
 import { decodeJpeg2000, openJpeg2000RasterSource } from "./jp2-decoder.js?v=20260809-6";
 import { decodeDicom, isDicomFile } from "./dicom-decoder.js?v=20260821-3";
 import { openExrRasterSource } from "./exr-decoder.js?v=20260920-1";
+import { loadDds } from "./dds-decoder.js?v=20260930-1";
 import { createBitmapRasterSource, createHalfFloatRasterSource, createMemoryRasterSource, createSwitchableRasterSource, RASTER_TILE_SIZE } from "./raster-source.js?v=20260901-3";
 import { openAvifRasterSource } from "./avif-raster-source.js?v=20260810-2";
 import {
@@ -723,7 +724,7 @@ function isSupportedClipboardFile(file) {
     return true;
   }
   const extension = file.name.split(".").pop()?.toLowerCase();
-  return extension === "hdr" || extension === "pic" || extension === "exr";
+  return extension === "hdr" || extension === "pic" || extension === "exr" || extension === "dds";
 }
 
 function clipboardImageFiles(clipboardData) {
@@ -1279,7 +1280,7 @@ async function openFilesWithPicker() {
       types: [{
         description: "Images",
         accept: {
-          "image/*": [".png", ".jpg", ".jpeg", ".webp", ".avif", ".gif", ".bmp", ".hdr", ".pic", ".exr"],
+          "image/*": [".png", ".jpg", ".jpeg", ".webp", ".avif", ".gif", ".bmp", ".hdr", ".pic", ".exr", ".dds"],
           "application/dicom": [".dcm"]
         }
       }]
@@ -1405,6 +1406,21 @@ function formatFileError(file, error) {
 
 async function loadImageFile(file) {
   const extension = file.name.split(".").pop().toLowerCase();
+  if (extension === "dds") {
+    const decoded = await loadDds(file);
+    const transfer = decoded.srgb ? "srgb" : "linear";
+    return createImageRecord(file, decoded.width, decoded.height,
+      `dds/BC${decoded.hdr ? "6H" : decoded.format} · ${transfer} · mip 0`,
+      decoded.pixels, "dds", {
+        format: "DDS",
+        bitDepth: decoded.hdr ? "BC6H / 16-bit float" : `BC${decoded.format}${decoded.signed ? " SNORM" : " UNORM"}`,
+        hdr: decoded.hdr,
+        integerEncoding: decoded.hdr ? null : {
+          bits: 8, signed: decoded.signed, normalized: true, transfer,
+          snorm: decoded.signed, syntheticAlpha: decoded.format === 4 || decoded.format === 5
+        }
+      });
+  }
   if (extension === "dcm" || isDicomFile(file)) {
     return loadDicomImage(file);
   }
@@ -3972,6 +3988,7 @@ function isHdrImage(image) {
   return image.type.startsWith("openexr/") ||
     image.type.startsWith("radiance-hdr/") ||
     image.type.startsWith("glsl/") ||
+    (image.sourceFormat === "dds" && image.hdr) ||
     image.sourceFormat === "values";
 }
 
@@ -6908,6 +6925,9 @@ function integerCodeValues(image, values, srgbValues = null) {
       : srgbValues || [
         linearToSrgb(values[0]), linearToSrgb(values[1]), linearToSrgb(values[2]), values[3]
       ];
+    if (inferred.snorm) return encoded.map((value, channel) => channel < 3
+      ? Math.round(Math.max(-1, Math.min(1, value)) * maximum)
+      : value);
     return encoded.map((value, channel) => channel < 3
       ? Math.round(clamp01(value) * range + minimum)
       : inferred.syntheticAlpha
@@ -7351,7 +7371,7 @@ function allowedSaveFormats(image) {
   if (image.sourceFormat === "exr") {
     return ["exr"];
   }
-  if (image.sourceFormat === "hdr") {
+  if (image.sourceFormat === "hdr" || (image.sourceFormat === "dds" && image.hdr)) {
     return ["hdr", "exr"];
   }
   return ["png", "jpeg", "webp"];

@@ -17,7 +17,7 @@ https://tomosud.github.io/hdri_view/
 
 ## できること
 
-- PNG / JPEG / WebP / AVIF / GIF / BMP / **JPEG 2000 (JP2/J2K, 1/3ch, 1〜16bit)** / **TIFF / BigTIFF（LZW・Deflate・PackBits・JPEGなど）** / **DICOM（非圧縮・単一フレーム）** に加え、**HDR (Radiance)** / **EXR (OpenEXR)** をブラウザ上でそのまま開ける
+- PNG / JPEG / WebP / AVIF / GIF / BMP / **JPEG 2000 (JP2/J2K, 1/3ch, 1〜16bit)** / **TIFF / BigTIFF（LZW・Deflate・PackBits・JPEGなど）** / **DDS（2D・BC1～BC7、BC6H HDR対応）** / **DICOM（非圧縮・単一フレーム）** に加え、**HDR (Radiance)** / **EXR (OpenEXR)** をブラウザ上でそのまま開ける
 - 16,777,216画素を超える非インターレース8/16bit Gray / Gray+Alpha / RGB(A) PNGは、まず縮小した仮画像を表示し、Worker内で元ビット深度の512pxタイルへストリーム展開できた時点で原寸表示へ自動で差し替える
 - 通常表示は WebGPU に統一し、低解像度の全体プレビューを常に背景へ表示した上へ、読み込み済みの512pxタイルを重ねる。HDR対応環境ではfloat出力、SDR環境ではシェーダー内トーンマップを使い、移動・ズーム先のタイルが未到着でも黒抜けさせない
 - カーソル位置の **linear値 / sRGB値** をステータスバーにリアルタイム表示。配置済みピッカーはクリックで選択し、左ドラッグで移動できる
@@ -223,7 +223,7 @@ GPU メモリと readPixels によるフリーズを避けるため、GLSL の�
 
 | 用途 | 形式 |
 | --- | --- |
-| 読み込み | PNG, JPEG, WebP, AVIF, GIF, BMP, JPEG 2000 (JP2/J2K), TIFF / BigTIFF, DICOM (非圧縮・単一フレーム・グレースケール), HDR (Radiance), EXR (OpenEXR) |
+| 読み込み | PNG, JPEG, WebP, AVIF, GIF, BMP, JPEG 2000 (JP2/J2K), TIFF / BigTIFF, DDS (2D・BC1～BC7), DICOM (非圧縮・単一フレーム・グレースケール), HDR (Radiance), EXR (OpenEXR) |
 | 保存 | PNG, JPEG, WebP, HDR RGBE（HDRI画像）, EXR Float（HDRI画像） |
 
 AVIF はブラウザの WebCodecs `ImageDecoder` が返すネイティブYUVプレーンをWorkerで読みます。
@@ -241,6 +241,9 @@ AVIF gain mapの合成は未対応です。
 ## 技術構成
 
 - ビルド不要の静的サイト（GitHub Pages でホスト可能）
+- DDSは [bcdec](https://github.com/iOrange/bcdec) v0.985（固定commit `80859ed3b7afb1c527a2a99d70c61457bea72d0c`、MITライセンスを選択）をWASMとして同梱し、専用Workerで復号する。上流ソースは無変更の `vendor/bcdec/bcdec.h`、ライセンスは同ディレクトリの `LICENSE`。`bridge.c` は画像配置とRGBA Float32への受け渡しのみを担当し、BC復号処理はすべてbcdecを使う。配信時のビルドや外部CDNは不要。WASMを再生成する場合のみZig 0.14.1で `vendor/bcdec/build.ps1 -Zig <zig.exeのパス>` を実行する
+- DDSは単一2D画像の最大解像度（mip 0、最大32メガピクセル）を読み込む。DX10ヘッダーのBC1～BC7、旧ヘッダーのDXT1/3/5・ATI1/2・BC4U/S・BC5U/Sに対応。BC6Hは符号付き／符号なしのHDR値をFloat32で保持し、HDR/EXR保存も可能。DX10のsRGB指定だけをリニアへ変換し、指定のない旧DDSはリニアとして扱う。BC4/5の未格納チャンネルは0、アルファは1とし、法線のZ再構築は行わない。Code Valueは復号後の値に基づく。非圧縮DDS・typeless形式・配列・キューブマップ・ボリューム・premultiplied alphaは未対応で、明示的にエラーを表示する
+- DDSの自動検証は `node tests/dds-decoder.test.mjs`。任意のサンプルフォルダーを引数に渡すと、配下のDDSを再帰的に復号して寸法・形式・有限値を検査する
 - [three.js](https://threejs.org/) の `EXRLoader` / `RGBELoader` を利用して HDR/EXR を読み込み
 - AVIF は外部ライブラリを追加せず、ブラウザ内蔵WebCodecsでネイティブYUVを取り出し、CICP/PQ/HLG変換を専用Workerで行う
 - PNG は小～中画像を `png-decoder.js`、巨大画像を `png-tile-worker.js` で自前デコードする。巨大画像は圧縮ファイル全体やRGBA Float32全体を確保せず、待ち時間中だけ最大1024pxの仮画像を使う。ピクセル値は原寸タイルへの切替後に元ビット深度で取得する
