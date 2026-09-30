@@ -1,6 +1,6 @@
 // DDS container adapter. Compression decoding is delegated to vendor/bcdec.
 // https://learn.microsoft.com/windows/win32/direct3ddds/dx-graphics-dds-pguide
-export function inspectDds(source) {
+export function inspectDds(source, fileSize = null) {
   const bytes = source instanceof Uint8Array ? source : new Uint8Array(source);
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const u32 = (offset) => view.getUint32(offset, true);
@@ -12,17 +12,18 @@ export function inspectDds(source) {
     throw new Error("DDS dimensions are invalid or exceed the 32-megapixel decode limit.");
   }
   if (u32(24) > 1 || (u32(112) & (0xfe00 | 0x200000))) {
-    throw new Error("Only single-surface 2D DDS textures are supported (no cubemaps or volumes).");
+    throw new Error("Only 2D DDS textures are supported (no cubemaps or volumes).");
   }
   if (!(u32(80) & 4)) throw new Error("Uncompressed DDS is not supported; use BC1–BC7 DDS.");
   const fourCC = String.fromCharCode(...bytes.subarray(84, 88));
-  let offset = 128, format, signed = false, srgb = false;
+  let offset = 128, format, signed = false, srgb = false, arraySize = 1;
   if (fourCC === "DX10") {
     if (bytes.length < 148) throw new Error("Truncated DDS DX10 header.");
     offset = 148;
-    if (u32(132) !== 3 || u32(140) !== 1 || (u32(136) & 4)) {
-      throw new Error("Only single-surface 2D DDS textures are supported (no arrays or cubemaps).");
+    if (u32(132) !== 3 || !u32(140) || (u32(136) & 4)) {
+      throw new Error("Only 2D DDS textures and arrays are supported (no cubemaps).");
     }
+    arraySize = u32(140);
     const dxgi = u32(128);
     format = {
       71: 1, 72: 1, 74: 2, 75: 2, 77: 3, 78: 3, 80: 4, 81: 4,
@@ -39,8 +40,19 @@ export function inspectDds(source) {
   }
   const blockBytes = format === 1 || format === 4 ? 8 : 16;
   const length = Math.ceil(width / 4) * Math.ceil(height / 4) * blockBytes;
-  if (offset + length > bytes.length) throw new Error("Truncated DDS mip 0 pixel data.");
-  return { width, height, offset, length, format, signed, srgb, hdr: format === 6 };
+  const mipCount = Math.max(1, u32(28));
+  if (mipCount > 1 + Math.floor(Math.log2(Math.max(width, height)))) throw new Error("Invalid DDS mip count.");
+  let layerStride = 0;
+  for (let mip = 0; mip < mipCount; mip++) {
+    layerStride += Math.ceil(Math.max(1, width >> mip) / 4) * Math.ceil(Math.max(1, height >> mip) / 4) * blockBytes;
+  }
+  if (offset + layerStride * arraySize > (fileSize ?? bytes.length)) throw new Error("Truncated DDS mip or array pixel data.");
+  return { width, height, offset, length, format, signed, srgb, hdr: format === 6, arraySize, mipCount, layerStride };
+}
+
+function selectLayer(info, layerIndex) {
+  if (!Number.isInteger(layerIndex) || layerIndex < 0 || layerIndex >= info.arraySize) throw new Error("DDS layer index is out of range.");
+  return { ...info, offset: info.offset + layerIndex * info.layerStride, layerIndex };
 }
 
 let decoderPromise;
@@ -57,16 +69,27 @@ async function openDecoder() {
 }
 
 // Optional exports argument lets offline tests exercise the very same WASM binary.
-export async function decodeDds(source, decoder = null) {
+export async function decodeDds(source, decoder = null, layerIndex = 0) {
   const bytes = source instanceof Uint8Array ? source : new Uint8Array(source);
-  const info = inspectDds(bytes);
-  const { width, height, offset, length, format, signed, srgb } = info;
+  const info = selectLayer(inspectDds(bytes), layerIndex);
+  return decodePixels(bytes.subarray(info.offset, info.offset + info.length), info, decoder);
+}
+
+export async function decodeDdsFile(file, layerIndex = 0, decoder = null) {
+  const info = selectLayer(inspectDds(await file.slice(0, 148).arrayBuffer(), file.size), layerIndex);
+  const bytes = new Uint8Array(await file.slice(info.offset, info.offset + info.length).arrayBuffer());
+  if (bytes.length !== info.length) throw new Error("Truncated DDS layer pixel data.");
+  return decodePixels(bytes, info, decoder);
+}
+
+async function decodePixels(bytes, info, decoder) {
+  const { width, height, length, format, signed, srgb } = info;
   const wasm = decoder || await openDecoder();
   const input = Number(wasm.__heap_base.value);
   const output = Math.ceil((input + length) / 16) * 16;
   const end = output + width * height * 16;
   if (end > wasm.memory.buffer.byteLength) wasm.memory.grow(Math.ceil((end - wasm.memory.buffer.byteLength) / 65536));
-  new Uint8Array(wasm.memory.buffer, input, length).set(bytes.subarray(offset, offset + length));
+  new Uint8Array(wasm.memory.buffer, input, length).set(bytes);
   wasm.decode(input, output, width, height, format, Number(signed));
   const pixels = new Float32Array(wasm.memory.buffer, output, width * height * 4).slice();
   if (srgb) for (let i = 0; i < pixels.length; i += 4) for (let c = 0; c < 3; c++) {
@@ -76,9 +99,9 @@ export async function decodeDds(source, decoder = null) {
   return { ...info, pixels };
 }
 
-export function loadDds(file) {
+export function loadDds(file, layerIndex = 0) {
   return new Promise((resolve, reject) => {
-    const worker = new Worker(new URL("./dds-worker.js?v=20260930-1", import.meta.url), { type: "module" });
+    const worker = new Worker(new URL("./dds-worker.js?v=20260930-2", import.meta.url), { type: "module" });
     worker.onmessage = ({ data }) => {
       worker.terminate();
       if (data.error) reject(new Error(data.error));
@@ -88,6 +111,6 @@ export function loadDds(file) {
       worker.terminate();
       reject(new Error(event.message || "DDS worker failed."));
     };
-    worker.postMessage(file);
+    worker.postMessage({ file, layerIndex });
   });
 }

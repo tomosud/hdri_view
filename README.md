@@ -242,7 +242,7 @@ AVIF gain mapの合成は未対応です。
 
 - ビルド不要の静的サイト（GitHub Pages でホスト可能）
 - DDSは [bcdec](https://github.com/iOrange/bcdec) v0.985（固定commit `80859ed3b7afb1c527a2a99d70c61457bea72d0c`、MITライセンスを選択）をWASMとして同梱し、専用Workerで復号する。上流ソースは無変更の `vendor/bcdec/bcdec.h`、ライセンスは同ディレクトリの `LICENSE`。`bridge.c` は画像配置とRGBA Float32への受け渡しのみを担当し、BC復号処理はすべてbcdecを使う。配信時のビルドや外部CDNは不要。WASMを再生成する場合のみZig 0.14.1で `vendor/bcdec/build.ps1 -Zig <zig.exeのパス>` を実行する
-- DDSは単一2D画像の最大解像度（mip 0、最大32メガピクセル）を読み込む。DX10ヘッダーのBC1～BC7、旧ヘッダーのDXT1/3/5・ATI1/2・BC4U/S・BC5U/Sに対応。BC6Hは符号付き／符号なしのHDR値をFloat32で保持し、HDR/EXR保存も可能。DX10のsRGB指定だけをリニアへ変換し、指定のない旧DDSはリニアとして扱う。BC4/5の未格納チャンネルは0、アルファは1とし、法線のZ再構築は行わない。Code Valueは復号後の値に基づく。非圧縮DDS・typeless形式・配列・キューブマップ・ボリューム・premultiplied alphaは未対応で、明示的にエラーを表示する
+- DDSは2D画像の最大解像度（mip 0、1レイヤー最大32メガピクセル）を読み込む。Texture2DArrayは各レイヤーを `[Layer 0]` から始まる別画像として順次開く。各レイヤーのミップチェーンからmip 0だけを読み取り、ファイルハンドルからのセッション復元でもレイヤー番号を保持する。DX10ヘッダーのBC1～BC7、旧ヘッダーのDXT1/3/5・ATI1/2・BC4U/S・BC5U/Sに対応。BC6Hは符号付き／符号なしのHDR値をFloat32で保持し、HDR/EXR保存も可能。DX10のsRGB指定だけをリニアへ変換し、指定のない旧DDSはリニアとして扱う。BC4/5の未格納チャンネルは0、アルファは1とし、法線のZ再構築は行わない。Code Valueは復号後の値に基づく。非圧縮DDS・typeless形式・キューブマップ・ボリューム・premultiplied alphaは未対応で、明示的にエラーを表示する
 - DDSの自動検証は `node tests/dds-decoder.test.mjs`。任意のサンプルフォルダーを引数に渡すと、配下のDDSを再帰的に復号して寸法・形式・有限値を検査する
 - [three.js](https://threejs.org/) の `EXRLoader` / `RGBELoader` を利用して HDR/EXR を読み込み
 - AVIF は外部ライブラリを追加せず、ブラウザ内蔵WebCodecsでネイティブYUVを取り出し、CICP/PQ/HLG変換を専用Workerで行う

@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
-import { decodeDds, inspectDds } from "../dds-decoder.js";
+import { decodeDds, decodeDdsFile, inspectDds } from "../dds-decoder.js";
 
 const { instance } = await WebAssembly.instantiate(await readFile(new URL("../vendor/bcdec/bcdec.wasm", import.meta.url)));
 const decode = (bytes) => decodeDds(bytes, instance.exports);
@@ -65,6 +65,24 @@ legacy.set(dds(71, red).subarray(0, 128));
 new DataView(legacy.buffer).setUint32(84, 0x31545844, true);
 legacy.set(red, 128);
 assert.equal((await decode(legacy)).pixels[0], 1);
+// Each array element stores its whole mip chain before the next element.
+const blue = [31, 0, 0, 0, 0, 0, 0, 0];
+const array = dds(71, [...red, ...gray, ...blue, ...gray]);
+const arrayView = new DataView(array.buffer);
+arrayView.setUint32(28, 2, true);
+arrayView.setUint32(140, 2, true);
+assert.equal(inspectDds(array).layerStride, 16);
+assert.deepEqual([...(await decodeDds(array, instance.exports, 1)).pixels.slice(0, 4)], [0, 0, 1, 1]);
+const slicedReads = [];
+const file = new Blob([array]);
+const slicedFile = { size: file.size, slice(start, end) { slicedReads.push([start, end]); return file.slice(start, end); } };
+assert.deepEqual([...(await decodeDdsFile(slicedFile, 1, instance.exports)).pixels.slice(0, 4)], [0, 0, 1, 1]);
+assert.deepEqual(slicedReads, [[0, 148], [164, 172]]);
+await assert.rejects(decodeDds(array, instance.exports, 2), /out of range/);
+assert.throws(() => inspectDds(array.subarray(0, array.length - 1)), /Truncated/);
+const invalidMips = array.slice();
+new DataView(invalidMips.buffer).setUint32(28, 4, true);
+assert.throws(() => inspectDds(invalidMips), /mip count/);
 assert.throws(() => inspectDds(new Uint8Array(120)), /header/);
 assert.throws(() => inspectDds(dds(71, [])), /Truncated/);
 assert.throws(() => inspectDds(dds(28, red)), /Unsupported/);
@@ -81,14 +99,19 @@ async function scan(directory) {
     if (entry.isDirectory()) await scan(path);
     else if (/\.dds$/i.test(entry.name)) {
       const start = performance.now();
-      const image = await decode(await readFile(path));
-      let minimum = Infinity, maximum = -Infinity;
-      for (const value of image.pixels) {
-        assert.ok(Number.isFinite(value));
-        minimum = Math.min(minimum, value);
-        maximum = Math.max(maximum, value);
+      const bytes = await readFile(path);
+      const info = inspectDds(bytes);
+      const file = new Blob([bytes]);
+      for (let layer = 0; layer < info.arraySize; layer++) {
+        const image = await decodeDdsFile(file, layer, instance.exports);
+        let minimum = Infinity, maximum = -Infinity;
+        for (const value of image.pixels) {
+          assert.ok(Number.isFinite(value));
+          minimum = Math.min(minimum, value);
+          maximum = Math.max(maximum, value);
+        }
+        console.log(`${entry.name} layer ${layer}: BC${image.format}, ${image.width}x${image.height}, range ${minimum}..${maximum}, ${Math.round(performance.now() - start)}ms`);
       }
-      console.log(`${entry.name}: BC${image.format}, ${image.width}x${image.height}, range ${minimum}..${maximum}, ${Math.round(performance.now() - start)}ms`);
     }
   }
 }

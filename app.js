@@ -7,7 +7,7 @@ import { decodeTiff, openTiffRasterSource } from "./tiff-decoder.js?v=20260811-2
 import { decodeJpeg2000, openJpeg2000RasterSource } from "./jp2-decoder.js?v=20260809-6";
 import { decodeDicom, isDicomFile } from "./dicom-decoder.js?v=20260821-3";
 import { openExrRasterSource } from "./exr-decoder.js?v=20260920-1";
-import { loadDds } from "./dds-decoder.js?v=20260930-1";
+import { loadDds } from "./dds-decoder.js?v=20260930-2";
 import { createBitmapRasterSource, createHalfFloatRasterSource, createMemoryRasterSource, createSwitchableRasterSource, RASTER_TILE_SIZE } from "./raster-source.js?v=20260901-3";
 import { openAvifRasterSource } from "./avif-raster-source.js?v=20260810-2";
 import {
@@ -1349,15 +1349,21 @@ async function openFileEntries(entries, dropPoint = null) {
     const entry = files[index];
     const file = entry.file;
     try {
-      const image = await loadImageFile(file);
-      image.source = imageSourceForEntry(file, entry);
-      images.push(image);
-      createImageWindow(image, dropPoint, index);
-      selectImage(image);
-      fitImageToWindow(image, false);
-      updatePickerPanel();
-      requestRender();
-      openedCount += 1;
+      let layerCount = 1;
+      for (let layer = 0; layer < layerCount; layer++) {
+        const image = await loadImageFile(file, layer);
+        layerCount = image.ddsLayerCount || 1;
+        image.source = imageSourceForEntry(file, entry);
+        if (image.sourceFormat === "dds") image.source.ddsLayer = layer;
+        images.push(image);
+        createImageWindow(image, dropPoint, openedCount);
+        selectImage(image);
+        fitImageToWindow(image, false);
+        updatePickerPanel();
+        requestRender();
+        openedCount += 1;
+        if (layerCount > 1) fileHint.textContent = `${file.name}: opened layer ${layer + 1}/${layerCount}`;
+      }
     } catch (error) {
       console.error(error);
       failed.push(formatFileError(file, error));
@@ -1404,13 +1410,13 @@ function formatFileError(file, error) {
   return message ? `Failed: ${file.name} (${message})` : `Failed: ${file.name}`;
 }
 
-async function loadImageFile(file) {
+async function loadImageFile(file, ddsLayer = 0) {
   const extension = file.name.split(".").pop().toLowerCase();
   if (extension === "dds") {
-    const decoded = await loadDds(file);
+    const decoded = await loadDds(file, ddsLayer);
     const transfer = decoded.srgb ? "srgb" : "linear";
-    return createImageRecord(file, decoded.width, decoded.height,
-      `dds/BC${decoded.hdr ? "6H" : decoded.format} · ${transfer} · mip 0`,
+    const image = createImageRecord(file, decoded.width, decoded.height,
+      `dds/BC${decoded.hdr ? "6H" : decoded.format} · ${transfer} · mip 0${decoded.arraySize > 1 ? ` · layer ${ddsLayer}/${decoded.arraySize - 1}` : ""}`,
       decoded.pixels, "dds", {
         format: "DDS",
         bitDepth: decoded.hdr ? "BC6H / 16-bit float" : `BC${decoded.format}${decoded.signed ? " SNORM" : " UNORM"}`,
@@ -1420,6 +1426,9 @@ async function loadImageFile(file) {
           snorm: decoded.signed, syntheticAlpha: decoded.format === 4 || decoded.format === 5
         }
       });
+    image.ddsLayerCount = decoded.arraySize;
+    if (decoded.arraySize > 1) image.name = `${file.name} [Layer ${ddsLayer}]`;
+    return image;
   }
   if (extension === "dcm" || isDicomFile(file)) {
     return loadDicomImage(file);
@@ -5056,6 +5065,7 @@ function imageSourceSessionState(image, assetOwners) {
       kind: "file-handle",
       handle: source.handle,
       name: source.name || image.name,
+      ddsLayer: source.ddsLayer,
       size: source.size || 0,
       lastModified: source.lastModified || 0
     };
@@ -5063,6 +5073,7 @@ function imageSourceSessionState(image, assetOwners) {
   return {
     kind: "external",
     name: source.name || image.name,
+    ddsLayer: source.ddsLayer,
     size: source.size || 0,
     lastModified: source.lastModified || 0
   };
@@ -5221,11 +5232,12 @@ async function restoreImageFromSession(savedImage, restoredById) {
 
   if (source.kind === "file-handle" && source.handle && typeof source.handle.getFile === "function") {
     const file = await source.handle.getFile();
-    const image = await loadImageFile(file);
+    const image = await loadImageFile(file, source.ddsLayer ?? 0);
     image.source = {
       kind: "file-handle",
       handle: source.handle,
       name: file.name,
+      ddsLayer: source.ddsLayer,
       size: file.size,
       lastModified: file.lastModified
     };
