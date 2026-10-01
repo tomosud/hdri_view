@@ -1,4 +1,4 @@
-import { createWorkerRasterSource } from "./raster-source.js?v=20260901-2";
+import { createWorkerRasterSource } from "./raster-source.js?v=20261001-1";
 
 export function openExrRasterSource(file) {
   return new Promise((resolve, reject) => {

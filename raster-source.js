@@ -104,6 +104,8 @@ export function createWorkerRasterSource(worker, metadata, { maxCachedTiles = 24
   }
   const cache = new Map();
   const inFlightTiles = new Map();
+  const pixelCache = new Map();
+  const inFlightPixels = new Map();
   const requests = new Map();
   let nextRequestId = 1;
   let disposed = false;
@@ -112,6 +114,8 @@ export function createWorkerRasterSource(worker, metadata, { maxCachedTiles = 24
     for (const request of requests.values()) request.reject(error);
     requests.clear();
     inFlightTiles.clear();
+    inFlightPixels.clear();
+    pixelCache.clear();
   };
   worker.addEventListener("message", (event) => {
     const message = event.data || {};
@@ -171,8 +175,26 @@ export function createWorkerRasterSource(worker, metadata, { maxCachedTiles = 24
     },
     getPixel(x, y, target = new Float32Array(4)) {
       if (metadata.directPixel) {
-        return request("pixel", { x, y }).then((result) => {
-          target.set(result.values);
+        const key = `${x}:${y}`;
+        const cached = pixelCache.get(key);
+        if (cached) {
+          pixelCache.delete(key);
+          pixelCache.set(key, cached);
+          target.set(cached);
+          return target;
+        }
+        let pending = inFlightPixels.get(key);
+        if (!pending) {
+          pending = request("pixel", { x, y }).then((result) => {
+            const values = new Float32Array(result.values);
+            pixelCache.set(key, values);
+            while (pixelCache.size > 4096) pixelCache.delete(pixelCache.keys().next().value);
+            return values;
+          }).finally(() => inFlightPixels.delete(key));
+          inFlightPixels.set(key, pending);
+        }
+        return pending.then((values) => {
+          target.set(values);
           return target;
         });
       }
