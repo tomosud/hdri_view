@@ -4,6 +4,14 @@ setlocal
 
 pushd "%~dp0"
 
+python scripts\generate_glsl_presets.py
+if errorlevel 1 (
+    echo GLSL preset generation failed. Check the message above.
+    pause
+    popd
+    exit /b 1
+)
+
 if not defined PORT set "PORT=8000"
 set "START_PORT=%PORT%"
 

@@ -206,6 +206,60 @@ Remap Range、Power 2.2、R/B Swizzle、Rec.709 YUV変換、Mosaic、ifを使う
 Linear / Log2 HDR Heatmap、ループ式Blur / Maximum Filter、各種Generatorを収録しています。
 各プリセットには、処理内容、変更する定数、値域、alphaの扱いを英語コメントで記載しています。
 
+#### GLSLプリセットの追加
+
+`glsl-presets/` に UTF-8 の `.glsl` ファイルを1つ追加し、`run.bat` を起動し直すと
+プリセット一覧へ反映されます。ブラウザを開いたままの場合は再読み込みしてください。
+ファイルの先頭には次のメタデータを書き、空行の後に `mainImage` の中身を書きます。
+
+```glsl
+// @name My HDR Ramp
+// @category Generated images
+// @generator true
+
+outputColor = vec4(vec3(uv.x * 10.0), 1.0);
+```
+
+- `@name`：表示名（重複不可）。
+- `@category`：メニューの分類。既存の分類名に合わせるか、新しい分類名を指定できます。
+- `@generator`：入力画像なしで生成する場合は `true`、画像加工用は `false`。
+- `@order`：任意の整数。小さい順、同値ならファイル名順。省略時は1000です。
+- `@default`：既定プリセット専用。既存の `filter` と `generator` が各1つあるため、通常は追加しません。
+
+ファイルの編集・削除も次回生成時に反映されます。対象は `glsl-presets/` 直下の `.glsl` です。
+生成はPython標準ライブラリだけを使い、手動実行は `python scripts/generate_glsl_presets.py`。
+`glsl-presets.generated.js` は生成物なので直接編集しません。生成に失敗した場合は元の生成物を保持し、
+`run.bat` の起動や公開を中止してエラーを表示します。
+
+GitHub Pagesでは `.github/workflows/pages.yml` がmainへのpush時に自動生成して公開します。
+**初回のみリポジトリの Settings → Pages → Build and deployment → Source を GitHub Actions に設定**してください。
+配信物は静的ファイルのみで、実行時のサーバー処理やnpmのインストールは不要です。
+別の静的ホストへ公開する場合は生成コマンドを実行し、生成物も一緒に配置してください。
+
+#### ColorChecker ClassicプリセットとPNG
+
+`Generated images → ColorChecker Classic (2014+, sRGB)` は6列×4行の24色です。
+[X-Riteの2014年11月以降のLab基準値（BabelColor掲載）](https://babelcolor.com/index_htm_files/ColorChecker24_After_Nov2014.txt)
+を、[ICCのsRGB仕様](https://registry.color.org/rgb-registry/files/sRGB.pdf)のBradford色順応行列を使って
+Lab D50 → XYZ D50 → linear sRGB D65へ変換しています。白・黒の再正規化はしていません。
+2014年11月より前の製品の基準値とは異なり、実物の個体差・照明・経年変化を再現するものではありません。
+F3（Cyan）のRはsRGB色域外のため0にクリップします。中性色にも基準値由来のわずかな色味があります。
+
+配置は正方形パッチを持つ **3:2** の独自レイアウトです（製品の外形寸法の再現ではありません）。
+サイズ案は **768×512 / 1536×1024（推奨）/ 3072×2048 / 3840×2560**。
+他の比率で生成してもパッチの正方形を保ち、余った部分を黒で埋めます。
+
+`exports/colorchecker/` にsRGBタグ付きのPNGを用意しています。8-bit版は768×512、1536×1024、3072×2048、
+16-bit版は1536×1024です。`colorchecker-values.json` にLab、クリップ前のlinear sRGB、8/16-bit値を収録。
+再生成は `python scripts/generate_colorchecker.py`、続いて `python scripts/generate_glsl_presets.py`。
+PNG・値一覧・対応GLSLを同じ元データ `reference-data/colorchecker-classic-2014.json` から作ります。
+
+アプリからPNGを書き出す場合は **Export → Current display / PNG** を使い、
+**Channel: RGB、Color Scale: Linear、Auto level: OFF、Brightness: 0 EV、Display Gamma: 1.0、Invert: OFF**
+にしてください。出力解像度は生成時と同じ値（変更するならNearest）にします。
+現状のRAW pixels → PNGはGLSL/HDR画像にトーンマップを適用するため、基準色の書き出しには使いません。
+通常のPNG書き出しは8-bitです。16-bitが必要な場合は同梱の16-bit PNGを使ってください。
+
 既定の **Passthrough** では、代入文の下がコメント形式のクイックリファレンスになっています。
 利用可能な引数・uniform・helper、GLSLの基本型、標準関数、swizzleと短いコード例を確認できます。
 コード欄は折り返さず、縦横にスクロールできます。Box Blurは半径に対してサンプル数が二乗で

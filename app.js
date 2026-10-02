@@ -24,7 +24,7 @@ import {
   GLSL_PRESETS,
   getGlslSupport,
   runGlslShader
-} from "./glsl-runtime.js?v=20260926-1";
+} from "./glsl-runtime.js?v=20261002-1";
 import { decodeGlslShareHash, encodeGlslShareHash } from "./glsl-share.js?v=20260809-3";
 import { createWebGpuRenderer, HDR_REFERENCE_WHITE_NITS } from "./webgpu-renderer.js?v=20260901-2";
 

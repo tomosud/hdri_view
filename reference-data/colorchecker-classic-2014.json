@@ -1,0 +1,230 @@
+{
+  "reference": "X-Rite ColorChecker24 - November 2014 edition and newer; published 2015-04-28",
+  "source": "https://babelcolor.com/index_htm_files/ColorChecker24_After_Nov2014.txt",
+  "conversion_reference": "https://registry.color.org/rgb-registry/files/sRGB.pdf",
+  "illuminant": "ICC D50",
+  "observer": "CIE 1931 2 degree",
+  "white_xyz": [
+    0.9642,
+    1.0,
+    0.8249
+  ],
+  "patches": [
+    {
+      "id": "A1",
+      "name": "Dark skin",
+      "lab": [
+        37.54,
+        14.37,
+        14.92
+      ]
+    },
+    {
+      "id": "B1",
+      "name": "Light skin",
+      "lab": [
+        64.66,
+        19.27,
+        17.5
+      ]
+    },
+    {
+      "id": "C1",
+      "name": "Blue sky",
+      "lab": [
+        49.32,
+        -3.82,
+        -22.54
+      ]
+    },
+    {
+      "id": "D1",
+      "name": "Foliage",
+      "lab": [
+        43.46,
+        -12.74,
+        22.72
+      ]
+    },
+    {
+      "id": "E1",
+      "name": "Blue flower",
+      "lab": [
+        54.94,
+        9.61,
+        -24.79
+      ]
+    },
+    {
+      "id": "F1",
+      "name": "Bluish green",
+      "lab": [
+        70.48,
+        -32.26,
+        -0.37
+      ]
+    },
+    {
+      "id": "A2",
+      "name": "Orange",
+      "lab": [
+        62.73,
+        35.83,
+        56.5
+      ]
+    },
+    {
+      "id": "B2",
+      "name": "Purplish blue",
+      "lab": [
+        39.43,
+        10.75,
+        -45.17
+      ]
+    },
+    {
+      "id": "C2",
+      "name": "Moderate red",
+      "lab": [
+        50.57,
+        48.64,
+        16.67
+      ]
+    },
+    {
+      "id": "D2",
+      "name": "Purple",
+      "lab": [
+        30.1,
+        22.54,
+        -20.87
+      ]
+    },
+    {
+      "id": "E2",
+      "name": "Yellow green",
+      "lab": [
+        71.77,
+        -24.13,
+        58.19
+      ]
+    },
+    {
+      "id": "F2",
+      "name": "Orange yellow",
+      "lab": [
+        71.51,
+        18.24,
+        67.37
+      ]
+    },
+    {
+      "id": "A3",
+      "name": "Blue",
+      "lab": [
+        28.37,
+        15.42,
+        -49.8
+      ]
+    },
+    {
+      "id": "B3",
+      "name": "Green",
+      "lab": [
+        54.38,
+        -39.72,
+        32.27
+      ]
+    },
+    {
+      "id": "C3",
+      "name": "Red",
+      "lab": [
+        42.43,
+        51.05,
+        28.62
+      ]
+    },
+    {
+      "id": "D3",
+      "name": "Yellow",
+      "lab": [
+        81.8,
+        2.67,
+        80.41
+      ]
+    },
+    {
+      "id": "E3",
+      "name": "Magenta",
+      "lab": [
+        50.63,
+        51.28,
+        -14.12
+      ]
+    },
+    {
+      "id": "F3",
+      "name": "Cyan",
+      "lab": [
+        49.57,
+        -29.71,
+        -28.32
+      ]
+    },
+    {
+      "id": "A4",
+      "name": "White",
+      "lab": [
+        95.19,
+        -1.03,
+        2.93
+      ]
+    },
+    {
+      "id": "B4",
+      "name": "Neutral 8",
+      "lab": [
+        81.29,
+        -0.57,
+        0.44
+      ]
+    },
+    {
+      "id": "C4",
+      "name": "Neutral 6.5",
+      "lab": [
+        66.89,
+        -0.75,
+        -0.06
+      ]
+    },
+    {
+      "id": "D4",
+      "name": "Neutral 5",
+      "lab": [
+        50.76,
+        -0.13,
+        0.14
+      ]
+    },
+    {
+      "id": "E4",
+      "name": "Neutral 3.5",
+      "lab": [
+        35.63,
+        -0.46,
+        -0.48
+      ]
+    },
+    {
+      "id": "F4",
+      "name": "Black",
+      "lab": [
+        20.64,
+        0.07,
+        -0.46
+      ]
+    }
+  ]
+}
