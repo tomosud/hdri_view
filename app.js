@@ -333,6 +333,25 @@ function constrainImageWindow(image) {
   image.window.y = clamp(image.window.y, workspaceWorldMin, workspaceWorldMax - image.window.height);
 }
 
+// Use viewport coordinates here: world bounds alone allow hidden title bars.
+function ensureImageWindowAccessible(image) {
+  constrainImageWindow(image);
+  const scale = workspaceView.scale;
+  const margin = 12;
+  const width = viewport.clientWidth;
+  const height = viewport.clientHeight;
+  const minX = Math.min(margin, Math.max(0, width - 72 * scale));
+  const minY = Math.min(margin, Math.max(0, height - 28 * scale));
+  const x = clamp(image.window.x * scale + workspaceView.panX,
+    minX, Math.max(minX, width - image.window.width * scale - margin));
+  const y = clamp(image.window.y * scale + workspaceView.panY,
+    minY, Math.max(minY, height - image.window.height * scale - margin));
+  const position = viewportPointToWorld(x, y);
+  image.window.x = position.x;
+  image.window.y = position.y;
+  constrainImageWindow(image);
+}
+
 fileInput.addEventListener("click", (event) => {
   if (!window.showOpenFilePicker) {
     return;
@@ -2301,6 +2320,7 @@ function duplicateSourceNode(snapshot) {
   images.push(image);
   createImageWindow(image, null, 0);
   image.window = pastedWindow;
+  ensureImageWindowAccessible(image);
   applyWindowGeometry(image);
   selectImage(image);
   requestRender();
@@ -2340,7 +2360,7 @@ function createImageWindow(image, dropPoint, placementIndex) {
   image.window.height = preferredHeight;
   image.window.x = baseX;
   image.window.y = baseY;
-  constrainImageWindow(image);
+  ensureImageWindowAccessible(image);
   image.window.z = ++topZ;
 
   const frame = document.createElement("section");
@@ -3021,13 +3041,26 @@ function ensureFloatingPanelAccessible(panel) {
 }
 
 function resetFloatingPanelLayout() {
+  workspaceView.scale = 1;
+  workspaceView.panX = 0;
+  workspaceView.panY = 0;
+  applyWorkspaceTransform();
+  images.forEach((image, index) => {
+    image.window.x = 24 + (index % 8) * 32;
+    image.window.y = 24 + (index % 8) * 32;
+    ensureImageWindowAccessible(image);
+    applyWindowGeometry(image);
+  });
   for (const panel of [inspector, pickerPanel, selectionGraphPanel, glslPanel]) {
+    panel.classList.remove("collapsed");
     for (const property of ["left", "top", "right", "bottom", "width", "height", "z-index"]) {
       panel.style.removeProperty(property);
     }
     ensureFloatingPanelAccessible(panel);
   }
-  fileHint.textContent = "Floating UI layout reset";
+  fileHint.textContent = "UI and image window layout reset";
+  updateViewState();
+  requestRender();
   requestSelectionGraphDraw();
   scheduleSessionSave();
 }
@@ -3309,6 +3342,7 @@ function createPassThroughGlslNode(sourceImage, dropPoint) {
   fitWindowToImageAspect(image);
   image.window.x = dropPoint.x + 1;
   image.window.y = dropPoint.y - 14;
+  ensureImageWindowAccessible(image);
   applyWindowGeometry(image);
   fileHint.textContent = `Created pass-through GLSL node from ${sourceImage.name}`;
   scheduleSessionSave();
@@ -3346,6 +3380,7 @@ function addGeneratedGlslImage({
   if (sourceImage) {
     image.window.x = sourceImage.window.x + sourceImage.window.width + 70;
     image.window.y = sourceImage.window.y;
+    ensureImageWindowAccessible(image);
     applyWindowGeometry(image);
   }
   selectImage(image);
@@ -3389,6 +3424,7 @@ function duplicateGlslNode(snapshot) {
   image.exportSettings = { ...snapshot.exportSettings };
   image.view = { ...snapshot.view };
   image.window = { ...snapshot.window, x: snapshot.window.x + 28, y: snapshot.window.y + 28, z: ++topZ };
+  ensureImageWindowAccessible(image);
   applyWindowGeometry(image);
   selectImage(image, true);
   return image;
