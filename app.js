@@ -8,6 +8,7 @@ import { decodeJpeg2000, openJpeg2000RasterSource } from "./jp2-decoder.js?v=202
 import { decodeDicom, isDicomFile } from "./dicom-decoder.js?v=20260821-3";
 import { openExrRasterSource } from "./exr-decoder.js?v=20261001-1";
 import { loadDds } from "./dds-decoder.js?v=20260930-2";
+import { loadTga } from "./tga-decoder.js?v=20261020-1";
 import { createBitmapRasterSource, createHalfFloatRasterSource, createMemoryRasterSource, createSwitchableRasterSource, RASTER_TILE_SIZE } from "./raster-source.js?v=20260901-3";
 import { openAvifRasterSource } from "./avif-raster-source.js?v=20260810-2";
 import {
@@ -743,7 +744,7 @@ function isSupportedClipboardFile(file) {
     return true;
   }
   const extension = file.name.split(".").pop()?.toLowerCase();
-  return extension === "hdr" || extension === "pic" || extension === "exr" || extension === "dds";
+  return extension === "hdr" || extension === "pic" || extension === "exr" || extension === "dds" || extension === "tga";
 }
 
 function clipboardImageFiles(clipboardData) {
@@ -1299,7 +1300,7 @@ async function openFilesWithPicker() {
       types: [{
         description: "Images",
         accept: {
-          "image/*": [".png", ".jpg", ".jpeg", ".webp", ".avif", ".gif", ".bmp", ".hdr", ".pic", ".exr", ".dds"],
+          "image/*": [".png", ".jpg", ".jpeg", ".webp", ".avif", ".gif", ".bmp", ".hdr", ".pic", ".exr", ".dds", ".tga"],
           "application/dicom": [".dcm"]
         }
       }]
@@ -1448,6 +1449,17 @@ async function loadImageFile(file, ddsLayer = 0) {
     image.ddsLayerCount = decoded.arraySize;
     if (decoded.arraySize > 1) image.name = `${file.name} [Layer ${ddsLayer}]`;
     return image;
+  }
+  if (extension === "tga") {
+    const decoded = await loadTga(file);
+    const kind = decoded.colorMapped ? "indexed" : decoded.gray ? "gray" : decoded.alpha ? "rgba" : "rgb";
+    return createImageRecord(file, decoded.width, decoded.height,
+      `tga/${kind}${decoded.rle ? " · rle" : ""} · srgb`,
+      decoded.pixels, "raster", {
+        format: "TGA",
+        bitDepth: `${decoded.depth}-bit`,
+        integerEncoding: { bits: 8, signed: false, normalized: true, transfer: "srgb" }
+      });
   }
   if (extension === "dcm" || isDicomFile(file)) {
     return loadDicomImage(file);
